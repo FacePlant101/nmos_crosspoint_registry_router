@@ -2,6 +2,11 @@ import { SyncObject } from "./SyncServer/syncObject";
 import { LoggedError, SyncLog } from "./syncLog";
 import { error } from "console";
 import { NmosRegistryConnector } from "./nmosConnector";
+import { ConnectionLatencyMeasurement, LatencyTimingContext } from "./connectionLatencyMeasurement";
+import { CrosspointOptimizedLookup } from "./crosspointOptimizedLookup";
+import { ParallelNmosConnector } from "./parallelNmosConnector";
+import { NmosHealthMonitor } from "./nmosHealthMonitor";
+import { EnhancedPredictiveStaging } from "./enhancedPredictiveStaging";
 
 import { setTimeout as sleep } from 'node:timers/promises'
 
@@ -21,6 +26,16 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
     crosspointState: CrosspointState = {devices:[]};
 
     worker;
+
+    // Internal subscribers that want to be notified when crosspointState updates
+    private updateCallbacks: Array<(state: CrosspointState, prev: CrosspointState | null) => void> = [];
+
+    // Optimized lookup service for O(1) device/flow lookups
+    private optimizedLookup: CrosspointOptimizedLookup;
+    healthMonitor: NmosHealthMonitor;
+    predictiveStaging: EnhancedPredictiveStaging;
+
+
 
     startWorker(){
         SyncLog.info("crosspoint", "Starting Worker thread.");
@@ -43,35 +58,274 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             }
         });
     }
+
+    
+    executeConnectionPrepare(src:CrosspointFlow, dst:CrosspointFlow){
+        return new Promise(async(resolve, reject) => {
+            if(dst){
+                let senderInfo:CrosspointConnectionSenderInfo|null = null;
+                if(src){
+                    SyncLog.log("info", "connect_crosspoint", "Stage (prepare): Receiver "+ dst.id + "    <   Sender " + src.id)
+                    try{
+                        if(src.id.startsWith("nmos_")){
+                            let nmosId = src.id.slice(5);
+                            senderInfo = await NmosRegistryConnector.instance.connectionGetSenderInfo(nmosId);
+                        }
+                    }catch(e){
+                        reject({src:src,dst:dst,status:"failed sender info"});
+                        return;
+                    }
+                }else{
+                    SyncLog.log("info", "connect_crosspoint", "Stage (prepare): Receiver "+ dst.id + "    <   Disconnect")
+                    senderInfo = {
+                        senderId: "disconnect",
+                        interfaces:[],
+                        manifestFile:"",
+                        active:false,
+                        error:"",
+                        transport:""
+                    }
+                }
+
+                if(dst.id.startsWith("nmos_")){
+                    try{
+                        let nmosId = dst.id.slice(5);
+                        let log = await NmosRegistryConnector.instance.makeConnection(nmosId,senderInfo,true);
+                        if(senderInfo.senderId == "disconnect"){
+                            resolve({src:src,dst:dst,status:"ok_staged_dis", detail:{message:"Staged",log:""+log}});
+                        }else{
+                            resolve({src:src,dst:dst,status:"ok_staged", detail:{message:"Staged",log:""+log}});
+                        }
+                    }catch(e){
+                        if(e instanceof LoggedError){
+                            reject({src:src,dst:dst,status:"failed", detail:{message:e.message, log:e.logId}});
+                        }else{
+                            reject({src:src,dst:dst,status:"failed", detail:{message:e.message, log:""}});
+                        }
+                    }
+                }
+            }else{
+                let id = SyncLog.log("warning", "connect_crosspoint", "Prepare connect command without destination.")
+                reject({src:src,dst:dst,status:"nc", detail:{message:"Destination missing",log:id}});
+            }
+        });
+    }
     settings:any = {};
     constructor(config:any){
         this.settings = config;
+        CrosspointAbstraction.instance = this;
+        
+        this.syncCrosspoint = new SyncObject("crosspoint", this.crosspointState);
+        
+        // Initialize optimized lookup service
+        this.optimizedLookup = new CrosspointOptimizedLookup();
+        
+        // Initialize performance optimization services
+        this.healthMonitor = NmosHealthMonitor.getInstance();
+        this.predictiveStaging = EnhancedPredictiveStaging.getInstance();
 
         this.startWorker();
-
-        
-
-
-        if(CrosspointAbstraction.instance == null){
-            CrosspointAbstraction.instance = this;
-        }
-        this.syncCrosspoint = new SyncObject("crosspoint", this.crosspointState);
-        this.update();
+        // Don't call this.update() here - wait for first NMOS state to prevent 
+        // initialization timing issues where existing connections are missed
     }
 
-    nmosState : any = null;
+    nmosState: any = null;
 
-    getFlowInfo(flowId:string){
-        try{
-            let manifest:any = null;
-            if(flowId.startsWith("nmos_")){
+    /**
+     * Load aliases from NMOS description fields on startup
+     */
+    public loadNmosAliases(): void {
+        if (!this.crosspointState || !this.nmosState) {
+            return;
+        }
+
+        const aliasUpdates: { [key: string]: string } = {};
+
+        // Check all devices for aliases in NMOS description fields
+        for (const dev of this.crosspointState.devices) {
+            if (dev.id.startsWith("nmos_")) {
+                const nmosId = dev.id.slice(5);
+
+                // Find the NMOS resource and extract alias from description
+                const nmosResource = this.findNmosResource(nmosId);
+                if (nmosResource && nmosResource.description && nmosResource.description.trim()) {
+                    // Use description as alias if it looks like an alias (not default description)
+                    const description = nmosResource.description.trim();
+                    if (description && description !== dev.name && description !== nmosId) {
+                        aliasUpdates[dev.id] = description;
+                    }
+                }
+
+                // Also check senders and receivers for aliases
+                for (const type of ['senders', 'receivers']) {
+                    if (dev[type]) {
+                        for (const flowType of Object.keys(dev[type])) {
+                            for (const flow of dev[type][flowType]) {
+                                if (flow.id.startsWith("nmos_")) {
+                                    const flowNmosId = flow.id.slice(5);
+                                    const flowResource = this.findNmosResource(flowNmosId);
+                                    if (flowResource && flowResource.description && flowResource.description.trim()) {
+                                        const description = flowResource.description.trim();
+                                        if (description && description !== flow.name && description !== flowNmosId) {
+                                            aliasUpdates[flow.id] = description;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Send alias updates to worker thread
+        if (Object.keys(aliasUpdates).length > 0) {
+            this.worker.postMessage(JSON.stringify({
+                loadNmosAliases: aliasUpdates
+            }));
+            SyncLog.log("info", "alias", `Loaded ${Object.keys(aliasUpdates).length} aliases from NMOS description fields`);
+        }
+    }
+
+    public async migrateExistingAliasesToNmos(): Promise<void> {
+        if (!this.crosspointState || !this.nmosState) {
+            return;
+        }
+
+        // Request current alias state from worker thread
+        return new Promise((resolve) => {
+            const requestId = Math.random().toString(36).substring(7);
+
+            // Set up listener for response
+            const messageHandler = (event: MessageEvent) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.aliasStateResponse && data.requestId === requestId) {
+                        this.worker.removeEventListener('message', messageHandler);
+                        this.processAliasMigration(data.aliasState).then(resolve);
+                    }
+                } catch (e) {
+                    // Ignore parsing errors
+                }
+            };
+
+            this.worker.addEventListener('message', messageHandler);
+
+            // Request alias state
+            this.worker.postMessage(JSON.stringify({
+                requestAliasState: { requestId }
+            }));
+
+            // Timeout after 5 seconds
+            setTimeout(() => {
+                this.worker.removeEventListener('message', messageHandler);
+                resolve();
+            }, 5000);
+        });
+    }
+
+    public async migrateExistingAliasesToNmosOnce(): Promise<void> {
+        const fs = require('fs');
+        const path = require('path');
+        const migrationFlagFile = './state/alias_migration_completed.flag';
+
+        // Check if migration has already been completed
+        if (fs.existsSync(migrationFlagFile)) {
+            SyncLog.log("debug", "alias", "Alias migration already completed, skipping");
+            return;
+        }
+
+        // Run the migration
+        await this.migrateExistingAliasesToNmos();
+
+        // Create flag file to prevent future migrations
+        try {
+            fs.writeFileSync(migrationFlagFile, new Date().toISOString());
+            SyncLog.log("info", "alias", "Alias migration completed and flagged - will not run again");
+        } catch (error) {
+            SyncLog.log("warning", "alias", `Failed to create migration flag file: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    private async processAliasMigration(aliasState: { [key: string]: string }): Promise<void> {
+        let migratedCount = 0;
+        let errorCount = 0;
+
+        SyncLog.log("info", "alias", `Starting migration of ${Object.keys(aliasState).length} existing aliases to NMOS description fields`);
+
+        
+        // Process each alias
+        for (const [id, alias] of Object.entries(aliasState)) {
+            try {
+                await this.updateNmosAlias(id, alias);
+                migratedCount++;
+                SyncLog.log("debug", "alias", `Migrated alias for ${id}: "${alias}"`);
+            } catch (error) {
+                errorCount++;
+                SyncLog.log("warning", "alias", `Failed to migrate alias for ${id}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            
+            // Small delay to avoid overwhelming NMOS registries
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        if (migratedCount > 0 || errorCount > 0) {
+            SyncLog.log("info", "alias", `Alias migration complete: ${migratedCount} migrated, ${errorCount} failed`);
+        }
+    }
+
+    private findNmosResource(nmosId: string): any {
+        if (!this.nmosState) {
+            return null;
+        }
+        
+        // Search in devices, senders, receivers, sources, and flows
+        const resourceTypes = ['devices', 'senders', 'receivers', 'sources', 'flows'];
+        
+        for (const resourceType of resourceTypes) {
+            if (this.nmosState[resourceType] && this.nmosState[resourceType][nmosId]) {
+                return this.nmosState[resourceType][nmosId];
+            }
+        }
+        
+        return null;
+    }
+
+    private checkIs13Support(): void {
+        if (!NmosRegistryConnector.instance) {
+            return;
+        }
+        
+        const is13Summary = NmosRegistryConnector.instance.getIs13SupportSummary();
+        
+        if (is13Summary.totalDevices === 0) {
+            SyncLog.log("info", "nmos_alias", "No NMOS devices discovered yet");
+            return;
+        }
+        
+        if (is13Summary.supportedDevices.length === 0) {
+            SyncLog.log("info", "nmos_alias", `IS-13 annotation support: 0/${is13Summary.totalDevices} devices support NMOS alias persistence`);
+        } else {
+            SyncLog.log("info", "nmos_alias", `IS-13 annotation support: ${is13Summary.supportedDevices.length}/${is13Summary.totalDevices} devices support NMOS alias persistence`);
+            
+            // List supported devices
+            for (const device of is13Summary.supportedDevices) {
+                SyncLog.log("info", "nmos_alias", `  ✓ ${device.label} supports IS-13 annotation`, { deviceId: device.id, serviceUrl: device.serviceUrl });
+            }
+        }
+    }
+
+    getFlowInfo(flowId: string) {
+        try {
+            let manifest: any = null;
+            if (flowId.startsWith("nmos_")) {
                 let id = flowId.slice(5);
                 manifest = this.nmosState.sendersManifestDetail[id];
             }
-            for(let dev of this.crosspointState.devices){
-                for(let type of Object.keys(dev.senders)){
-                    for( let flow of dev.senders[type]){
-                        if(flow.id == flowId){
+            for (let dev of this.crosspointState.devices) {
+                for (let type of Object.keys(dev.senders)) {
+                    for (let flow of dev.senders[type]) {
+                        if (flow.id == flowId) {
                             return {
                                 flow: flow,
                                 manifest: manifest
@@ -80,22 +334,21 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     }
                 }
             }
-        }catch(e){}
+        } catch (e) { }
         return null;
     }
 
-
-    enableFlow(id:string, disable=false){
+    enableFlow(id: string, disable = false) {
         return new Promise((resolve, reject) => {
-            if(id.startsWith("nmos_")){
+            if (id.startsWith("nmos_")) {
                 let nmosId = id.slice(5);
-                NmosRegistryConnector.instance.enableFlow(nmosId,disable);
-            } 
+                NmosRegistryConnector.instance.enableFlow(nmosId, disable);
+            }
             resolve({});
         });
     }
 
-    setMulticast(id:string, data:any){
+    setMulticast(id: string, data: any) {
         return new Promise((resolve, reject) => {
             if(id.startsWith("nmos_")){
                 let nmosId = id.slice(5);
@@ -118,12 +371,51 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
 
     changeAlias(id:string, alias:string){
-        return new Promise((resolve, reject) => {
+        return new Promise(async (resolve, reject) => {
+            // First update local storage (existing behavior)
             this.worker.postMessage(JSON.stringify({
                 changeAlias:{id:id, alias:alias}
             }));
+            
+            // Then attempt to persist to NMOS description field
+            try {
+                await this.updateNmosAlias(id, alias);
+            } catch (error) {
+                SyncLog.log("warning", "alias", `Failed to persist alias to NMOS: ${error instanceof Error ? error.message : String(error)}`);
+                // Continue anyway - local storage still works
+            }
+            
             resolve({});
         });
+    }
+    
+    /**
+     * Update NMOS description field with alias for persistent storage
+     */
+    private async updateNmosAlias(id: string, alias: string): Promise<void> {
+        if (!NmosRegistryConnector.instance) {
+            return;
+        }
+        
+        // Determine resource type and ID from crosspoint ID format
+        if (id.startsWith("nmos_")) {
+            const nmosId = id.slice(5);
+            
+            // Check what type of resource this is by looking in nmosState
+            const nmosState = NmosRegistryConnector.instance.getNmosState();
+            
+            if (nmosState.devices[nmosId]) {
+                await NmosRegistryConnector.instance.updateNmosDescription("devices", nmosId, alias);
+            } else if (nmosState.senders[nmosId]) {
+                await NmosRegistryConnector.instance.updateNmosDescription("senders", nmosId, alias);
+            } else if (nmosState.receivers[nmosId]) {
+                await NmosRegistryConnector.instance.updateNmosDescription("receivers", nmosId, alias);
+            } else if (nmosState.sources[nmosId]) {
+                await NmosRegistryConnector.instance.updateNmosDescription("sources", nmosId, alias);
+            } else if (nmosState.flows[nmosId]) {
+                await NmosRegistryConnector.instance.updateNmosDescription("flows", nmosId, alias);
+            }
+        }
     }
 
     toggleHidden(id:string){
@@ -135,13 +427,54 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         });
     }
 
+    // Allow modules (e.g., PredictiveStager) to subscribe to crosspoint updates
+    public registerUpdateCallback(cb: (state: CrosspointState, prev: CrosspointState | null) => void) {
+        try{
+            if(typeof cb === 'function'){
+                this.updateCallbacks.push(cb);
+            }
+        }catch(e){}
+    }
+
+    // Check if a device is a multiview decoder by counting video receiver flows
+    private isDeviceMultiviewDecoder(device: CrosspointDevice): boolean {
+        try {
+            console.log(`[DEBUG] isDeviceMultiviewDecoder called for device:`, {
+                name: device.name,
+                alias: device.alias,
+                num: device.num
+            });
+            
+            // Simple and reliable approach: multiviewer devices typically have exactly 4 video receiver flows
+            const videoReceiverFlows = this.optimizedLookup.findReceiverFlows(device.id, 'video');
+            const flowCount = videoReceiverFlows.length;
+            
+            console.log(`[DEBUG] Device has ${flowCount} video receiver flows`);
+            
+            // If device has exactly 4 video receiver flows, it's likely a multiviewer
+            const isMultiviewer = flowCount === 4;
+            
+            console.log(`[DEBUG] Multiviewer detection result: ${isMultiviewer} (based on flow count)`);
+            return isMultiviewer;
+            
+        } catch (error) {
+            console.log(`[DEBUG] Error in isDeviceMultiviewDecoder:`, error);
+            return false;
+        }
+    }
+
     makeConnection(data:any){
         return new Promise(async(resolve, reject) => {
             // Debug logging to track makeConnection calls
             console.log("[DEBUG] makeConnection called with:", JSON.stringify(data, null, 2));
 
-            let preview = true;
+            // Start latency measurement
+            const latencyMeasurement = ConnectionLatencyMeasurement.getInstance();
+            let timingContext: LatencyTimingContext | null = null;
+
+            let preview = false; // default to immediate activation unless explicitly preview/prepare
             let prepare = false;
+            const toBool = (v:any) => v === true || v === 'true' || v === 1 || v === '1';
             let list = [];
             if(data.hasOwnProperty("multiple")){
                 list = data.multiple;
@@ -151,12 +484,25 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 }
             }
 
-            if(data.hasOwnProperty("preview") && data.preview === false){
-                preview = false;
+            if(data.hasOwnProperty("preview")){
+                preview = toBool(data.preview);
             }
-            if(data.hasOwnProperty("prepare") && data.prepare === true){
-                prepare = true;
-                preview = false;
+            if(data.hasOwnProperty("prepare")){
+                prepare = toBool(data.prepare);
+                if(prepare) preview = false;
+            }
+
+            const mode = prepare ? "prepare" : (preview ? "preview" : "immediate");
+            SyncLog.log("info", "connect_crosspoint", "makeConnection mode", { preview, prepare, mode });
+
+            // Initialize timing context for first connection in list
+            if (list.length > 0) {
+                const firstConnection = list[0];
+                timingContext = latencyMeasurement.startConnectionTiming({
+                    sourceId: firstConnection.source,
+                    destinationId: firstConnection.destination,
+                    mode: mode as 'immediate' | 'prepare' | 'preview'
+                });
             }
 
 
@@ -207,20 +553,74 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 console.log("[DEBUG] Looking for source device:", {sourceDevice, sourceFlowType, sourceFlow, sourceDeviceOnly});
                 console.log("[DEBUG] Available devices:", this.crosspointState.devices.map(d => ({num: d.num, name: d.name, alias: d.alias})));
                 
-                for(let dev of this.crosspointState.devices){
-                    // Support name-based addressing: numeric ID, device name, or alias
-                    if(dev.num == sourceDevice || dev.name == sourceDevice || dev.alias == sourceDevice){
-                        console.log("[DEBUG] Found matching source device:", {num: dev.num, name: dev.name, alias: dev.alias});
-                        srcDev = dev;
-                        for(let type in dev.senders){
-                            if(type == sourceFlowType || sourceDeviceOnly){
-                                for(let flow of dev.senders[type]){
-                                    if(flow.num == sourceFlow || sourceDeviceOnly){
-                                        srcFlows.push(flow);
-                                        console.log("[DEBUG] Added source flow:", {type, flowNum: flow.num, flowId: flow.id});
-                                    }
+                // 1) Try direct NMOS flow-id addressing (e.g., 'nmos_<sender_id>') - OPTIMIZED
+                let matchedByNmosIdSrc = false;
+                if(source.startsWith("nmos_")){
+                    const flow = this.optimizedLookup.findFlow(source);
+                    if(flow){
+                        // Find the device that contains this flow
+                        for(const dev of this.crosspointState.devices){
+                            for(const type of Object.keys(dev.senders)){
+                                const arr:any[] = (dev.senders as any)[type] || [];
+                                if(arr.some(f => f.id === source)){
+                                    srcDev = dev;
+                                    srcFlows.push(flow);
+                                    matchedByNmosIdSrc = true;
+                                    console.log("[DEBUG] Matched source by NMOS id (OPTIMIZED):", {dev: {num: dev.num, name: dev.name, alias: dev.alias}, flowId: flow.id});
+                                    break;
                                 }
                             }
+                            if(matchedByNmosIdSrc) break;
+                        }
+                    }
+                }
+
+                // 2) Fallback to name/alias/num based addressing - OPTIMIZED
+                if(!matchedByNmosIdSrc){
+                    // Use optimized O(1) device lookup instead of O(n) loop
+                    const dev = this.optimizedLookup.findDevice(sourceDevice);
+                    if(dev){
+                        console.log("[DEBUG] Found matching source device (OPTIMIZED):", {num: dev.num, name: dev.name, alias: dev.alias});
+                        srcDev = dev;
+                        
+                        if(sourceDeviceOnly){
+                            // Get only video sender flows for device-level patching (not audio)
+                            srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, "video"));
+                            console.log("[DEBUG] Added video sender flows for device-level patching (OPTIMIZED):", srcFlows.length);
+                        } else if(sourceFlowType && sourceFlow){
+                            // Get specific flow using optimized lookup
+                            // Handle stream indexing - check if device is a multiview decoder
+                            let hwStreamIndex = parseInt(sourceFlow);
+                            
+                            // For multiview decoders, UI sends 0-based stream numbers directly (0, 1, 2, 3)
+                            // For other devices, UI sends 1-based stream numbers (1, 2, 3) that need conversion to 0-based
+                            const isMultiviewDecoder = srcDev && this.isDeviceMultiviewDecoder(srcDev);
+                            if (!isMultiviewDecoder) {
+                                // Convert from 1-based UI numbering (v.1) to 0-based hardware indexing (stream 0)
+                                hwStreamIndex = hwStreamIndex - 1;
+                            }
+                            
+                            console.log("[DEBUG] Stream indexing for source:", {
+                                sourceFlow, 
+                                isMultiviewDecoder, 
+                                hwStreamIndex,
+                                deviceName: srcDev?.name,
+                                deviceAlias: srcDev?.alias
+                            });
+                            
+                            const flow = this.optimizedLookup.findFlowByDeviceAndNum(dev.id, hwStreamIndex);
+                            if(flow && (flow.type === sourceFlowType || sourceFlowType === "unknown")){
+                                srcFlows.push(flow);
+                                console.log("[DEBUG] Added specific source flow (OPTIMIZED):", {type: flow.type, flowNum: flow.num, flowId: flow.id});
+                            } else {
+                                // Fallback: get flows by type
+                                srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, sourceFlowType));
+                                console.log("[DEBUG] Added sender flows by type (OPTIMIZED):", {type: sourceFlowType, count: srcFlows.length});
+                            }
+                        } else if(sourceFlowType){
+                            // Get flows by type only
+                            srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, sourceFlowType));
+                            console.log("[DEBUG] Added sender flows by type (OPTIMIZED):", {type: sourceFlowType, count: srcFlows.length});
                         }
                     }
                 }
@@ -256,20 +656,106 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
                 console.log("[DEBUG] Looking for destination device:", {destinationDevice, destinationFlowType, destinationFlow, destinationDeviceOnly});
                 
-                for(let dev of this.crosspointState.devices){
-                    // Support name-based addressing: numeric ID, device name, or alias
-                    if(dev.num == destinationDevice || dev.name == destinationDevice || dev.alias == destinationDevice){
-                        console.log("[DEBUG] Found matching destination device:", {num: dev.num, name: dev.name, alias: dev.alias});
-                        dstDev = dev;
-                        for(let type in dev.receivers){
-                            if(type == destinationFlowType || destinationDeviceOnly){
-                                for(let flow of dev.receivers[type]){
-                                    if(flow.num == destinationFlow || destinationDeviceOnly){
-                                        dstFlows.push(flow);
-                                        console.log("[DEBUG] Added destination flow:", {type, flowNum: flow.num, flowId: flow.id});
-                                    }
+                // 1) Try direct NMOS flow-id addressing (e.g., 'nmos_<receiver_id>') - OPTIMIZED
+                let matchedByNmosIdDst = false;
+                if(destination.startsWith("nmos_")){
+                    const flow = this.optimizedLookup.findFlow(destination);
+                    if(flow){
+                        // Find the device that contains this flow
+                        for(const dev of this.crosspointState.devices){
+                            for(const type of Object.keys(dev.receivers)){
+                                const arr:any[] = (dev.receivers as any)[type] || [];
+                                if(arr.some(f => f.id === destination)){
+                                    dstDev = dev;
+                                    dstFlows.push(flow);
+                                    matchedByNmosIdDst = true;
+                                    console.log("[DEBUG] Matched destination by NMOS id (OPTIMIZED):", {dev: {num: dev.num, name: dev.name, alias: dev.alias}, flowId: flow.id});
+                                    break;
                                 }
                             }
+                            if(matchedByNmosIdDst) break;
+                        }
+                    }
+                }
+
+                // 2) Fallback to name/alias/num based addressing - OPTIMIZED
+                if(!matchedByNmosIdDst){
+                    // Use optimized O(1) device lookup instead of O(n) loop
+                    const dev = this.optimizedLookup.findDevice(destinationDevice);
+                    if(dev){
+                        console.log("[DEBUG] Found matching destination device (OPTIMIZED):", {num: dev.num, name: dev.name, alias: dev.alias});
+                        dstDev = dev;
+                        
+                        if(destinationDeviceOnly){
+                            // Get only video receiver flows for device-level patching (not audio)
+                            const allReceiverFlows = this.optimizedLookup.findReceiverFlows(dev.id, "video");
+                            
+                            // Filter out flows that are not available in NMOS to prevent batch failures
+                            const nmosState = NmosRegistryConnector.instance.getNmosState();
+                            const availableFlows = allReceiverFlows.filter(flow => {
+                                if (!flow.id.startsWith("nmos_")) return false;
+                                const nmosId = flow.id.substring(5); // Remove "nmos_" prefix
+                                const isAvailable = nmosState && nmosState.receivers && nmosState.receivers.hasOwnProperty(nmosId);
+                                if (!isAvailable) {
+                                    console.log("[DEBUG] Filtering out unavailable NMOS receiver:", {flowId: flow.id, nmosId});
+                                }
+                                return isAvailable;
+                            });
+                            
+                            dstFlows.push(...availableFlows);
+                            console.log("[DEBUG] Added video receiver flows for device-level patching (OPTIMIZED):", {
+                                total: allReceiverFlows.length,
+                                available: availableFlows.length,
+                                filtered: allReceiverFlows.length - availableFlows.length
+                            });
+                        } else if(destinationFlowType && destinationFlow){
+                            // Get specific flow using optimized lookup
+                            // Handle stream indexing - check if device is a multiview decoder
+                            let hwStreamIndex = parseInt(destinationFlow);
+                            
+                            // For multiview decoders, UI sends 0-based stream numbers directly (0, 1, 2, 3)
+                            // For other devices, UI sends 1-based stream numbers (1, 2, 3, 4) that need conversion to 0-based
+                            const isMultiviewDecoder = dstDev && this.isDeviceMultiviewDecoder(dstDev);
+                            
+                            // For non-multiviewer devices, only allow .v1 connections
+                            if (!isMultiviewDecoder && parseInt(destinationFlow) > 1) {
+                                console.log("[DEBUG] Non-multiviewer device: ignoring flow request above v1:", {
+                                    deviceName: dstDev?.name,
+                                    deviceAlias: dstDev?.alias,
+                                    requestedFlow: destinationFlow,
+                                    message: 'Non-multiviewer devices only accept device-level connections or .v1'
+                                });
+                                // Skip processing this flow - effectively ignores .v2, .v3, .v4 for non-multiviewer devices
+                            } else {
+                                if (!isMultiviewDecoder) {
+                                    // Convert from 1-based UI numbering (v.1) to 0-based hardware indexing (stream 0)
+                                    hwStreamIndex = hwStreamIndex - 1;
+                                }
+                                
+                                console.log("[DEBUG] Stream indexing for destination:", {
+                                    destinationFlow, 
+                                    isMultiviewDecoder, 
+                                    hwStreamIndex,
+                                    deviceName: dstDev?.name,
+                                    deviceAlias: dstDev?.alias,
+                                    originalIndex: parseInt(destinationFlow),
+                                    indexConversion: isMultiviewDecoder ? 'none (multiviewer mode)' : '1-based to 0-based (regular mode)'
+                                });
+                                
+                                const flow = this.optimizedLookup.findFlowByDeviceAndNum(dev.id, hwStreamIndex);
+                                if(flow && (flow.type === destinationFlowType || destinationFlowType === "unknown")){
+                                    dstFlows.push(flow);
+                                    console.log("[DEBUG] Added specific destination flow (OPTIMIZED):", {type: flow.type, flowNum: flow.num, flowId: flow.id});
+                                } else {
+                                    // Fallback: get flows by type
+                                    dstFlows.push(...this.optimizedLookup.findReceiverFlows(dev.id, destinationFlowType));
+                                    console.log("[DEBUG] Added receiver flows by type (OPTIMIZED):", {type: destinationFlowType, count: dstFlows.length});
+                                }
+                            }
+                        } else if(destinationFlowType){
+                            // Get flows by type only
+                            dstFlows.push(...this.optimizedLookup.findReceiverFlows(dev.id, destinationFlowType));
+                            console.log("[DEBUG] Added receiver flows by type (OPTIMIZED):", {type: destinationFlowType, count: dstFlows.length});
                         }
                     }
                 }
@@ -292,83 +778,136 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                         //      Type
                         //      Capabilities
                         //      Lowest NUM
-
-                        let usedSources = [];
-
                         for(let dstFlow of dstFlows){
                             let connection = {src:null,srcDev:srcDev, dst:dstFlow,dstDev:dstDev}
-
                             if(disconnect){
-                                // src : null
+                                // src : null (explicit disconnect request)
+                                connections.push(connection);
+                                continue;
+                            }
+                            // Choose best matching source using optimized compatibility check with caching
+                            let bestSrc:any = null;
+                            for(let srcFlow of srcFlows){
+                                // Use optimized compatibility check with caching
+                                if(this.optimizedLookup.areFlowsCompatible(srcFlow, dstFlow)){
+                                    if(bestSrc == null || (typeof srcFlow.num === "number" && typeof bestSrc.num === "number" && srcFlow.num < bestSrc.num)){
+                                        bestSrc = srcFlow;
+                                    }
+                                }
+                            }
+                            // Alternative: use optimized findBestSender method
+                            // bestSrc = this.optimizedLookup.findBestSender(dstFlow, srcFlows);
+                            if(bestSrc){
+                                connection.src = bestSrc;
+                                connections.push(connection);
                             }else{
-                                for(let srcFlow of srcFlows){
-                                    // TODO websocket/mqtt flwos interop
-                                    let connect = false;
-                                    if(dstFlow.type == "audio" && srcFlow.type == "audio"){
-                                        // TODO check for capabilities
-                                        connect = true;
-                                    }else if(dstFlow.type == "video" && srcFlow.type == "video"){
-                                        // TODO check for capabilities
-                                        connect = true;
-                                    }else if(dstFlow.type == "data"){
-                                        if(srcFlow.type == "data"){
-                                            // TODO check for capabilities
-                                            connect = true;
-                                        }
-                                    }else{
-                                        if(dstFlow.type == srcFlow.type){
-                                            connect = true;
-                                        }
-                                    }
-
-                                    if(connect && !usedSources.includes(srcFlow.id)){
-                                        if(connection.src == null){
-                                            connection.src = srcFlow;
-                                            usedSources.push(srcFlow.id);
-                                        }else if(connection.src.num > srcFlow.num){
-                                            usedSources = usedSources.filter((s)=>{
-                                                if(s.id == connection.src.id){
-                                                    return false;
-                                                }else{
-                                                    return true;
-                                                }
-                                            })
-                                            connection.src = srcFlow;
-                                        }
-                                    }
-                                
+                                // No matching source for this destination; skip to avoid unintended disconnects
+                                SyncLog.log("info", "connect_crosspoint", `No matching source for destination ${dstFlow.id}; skipping`);
                             }
-                            }
- 
-                            connections.push(connection);
                         }
                 }
 
             });
 
-
+            // Mark device resolution phase complete
+            if (timingContext) {
+                latencyMeasurement.markPhase(timingContext.connectionId, 'deviceResolution');
+            }
 
             if(preview){
                 let connectionPreviews = [];
                 connections.forEach((c)=>{
                     connectionPreviews.push({src:(c.src?c.src.id:null),dst:c.dst.id, status:"preview"});
                 });
+                
+                // Complete latency measurement for preview mode
+                if (timingContext) {
+                    latencyMeasurement.completeConnectionMeasurement(timingContext.connectionId, true);
+                }
+                
                 resolve({connections:connectionPreviews});
             }else if(prepare){
-                let connectionPreviews = [];
+                let stagePromises:any[] = [];
+                let stageDisconnectPromises:any[] = [];
+                let connectionResponses:any[] = [];
+
+                // Stage connects
                 connections.forEach((c)=>{
-                    connectionPreviews.push({src:c.src,dst:c.dst,srcDev:(c.src ? c.srcDev : null), dstDev:c.dstDev, status:"prepare"});
+                    if(c.src){
+                        stagePromises.push(this.executeConnectionPrepare(c.src,c.dst));
+                    }
                 });
-                resolve({connections:connectionPreviews});
+                let results = await Promise.allSettled(stagePromises);
+                results.forEach((r)=>{
+                    if(r.status == "fulfilled"){ connectionResponses.push(r.value); }
+                    else{ connectionResponses.push(r.reason); }
+                });
+
+                // Stage disconnects
+                connections.forEach((c)=>{
+                    if(!c.src){
+                        stageDisconnectPromises.push(this.executeConnectionPrepare(c.src,c.dst));
+                    }
+                });
+                results = await Promise.allSettled(stageDisconnectPromises);
+                results.forEach((r)=>{
+                    if(r.status == "fulfilled"){ connectionResponses.push(r.value); }
+                    else{ connectionResponses.push(r.reason); }
+                });
+
+                // Complete latency measurement for prepare mode
+                if (timingContext) {
+                    const success = connectionResponses.every(r => r.status && (r.status.includes("ok") || r.status === "preview"));
+                    latencyMeasurement.completeConnectionMeasurement(timingContext.connectionId, success);
+                }
+
+                resolve({connections:connectionResponses});
             }else{
                 let connectionPromises = [];
                 let disconnectPromises = [];
                 let connectionResponses = [];
 
-                // Connects
-                connections.forEach((c)=>{
+                // Connects - Use parallel processing for NMOS connections
+                const nmosConnections = connections.filter(c => c.src && c.dst.id.startsWith("nmos_"));
+                const nonNmosConnections = connections.filter(c => c.src && !c.dst.id.startsWith("nmos_"));
+                
+                // Process NMOS connections in parallel using ParallelNmosConnector
+                if (nmosConnections.length > 0) {
+                    const parallelConnector = ParallelNmosConnector.getInstance();
+                    
+                    // Group by sender for batch processing
+                    const senderGroups = new Map<string, typeof nmosConnections>();
+                    nmosConnections.forEach(conn => {
+                        const senderId = conn.src!.id;
+                        if (!senderGroups.has(senderId)) {
+                            senderGroups.set(senderId, []);
+                        }
+                        senderGroups.get(senderId)!.push(conn);
+                    });
+                    
+                    // Process each sender group in parallel
+                    const parallelPromises = Array.from(senderGroups.entries()).map(async ([senderId, conns]) => {
+                        const receiverIds = conns.map(c => c.dst.id);
+                        const results = await parallelConnector.makeBatchConnection(senderId, receiverIds, false);
+                        
+                        return results.map((result, index) => {
+                            const conn = conns[index];
+                            if (result.success) {
+                                return { src: conn.src, dst: conn.dst, status: "ok", detail: { message: "Success", log: result.logId } };
+                            } else {
+                                return { src: conn.src, dst: conn.dst, status: "failed", detail: { message: result.error, log: "" } };
+                            }
+                        });
+                    });
+                    
+                    const parallelResults = await Promise.all(parallelPromises);
+                    connectionPromises.push(...parallelResults.flat().map(result => Promise.resolve(result)));
+                }
+                
+                // Process non-NMOS connections normally
+                nonNmosConnections.forEach((c)=>{
                     if(c.src){
-                        connectionPromises.push(this.executeConnection(c.src,c.dst));
+                        connectionPromises.push(this.executeConnection(c.src,c.dst,timingContext));
                     }
                 });
                 
@@ -385,7 +924,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 // Dsiconnects
                 connections.forEach((c)=>{
                     if(!c.src){
-                        disconnectPromises.push(this.executeConnection(c.src,c.dst));
+                        disconnectPromises.push(this.executeConnection(c.src,c.dst,timingContext));
                     }
                 });
                 results = await Promise.allSettled(disconnectPromises);
@@ -396,6 +935,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                         connectionResponses.push(r.reason);
                     }
                 })
+
+                // Complete latency measurement for immediate mode
+                if (timingContext) {
+                    const success = connectionResponses.every(r => 
+                        r.status && (r.status.startsWith('ok') || r.status === 'preview')
+                    );
+                    latencyMeasurement.completeConnectionMeasurement(timingContext.connectionId, success);
+                    if (success && connections.length > 0 && connections[0].dst) {
+                        latencyMeasurement.detectStreamActive(timingContext.connectionId, connections[0].dst.id);
+                    }
+                }
 
                 resolve({connections:connectionResponses});
             }
@@ -419,7 +969,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
     }
 
 
-    executeConnection(src:CrosspointFlow,dst:CrosspointFlow){
+    executeConnection(src:CrosspointFlow,dst:CrosspointFlow, timingContext?: LatencyTimingContext){
         return new Promise(async(resolve, reject) => {
             if(dst){
                 let senderInfo:CrosspointConnectionSenderInfo|null = null;
@@ -428,7 +978,13 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     try{
                         if(src.id.startsWith("nmos_")){
                             let nmosId = src.id.slice(5);
+                            // Mark sender info retrieval start for latency measurement
+                            const latencyMeasurement = ConnectionLatencyMeasurement.getInstance();
                             senderInfo = await NmosRegistryConnector.instance.connectionGetSenderInfo(nmosId);
+                            // Mark sender info phase complete
+                            if (timingContext) {
+                                latencyMeasurement.markPhase(timingContext.connectionId, 'senderInfoRetrieved');
+                            }
                         }
                         
                     }catch(e){
@@ -453,7 +1009,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 if(dst.id.startsWith("nmos_")){
                     try{
                         let nmosId = dst.id.slice(5);
+                        // Mark NMOS patching start
+                        if (timingContext) {
+                            const latencyMeasurement = ConnectionLatencyMeasurement.getInstance();
+                            latencyMeasurement.markPhase(timingContext.connectionId, 'patchSent');
+                        }
                         let log = await NmosRegistryConnector.instance.makeConnection(nmosId,senderInfo);
+                        // Mark NMOS patching complete
+                        if (timingContext) {
+                            const latencyMeasurement = ConnectionLatencyMeasurement.getInstance();
+                            latencyMeasurement.markPhase(timingContext.connectionId, 'patchResponse');
+                        }
                         if(senderInfo.senderId == "disconnect"){
                             resolve({src:src,dst:dst,status:"ok_dis", detail:{message:"Success",log:""+log}});
                         }else{
@@ -507,22 +1073,24 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             }
         }
     }
-
-    updateFromNmos(state:any){
-        this.nmosState = state;
-        this.update();
-    }
-
-    update(){
-        this.worker.postMessage(JSON.stringify({
-            nmosState:this.nmosState,
-        }))
-    }
-
-    updateReturn(data:any){
+    
+    updateReturn(data: any) {
         if(data.hasOwnProperty("crosspointState")){
+            const prev = this.crosspointState;
             this.crosspointState = data.crosspointState;
+            
+            // Update optimized lookup maps for O(1) performance
+            this.optimizedLookup.updateFromCrosspointState(this.crosspointState);
+            
             this.syncCrosspoint.setState(this.crosspointState);
+            // Notify subscribers
+            try{
+                this.updateCallbacks.forEach(cb => {
+                    try{ cb(this.crosspointState, prev); }catch(e){
+                        SyncLog.log("error", "crosspoint", "Update callback failed", e);
+                    }
+                });
+            }catch(e){}
         }
 
         if(data.hasOwnProperty("log")){
@@ -531,6 +1099,36 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
         if(data.hasOwnProperty("nmosSetMulticast")){
             NmosRegistryConnector.instance.setFlowMulticast(data.nmosSetMulticast.nmosId,data.nmosSetMulticast.multicast);
+        }
+    }
+    
+    updateFromNmos(nmosState: any) {
+        const isFirstUpdate = !this.nmosState;
+        this.nmosState = nmosState;
+        this.worker.postMessage(JSON.stringify({
+            nmosState: this.nmosState
+        }));
+        
+        // On first NMOS update: check IS-13 support, load existing aliases, and migrate local aliases (only once)
+        if (isFirstUpdate) {
+            // Small delay to ensure worker thread has processed NMOS state first
+            setTimeout(async () => {
+                // Check and log IS-13 support status
+                this.checkIs13Support();
+                
+                // First load any existing aliases from NMOS description fields
+                this.loadNmosAliases();
+                
+                // Then migrate existing local aliases to NMOS description fields (one-time only)
+                // Additional delay to let loadNmosAliases complete first
+                setTimeout(async () => {
+                    try {
+                        await this.migrateExistingAliasesToNmosOnce();
+                    } catch (error) {
+                        SyncLog.log("warning", "alias", `Alias migration failed: ${error instanceof Error ? error.message : String(error)}`);
+                    }
+                }, 2000);
+            }, 1000);
         }
     }
 
@@ -561,6 +1159,7 @@ export interface CrosspointFlow {
     order : number,
     available:boolean,
     active:boolean,
+    staged:boolean,
     num:number,
     dynamic:boolean,
     name:string,

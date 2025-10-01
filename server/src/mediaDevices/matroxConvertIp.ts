@@ -88,7 +88,17 @@ class MatroxCipDevice {
     ptpEnabled:boolean = true;
     ptpDomain:string|number = "";
 
+    // IGMP version control
+    igmpVersion: "none" | "v2" | "v3" = "none";
+
     flowMode:string = "mixed";
+
+    // Multiviewer state
+    isMultiviewEnabled:boolean = false;
+
+    // Audio stream states
+    txAudioStream0Enabled:boolean = false;
+    rxAudioStream0Enabled:boolean = false;
 
     time:number = 0
     
@@ -135,7 +145,46 @@ export default class MediaDevMatroxConvertIp {
             "file":"./config/edid/2160p50.bin"
         }],
         resolutions:[],
-        "manualDevices":[]
+        "manualDevices":[],
+        "autoConfigNmosRegistry": {
+            "enabled": false,
+            "configureOnDiscovery": true,
+            "retryOnFailure": true,
+            "retryDelayMs": 30000
+        },
+        "disableAutoReauth": false
+    }
+
+    private settings: any;
+
+    // Helper methods to get registry information from settings.json
+    private getPrimaryRegistry() {
+        if (!this.settings?.staticNmosRegistries?.length) {
+            return null;
+        }
+        // Get the registry with highest priority (lowest number)
+        return this.settings.staticNmosRegistries.reduce((highest, current) =>
+            (current.priority < highest.priority) ? current : highest
+        );
+    }
+
+    private getRegistryIp(): string {
+        const registry = this.getPrimaryRegistry();
+        return registry?.ip || "";
+    }
+
+    private getRegistryPort(): number {
+        const registry = this.getPrimaryRegistry();
+        return registry?.port || 3210;
+    }
+
+    private getRegistryApiVersion(): string {
+        // Use the first supported version from settings
+        return this.settings?.nmos?.registryVersions?.[0] || "v1.3";
+    }
+
+    private isAutoConfigEnabled(): boolean {
+        return this.config.autoConfigNmosRegistry.enabled && !!this.getRegistryIp();
     }
 
     httpsAgent:any = null
@@ -166,33 +215,52 @@ export default class MediaDevMatroxConvertIp {
     
     
     constructor(settings:any){
+        this.settings = settings;
         this.ptpDomain = settings.ptp.domain;
         this.quickState = new BehaviorSubject<any>(this.quickStateInternal);
+        
+        try{
+            if (!fs.existsSync("./state/mediadev_matroxcip")) {
+                fs.mkdirSync("./state/mediadev_matroxcip", { recursive: true });
+            }
+        }catch(e){
+            SyncLog.log("error", "MatroxCIP", "Error:", e.message);
+        }
+
+        try {
+            let rawFile = fs.readFileSync("./config/mediadev_matroxcip/matroxcip.json");
+            let top = JSON.parse(rawFile);
+            this.config = top;
+            
+            // Initialize autoConfigNmosRegistry if not present in loaded config
+            if (!this.config.autoConfigNmosRegistry) {
+                this.config.autoConfigNmosRegistry = {
+                    enabled: false,
+                    configureOnDiscovery: true,
+                    retryOnFailure: true,
+                    retryDelayMs: 30000
+                };
+            }
+        } catch (e) {
+            console.error("Error reading from file: ./config/mediadev_matroxcip/matroxcip.json");
+            // File load failed, config will remain as the default structure already defined above
+            // Ensure autoConfigNmosRegistry exists in the default config
+            if (!this.config.autoConfigNmosRegistry) {
+                this.config.autoConfigNmosRegistry = {
+                    enabled: false,
+                    configureOnDiscovery: true,
+                    retryOnFailure: true,
+                    retryDelayMs: 30000
+                };
+            }
+        }
+
         // TODO Config of https ignore SSL cert error
         this.httpsAgent = new https.Agent({  
             rejectUnauthorized: !this.config.ignoreHttps,
             keepAlive: true
         });
 
-
-        try{
-            if (!fs.existsSync("./state/mediadev_matroxcip")) {
-                fs.mkdirSync("./state/mediadev_matroxcip");
-                console.log("Folder created: ./state/mediadev_matroxcip");
-            }
-        }catch(e){
-            console.error("Error while creating Folder: ./state/mediadev_matroxcip");
-        }
-
-
-
-        try {
-            let rawFile = fs.readFileSync("./config/mediadev_matroxcip/matroxcip.json");
-            let top = JSON.parse(rawFile);
-            this.config = top;
-        } catch (e) {
-            console.error("Error reading from file: ./config/mediadev_matroxcip/matroxcip.json");
-        }
 
         if(process.env.MATROX_CIP_USER)
         {
@@ -328,6 +396,27 @@ export default class MediaDevMatroxConvertIp {
             });
         });
 
+        server.addRoute("POST", "matroxcip_toggleaudio","global", (client: WebsocketClient, query:string[], postData: any) => {
+            return new Promise((resolve, reject) => {
+                this.toggleAudioStream(postData.sn, postData.streamType, postData.streamIndex, postData.enabled).then(()=>{
+                    resolve({});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                })
+                
+            });
+        });
+
+        server.addRoute("POST", "matroxcip_setigmp","global", (client: WebsocketClient, query:string[], postData: any) => {
+            return new Promise((resolve, reject) => {
+                this.setIgmpVersion(postData.sn, postData.version).then(()=>{
+                    resolve({});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                })
+            });
+        });
+
         server.addRoute("POST", "matroxcip_togglemultiviewer","global", (client: WebsocketClient, query:string[], postData: any) => {
             return new Promise((resolve, reject) => {
                 this.toggleMultiviewer(postData.sn, postData.enabled).then(()=>{
@@ -352,6 +441,16 @@ export default class MediaDevMatroxConvertIp {
         server.addRoute("GET", "matroxcip_ptpdisableall","global", (client: WebsocketClient, query:string[]) => {
             return new Promise((resolve, reject) => {
                 this.ptpDisableAll().then(()=>{
+                    resolve({});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                })
+            });
+        });
+
+        server.addRoute("POST", "matroxcip_setigmpall","global", (client: WebsocketClient, query:string[], postData: any) => {
+            return new Promise((resolve, reject) => {
+                this.setIgmpVersionAll(postData.version).then(()=>{
                     resolve({});    
                 }).catch((e)=>{
                     reject({status:400, message:e.message});
@@ -439,8 +538,38 @@ export default class MediaDevMatroxConvertIp {
 
         server.addRoute("POST", "matroxcip_setnmosregistry","global", (client: WebsocketClient, query:string[], postData: any) => {
             return new Promise((resolve, reject) => {
-                this.setNmosRegistry(postData.sn, postData.ip, postData.port).then(()=>{
+                this.setNmosRegistry(postData.sn, postData.ip, postData.port, postData.apiVersion).then(()=>{
                     resolve({message: "NMOS registry configured successfully"});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                })
+            });
+        });
+
+        server.addRoute("POST", "matroxcip_autonmosregistry","global", (client: WebsocketClient, query:string[], postData: any) => {
+            return new Promise((resolve, reject) => {
+                this.configureAutoNmosRegistry(postData.enabled).then(()=>{
+                    resolve({message: "Auto NMOS registry configuration updated successfully"});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                });
+            });
+        });
+
+        server.addRoute("POST", "matroxcip_toggleautoreauth","global", (client: WebsocketClient, query:string[], postData: any) => {
+            return new Promise((resolve, reject) => {
+                this.toggleAutoReauth(postData.enabled).then(()=>{
+                    resolve({message: "Auto-reauthentication setting updated successfully"});    
+                }).catch((e)=>{
+                    reject({status:400, message:e.message});
+                });
+            });
+        });
+
+        server.addRoute("GET", "matroxcip_bulknmosregistry","global", (client: WebsocketClient, query:string[]) => {
+            return new Promise((resolve, reject) => {
+                this.bulkConfigureNmosRegistry().then((results)=>{
+                    resolve({message: "Bulk NMOS registry configuration completed", results});    
                 }).catch((e)=>{
                     reject({status:400, message:e.message});
                 })
@@ -652,59 +781,106 @@ export default class MediaDevMatroxConvertIp {
                     ips.push(ep.host);
                 });
 
+                // Extract device name/hostname if available
+                let deviceName = data.label || data.description || "";
+
                 // Helper function to determine if a serial number is alphanumeric (preferred format)
                 const isAlphanumeric = (serial: string): boolean => {
                     return /[a-zA-Z]/.test(serial); // Contains at least one letter
                 };
 
-                // Device deduplication logic
+                // Enhanced device deduplication logic
                 let existingDeviceKey: string | null = null;
                 let existingDevice: MatroxCipDevice | null = null;
                 let useNewSerialAsKey = false;
+                let matchReason = "";
 
                 // First check if we already have this exact serial number
                 if(this.state.devices.hasOwnProperty(sn)){
                     existingDeviceKey = sn;
                     existingDevice = this.state.devices[sn];
+                    matchReason = "exact serial";
                 } else {
-                    // Check for duplicates using normalized serial numbers and IP addresses
+                    // Enhanced deduplication: Check for duplicates using multiple criteria
+                    let bestMatch: { key: string; device: MatroxCipDevice; score: number; reasons: string[] } | null = null;
+                    
                     for(let deviceSerial in this.state.devices) {
                         let device = this.state.devices[deviceSerial];
+                        let matchScore = 0;
+                        let matchReasons: string[] = [];
                         
-                        // Normalize serial numbers for comparison (remove non-alphanumeric, convert to lowercase)
+                        // 1. Serial number matching (multiple approaches)
                         let normalizedSN = sn.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
                         let normalizedExistingSN = deviceSerial.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
                         
-                        // Check if serial numbers match when normalized
                         let serialsMatch = false;
                         if(normalizedSN === normalizedExistingSN) {
                             serialsMatch = true;
+                            matchScore += 100; // Highest priority
+                            matchReasons.push("exact normalized serial");
                         } else {
-                            // Also check for partial matches (e.g., "8700634" vs "yxa00634" both containing "00634")
-                            let snSuffix = normalizedSN.slice(-6); // Last 6 characters
-                            let existingSuffix = normalizedExistingSN.slice(-6);
-                            if(snSuffix.length >= 4 && existingSuffix.length >= 4 && snSuffix === existingSuffix) {
-                                serialsMatch = true;
+                            // Enhanced partial matching - multiple suffix lengths
+                            for(let suffixLen of [8, 6, 5, 4]) {
+                                let snSuffix = normalizedSN.slice(-suffixLen);
+                                let existingSuffix = normalizedExistingSN.slice(-suffixLen);
+                                if(snSuffix.length >= 4 && existingSuffix.length >= 4 && snSuffix === existingSuffix) {
+                                    serialsMatch = true;
+                                    matchScore += Math.max(80 - (8 - suffixLen) * 10, 20); // Score based on suffix length
+                                    matchReasons.push(`serial suffix match (${suffixLen} chars)`);
+                                    break;
+                                }
                             }
                         }
                         
-                        // Check if IP addresses match (same physical device should have same IPs)
-                        let ipsMatch = device.ipList.length > 0 && ips.length > 0 && 
-                                     device.ipList.some(ip => ips.includes(ip));
-                        
-                        if(serialsMatch || ipsMatch) {
-                            existingDeviceKey = deviceSerial;
-                            existingDevice = device;
-                            
-                            // Prefer alphanumeric serial number as the primary key
-                            if(isAlphanumeric(sn) && !isAlphanumeric(deviceSerial)) {
-                                useNewSerialAsKey = true;
-                                SyncLog.log("info", "MatroxCIP", `Device deduplication: Will migrate device from numeric '${deviceSerial}' to alphanumeric '${sn}' format`);
+                        // 2. IP address matching (higher weight for exact matches)
+                        if(device.ipList.length > 0 && ips.length > 0) {
+                            let commonIPs = device.ipList.filter(ip => ips.includes(ip));
+                            if(commonIPs.length > 0) {
+                                matchScore += 60 + (commonIPs.length * 10); // More common IPs = higher score
+                                matchReasons.push(`IP match (${commonIPs.join(', ')})`);
                             }
-                            
-                            SyncLog.log("info", "MatroxCIP", `Device deduplication: Found existing device '${deviceSerial}' for new serial '${sn}' (serial match: ${serialsMatch}, IP match: ${ipsMatch})`);
-                            break;
                         }
+                        
+                        // 3. Device name/hostname matching
+                        if(deviceName && device.name && deviceName.toLowerCase() === device.name.toLowerCase()) {
+                            matchScore += 30;
+                            matchReasons.push("device name match");
+                        }
+                        
+                        // 4. Prioritize reactivation of failed devices (likely after reboot)
+                        if(device.failed || device.unreachable || device.error) {
+                            matchScore += 20;
+                            matchReasons.push("reactivating failed device");
+                        }
+                        
+                        // 5. Consider device type/firmware mode if available
+                        if(device.type && device.firmwareMode) {
+                            // This will be checked after device info is loaded, but we can still bonus existing typed devices
+                            matchScore += 5;
+                        }
+                        
+                        // Update best match if this device has a higher score
+                        if(matchScore > 50 && (!bestMatch || matchScore > bestMatch.score)) { // Minimum threshold
+                            bestMatch = {
+                                key: deviceSerial,
+                                device: device,
+                                score: matchScore,
+                                reasons: matchReasons
+                            };
+                        }
+                    }
+                    
+                    if(bestMatch) {
+                        existingDeviceKey = bestMatch.key;
+                        existingDevice = bestMatch.device;
+                        matchReason = bestMatch.reasons.join(', ');
+                        
+                        // Prefer alphanumeric serial number as the primary key
+                        if(isAlphanumeric(sn) && !isAlphanumeric(bestMatch.key)) {
+                            useNewSerialAsKey = true;
+                        }
+                        
+                        SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Matched device '${bestMatch.key}' to new serial '${sn}' (score: ${bestMatch.score}, reasons: ${matchReason})`);
                     }
                 }
 
@@ -720,7 +896,7 @@ export default class MediaDevMatroxConvertIp {
                         cip.sn = sn; // Update the device's serial number property
                         this.state.devices[sn] = cip;
                         finalDeviceKey = sn;
-                        SyncLog.log("info", "MatroxCIP", `Device deduplication: Migrated device to alphanumeric key '${sn}'`);
+                        SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Migrated device '${existingDeviceKey}' to alphanumeric key '${sn}' (${matchReason})`);
                     } else {
                         finalDeviceKey = existingDeviceKey!;
                     }
@@ -728,22 +904,49 @@ export default class MediaDevMatroxConvertIp {
                     // Merge IP lists to ensure we have all available IPs
                     let mergedIps = [...new Set([...cip.ipList, ...ips])];
                     cip.ipList = mergedIps;
-                    SyncLog.log("info", "MatroxCIP", `Device deduplication: Updated existing device '${finalDeviceKey}' with IPs: ${mergedIps.join(', ')}`);
+                    
+                    // Reset failure states when device comes back online
+                    cip.failed = false;
+                    cip.error = "";
+                    cip.unreachable = false;
+                    cip.outdated = false;
+                    
+                    // Update device name if we have it
+                    if(deviceName && !cip.name) {
+                        cip.name = deviceName;
+                    }
+                    
+                    SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Reactivated existing device '${finalDeviceKey}' with IPs: ${mergedIps.join(', ')} (${matchReason})`);
                 } else {
                     // Create new device
                     cip = new MatroxCipDevice();
                     cip.sn = sn;
                     cip.loading = false;
                     cip.ipList = ips;
+                    if(deviceName) {
+                        cip.name = deviceName;
+                    }
                     this.state.devices[sn] = cip;
                     finalDeviceKey = sn;
-                    SyncLog.log("info", "MatroxCIP", `Device deduplication: Created new device '${sn}' with IPs: ${ips.join(', ')}`);
+                    SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Created new device '${sn}' with IPs: ${ips.join(', ')}`);
                 }
+                
+                // Cleanup: Remove any obvious stale duplicates after successful match
+                this.cleanupStaleDevices(finalDeviceKey, ips);
 
                 this.reloadData(cip.ipList, finalDeviceKey, cip);
                 setTimeout(()=>{
                     this.reloadData(cip.ipList, finalDeviceKey, cip);
                 },5000);
+
+                // Auto-configure NMOS registry if enabled
+                if (this.isAutoConfigEnabled() && 
+                    this.config.autoConfigNmosRegistry.configureOnDiscovery) {
+                    
+                    setTimeout(() => {
+                        this.autoConfigureNmosRegistry(finalDeviceKey, cip);
+                    }, 10000); // Wait 10 seconds for device to stabilize
+                }
             }
         }catch(e){
             SyncLog.log("error", "MatroxCIP", "Error in nodeChange:", e.message);
@@ -889,6 +1092,124 @@ export default class MediaDevMatroxConvertIp {
         },2000)
     }
 
+    // Web Accessible - IGMP Version Control (available on both TX and RX devices)
+    async setIgmpVersion(sn: string, version: "none" | "v2" | "v3") {
+        let ipList: string[] = [];
+        let cip;
+        if (this.state.devices.hasOwnProperty(sn)) {
+            ipList = this.state.devices[sn].ipList;
+            cip = this.state.devices[sn];
+        } else {
+            throw new Error("Device not found.");
+        }
+
+        // Get current other settings
+        let context = await this.apiRequest(ipList, sn, "GET", "/device/settings/other");
+        if (!context) {
+            throw new Error("Cannot get other settings context.");
+        }
+
+        // Update IGMP version
+        let data = { ...context };
+        data.igmpVersion = version;
+        
+        SyncLog.log("info", "MatroxCIP", `Setting IGMP version to ${version} for device ${sn}`);
+        
+        let result = await this.apiRequest(ipList, sn, "POST", "/device/settings/other", data);
+        
+        // Note: Device reboot may be required for changes to take effect
+        SyncLog.log("warning", "MatroxCIP", `IGMP version change requires device reboot for ${sn}`);
+
+        setTimeout(() => {
+            this.reloadData(ipList, sn, cip);
+        }, 2000);
+    }
+
+    // Web Accessible - Toggle Audio Stream Enable/Disable
+    async toggleAudioStream(sn: string, streamType: 'tx' | 'rx', streamIndex: number, enabled: boolean) {
+        let ipList: string[] = [];
+        let cip;
+        if (this.state.devices.hasOwnProperty(sn)) {
+            ipList = this.state.devices[sn].ipList;
+            cip = this.state.devices[sn];
+        } else {
+            throw new Error("Device not found.");
+        }
+
+        SyncLog.log("info", "MatroxCIP", `${enabled ? 'Enabling' : 'Disabling'} ${streamType.toUpperCase()} audio stream ${streamIndex} for device ${sn}`);
+
+        // For RX streams, we need to get current SDP URL
+        let data: any = { enable: enabled };
+        
+        if (streamType === 'rx') {
+            try {
+                let currentStream = await this.apiRequest(ipList, sn, "GET", `/device/settings/streams/audio/${streamIndex}`);
+                if (currentStream && currentStream.sdpUrl) {
+                    data.sdpUrl = currentStream.sdpUrl;
+                } else {
+                    // If no current SDP URL, provide empty string as required parameter
+                    data.sdpUrl = "";
+                }
+                SyncLog.log("info", "MatroxCIP", `Got current RX audio stream ${streamIndex} config for ${sn}: ${JSON.stringify(currentStream)}`);
+            } catch (error) {
+                SyncLog.log("warning", "MatroxCIP", `Could not get current SDP URL for RX audio stream ${streamIndex} on ${sn}: ${error instanceof Error ? error.message : String(error)}`);
+                // If we can't get current config, provide empty SDP URL as required parameter
+                data.sdpUrl = "";
+            }
+        }
+
+        SyncLog.log("info", "MatroxCIP", `Posting to /device/settings/streams/audio/${streamIndex} for ${sn} with data: ${JSON.stringify(data)}`);
+        
+        try {
+            let result = await this.apiRequest(ipList, sn, "POST", `/device/settings/streams/audio/${streamIndex}`, data);
+            SyncLog.log("info", "MatroxCIP", `Audio stream toggle successful for ${sn}, result: ${JSON.stringify(result)}`);
+        } catch (error) {
+            SyncLog.log("error", "MatroxCIP", `Audio stream toggle failed for ${sn}: ${error instanceof Error ? error.message : String(error)}`);
+            throw error;
+        }
+
+        setTimeout(() => {
+            this.reloadData(ipList, sn, cip);
+        }, 2000);
+    }
+
+    // Public method to query multiviewer enabled status by device serial number, name, or alias
+    isMultiviewerEnabled(deviceIdentifier: string): boolean {
+        try {
+            SyncLog.log("debug", "MatroxCIP", `Checking multiviewer status for: ${deviceIdentifier}`);
+            
+            // Try direct serial number lookup first
+            if (this.state.devices.hasOwnProperty(deviceIdentifier)) {
+                const result = this.state.devices[deviceIdentifier].isMultiviewEnabled || false;
+                SyncLog.log("debug", "MatroxCIP", `Found device by SN ${deviceIdentifier}: multiviewer=${result}`);
+                return result;
+            }
+            
+            // Try lookup by name or alias
+            for (const sn in this.state.devices) {
+                const device = this.state.devices[sn];
+                if (device.name === deviceIdentifier || device.alias === deviceIdentifier || device.num?.toString() === deviceIdentifier) {
+                    const result = device.isMultiviewEnabled || false;
+                    SyncLog.log("debug", "MatroxCIP", `Found device by name/alias ${deviceIdentifier} (SN: ${sn}): multiviewer=${result}`);
+                    return result;
+                }
+            }
+            
+            // Debug: show available devices
+            const availableDevices = Object.keys(this.state.devices).map(sn => ({
+                sn,
+                name: this.state.devices[sn].name,
+                alias: this.state.devices[sn].alias,
+                num: this.state.devices[sn].num
+            }));
+            SyncLog.log("debug", "MatroxCIP", `Device not found for multiviewer query: ${deviceIdentifier}. Available devices:`, availableDevices);
+            return false;
+        } catch (error) {
+            SyncLog.log("error", "MatroxCIP", `Error querying multiviewer state for ${deviceIdentifier}: ${error instanceof Error ? error.message : String(error)}`);
+            return false;
+        }
+    }
+
     // Web Accessible
     async toggleMultiviewer(sn:string, enabled:boolean){
         SyncLog.log("info", "MatroxCIP", `Toggling multiviewer for device ${sn}: ${enabled ? 'ENABLE' : 'DISABLE'}`);
@@ -977,8 +1298,118 @@ export default class MediaDevMatroxConvertIp {
         },2000)
     }
 
+    // Auto-configure NMOS registry for discovered devices
+    private async autoConfigureNmosRegistry(sn: string, cip: MatroxCipDevice) {
+        try {
+            SyncLog.log("info", "MatroxCIP", `Auto-configuring NMOS registry for device ${sn}`);
+            
+            // Check if device already has NMOS registry configured
+            let currentSettings;
+            try {
+                currentSettings = await this.apiRequest(cip.ipList, sn, "GET", "/device/settings/nmos/registerserver");
+                
+                // Skip if the device already has manual registry configured
+                if (currentSettings?.server?.ip && 
+                    currentSettings.server.ip !== this.getRegistryIp()) {
+                    SyncLog.log("info", "MatroxCIP", `Device ${sn} already has manual NMOS registry configured, skipping auto-config`);
+                    return;
+                }
+            } catch (e) {
+                SyncLog.log("debug", "MatroxCIP", `Could not retrieve current NMOS registry settings for ${sn}: ${e.message}`);
+            }
+            
+            // Auto-configure the registry
+            await this.setNmosRegistry(
+                sn, 
+                this.getRegistryIp(),
+                this.getRegistryPort(),
+                this.getRegistryApiVersion()
+            );
+            
+            SyncLog.log("info", "MatroxCIP", `Successfully auto-configured NMOS registry for device ${sn}`);
+            
+        } catch (e) {
+            SyncLog.log("error", "MatroxCIP", `Failed to auto-configure NMOS registry for device ${sn}: ${e.message}`);
+            
+            // Retry if enabled
+            if (this.config.autoConfigNmosRegistry.retryOnFailure) {
+                setTimeout(() => {
+                    SyncLog.log("info", "MatroxCIP", `Retrying NMOS registry auto-configuration for device ${sn}`);
+                    this.autoConfigureNmosRegistry(sn, cip);
+                }, this.config.autoConfigNmosRegistry.retryDelayMs);
+            }
+        }
+    }
+
+    // Configure automatic NMOS registry settings
+    async configureAutoNmosRegistry(enabled: boolean) {
+        this.config.autoConfigNmosRegistry.enabled = enabled;
+        
+        SyncLog.log("info", "MatroxCIP", `Auto NMOS registry configuration updated: enabled=${enabled}, using registry from settings: ${this.getRegistryIp()}:${this.getRegistryPort()}`);
+        
+        // Save config to file if needed
+        // Note: Currently we don't persist config changes to file
+        // This would require implementing config file writing
+    }
+
+    // Toggle auto-reauthentication setting
+    async toggleAutoReauth(enabled: boolean) {
+        this.config.disableAutoReauth = !enabled; // Note: enabled=true means auto-reauth is ON, so disableAutoReauth=false
+        
+        SyncLog.log("info", "MatroxCIP", `Auto-reauthentication setting updated: enabled=${enabled} (disableAutoReauth=${this.config.disableAutoReauth})`);
+        
+        // Update the sync object to notify UI
+        this.state.settings.disableAutoReauth = this.config.disableAutoReauth;
+        this.syncList.setState(this.state);
+        
+        // Save config to file if needed
+        // Note: Currently we don't persist config changes to file
+        // This would require implementing config file writing
+    }
+
+    async bulkConfigureNmosRegistry() {
+        if (!this.isAutoConfigEnabled()) {
+            throw new Error("Auto NMOS registry configuration is not enabled or registry IP is not available in settings");
+        }
+
+        const results: { [key: string]: { success: boolean, error?: string } } = {};
+        const deviceList = Object.keys(this.state.devices);
+        
+        SyncLog.log("info", "MatroxCIP", `Starting bulk NMOS registry configuration for ${deviceList.length} devices`);
+        
+        for (const sn of deviceList) {
+            try {
+                const cip = this.state.devices[sn];
+                if (!cip.failed && !cip.unreachable) {
+                    await this.setNmosRegistry(
+                        sn,
+                        this.getRegistryIp(),
+                        this.getRegistryPort(),
+                        this.getRegistryApiVersion()
+                    );
+                    results[sn] = { success: true };
+                    SyncLog.log("info", "MatroxCIP", `Bulk configuration successful for device ${sn}`);
+                } else {
+                    results[sn] = { success: false, error: "Device is failed or unreachable" };
+                }
+                
+                // Add delay between devices to prevent overwhelming the network
+                await sleep(2000);
+                
+            } catch (e) {
+                results[sn] = { success: false, error: e.message };
+                SyncLog.log("error", "MatroxCIP", `Bulk configuration failed for device ${sn}: ${e.message}`);
+            }
+        }
+        
+        const successCount = Object.values(results).filter(r => r.success).length;
+        SyncLog.log("info", "MatroxCIP", `Bulk NMOS registry configuration completed: ${successCount}/${deviceList.length} devices configured successfully`);
+        
+        return results;
+    }
+
     // Web Accessible
-    async setNmosRegistry(sn:string, ip:string, port:number){
+    async setNmosRegistry(sn:string, ip:string, port:number = 3210, apiVersion:string = "v1.3"){
         let ipList:string[] = [];
         let cip;
         if(this.state.devices.hasOwnProperty(sn)){
@@ -988,22 +1419,45 @@ export default class MediaDevMatroxConvertIp {
             throw new Error("Device not found.")
         }
 
-        let context = await this.apiRequest(ipList, sn, "GET", "/device/settings/context");
-        if(!context){
-            throw new Error("Can not get Context.");
+        SyncLog.log("info", "MatroxCIP", `Configuring NMOS registry for device ${sn}: ${ip}:${port}`);
+
+        // Get current NMOS registry settings
+        let currentSettings;
+        try {
+            currentSettings = await this.apiRequest(ipList, sn, "GET", "/device/settings/nmos/registerserver");
+        } catch (e) {
+            SyncLog.log("warn", "MatroxCIP", `Could not retrieve current NMOS registry settings for ${sn}, using defaults`);
+            currentSettings = {};
         }
         
-        // Configure manual NMOS registry on the device
-        let data = context.nmosSettings || {};
-        data.manualRegistryEnabled = true;
-        data.manualRegistryIp = ip;
-        data.manualRegistryPort = port;
+        // Configure manual NMOS registry with proper payload structure
+        let registryConfig = {
+            isEnabled: true,
+            mode: "manual",
+            host: ip,
+            isIPv6: false,
+            port: port,
+            apiVersion: apiVersion,
+            isSecured: false,
+            selectPrivateKey: currentSettings.selectPrivateKey || "ManufacturerRsaClientPrivateKey",
+            isClientServerRole: currentSettings.isClientServerRole || false
+        };
         
-        let result = await this.apiRequest(ipList, sn, "POST", "/device/settings/nmos", data);
-
-        setTimeout(()=>{
-            this.reloadData(ipList,sn,cip)
-        },2000)
+        let result = await this.apiRequest(ipList, sn, "POST", "/device/settings/nmos/registerserver", registryConfig);
+        
+        if (result) {
+            SyncLog.log("info", "MatroxCIP", `Successfully configured NMOS registry for device ${sn}`);
+            
+            // Update device state to reflect registry configuration
+            cip.loading = true;
+            this.syncList.setState(this.state);
+            
+            setTimeout(()=>{
+                this.reloadData(ipList,sn,cip)
+            },2000)
+        } else {
+            throw new Error("Failed to configure NMOS registry settings");
+        }
     }
 
     // Web Accessible
@@ -1024,6 +1478,17 @@ export default class MediaDevMatroxConvertIp {
                 await this.togglePtp(sn, false);
             }catch(e){
                 SyncLog.log("error", "MatroxCIP", `Failed to disable PTP on device ${sn}: ${e.message}`);
+            }
+        }
+    }
+
+    // Web Accessible - Bulk IGMP Version Operations
+    async setIgmpVersionAll(version: "none" | "v2" | "v3"){
+        for(let sn in this.state.devices){
+            try{
+                await this.setIgmpVersion(sn, version);
+            }catch(e){
+                SyncLog.log("error", "MatroxCIP", `Failed to set IGMP version to ${version} on device ${sn}: ${e.message}`);
             }
         }
     }
@@ -1203,8 +1668,106 @@ export default class MediaDevMatroxConvertIp {
 
     }
 
+    /**
+     * Get authentication token for a specific device (for proxy usage)
+     */
+    public getAuthToken(sn: string): {bearerToken: string, sessionCookie: string} | null {
+        if (this.authState.hasOwnProperty(sn)) {
+            const auth = this.authState[sn];
+            // Handle both old format (string) and new format (object)
+            if (typeof auth === 'string') {
+                return { bearerToken: auth, sessionCookie: `session_token=${auth}` };
+            }
+            return auth;
+        }
+        return null;
+    }
 
+    /**
+     * Get device state (for proxy usage)
+     */
+    public getDeviceState() {
+        return this.state;
+    }
 
+    /**
+     * Clean up stale/duplicate devices after successful device matching
+     * This helps prevent duplicate entries after device reboots
+     */
+    private cleanupStaleDevices(activeDeviceKey: string, activeIPs: string[]) {
+        try {
+            let devicesToRemove: string[] = [];
+            let activeDevice = this.state.devices[activeDeviceKey];
+            
+            if (!activeDevice) return;
+
+            // Look for potential duplicates/stale entries
+            for (let deviceKey in this.state.devices) {
+                if (deviceKey === activeDeviceKey) continue; // Skip the active device
+                
+                let device = this.state.devices[deviceKey];
+                let shouldRemove = false;
+                let removeReason = "";
+
+                // Check for obvious stale duplicates
+                // 1. Device has same IPs but is marked as failed/unreachable
+                if (device.ipList.length > 0 && activeIPs.length > 0) {
+                    let commonIPs = device.ipList.filter(ip => activeIPs.includes(ip));
+                    if (commonIPs.length > 0) {
+                        if (device.failed || device.unreachable || device.error) {
+                            shouldRemove = true;
+                            removeReason = `stale duplicate with failed state (common IPs: ${commonIPs.join(', ')})`;
+                        }
+                    }
+                }
+
+                // 2. Device has been failed/unreachable for extended period
+                if ((device.failed || device.unreachable) && !shouldRemove) {
+                    // Check if device has been stale for a while (no recent successful connection)
+                    let isLikelyStale = !device.loading && 
+                                      (device.error === "Device not refreshed" || 
+                                       device.error.includes("Auth not possible") ||
+                                       device.error.includes("No connection possible"));
+                    
+                    if (isLikelyStale) {
+                        // Only remove if we have a very similar device that's now active
+                        let normalizedStaleSN = deviceKey.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+                        let normalizedActiveSN = activeDeviceKey.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+                        
+                        if (normalizedStaleSN.includes(normalizedActiveSN.slice(-6)) || 
+                            normalizedActiveSN.includes(normalizedStaleSN.slice(-6))) {
+                            shouldRemove = true;
+                            removeReason = `stale device with similar serial to active device`;
+                        }
+                    }
+                }
+
+                if (shouldRemove) {
+                    devicesToRemove.push(deviceKey);
+                    SyncLog.log("info", "MatroxCIP", `Cleanup: Marking stale device '${deviceKey}' for removal (${removeReason})`);
+                }
+            }
+
+            // Remove stale devices
+            for (let deviceKey of devicesToRemove) {
+                delete this.state.devices[deviceKey];
+                if (this.authState.hasOwnProperty(deviceKey)) {
+                    delete this.authState[deviceKey];
+                }
+                SyncLog.log("info", "MatroxCIP", `Cleanup: Removed stale device '${deviceKey}'`);
+            }
+
+            if (devicesToRemove.length > 0) {
+                this.syncList.setState(this.state);
+                this.updateQuickState();
+                this.saveState();
+                SyncLog.log("info", "MatroxCIP", `Cleanup: Removed ${devicesToRemove.length} stale device(s) to prevent duplicates`);
+            }
+
+        } catch (e) {
+            SyncLog.log("error", "MatroxCIP", `Error during stale device cleanup: ${e.message}`);
+        }
+    }
 
     async reloadData(ipList:string[], sn:string, cip:MatroxCipDevice, force =false){
         if(cip.loading){
@@ -1555,9 +2118,49 @@ export default class MediaDevMatroxConvertIp {
                         cip.frontpanelLock = context.otherSettings.areButtonsLocked;
                         cip.hdcpEnabled = context.hdcpSettings.enableHdcpSupport;
 
+                        // Parse IGMP version from otherSettings
+                        if (context.otherSettings && context.otherSettings.igmpVersion) {
+                            cip.igmpVersion = context.otherSettings.igmpVersion;
+                            SyncLog.log("debug", "MatroxCIP", `Device ${sn}: IGMP version: ${cip.igmpVersion}`);
+                        } else {
+                            cip.igmpVersion = "none";
+                            SyncLog.log("debug", "MatroxCIP", `Device ${sn}: No IGMP version found, defaulting to none`);
+                        }
+
                         cip.ptpDomain = context.ptpSettings.domain;
                         cip.ptpEnabled = context.ptpSettings.isEnabled;
 
+                        // Parse multiviewer settings
+                        if(context.MultiviewSettings && typeof context.MultiviewSettings.isMultiviewEnabled === 'boolean'){
+                            cip.isMultiviewEnabled = context.MultiviewSettings.isMultiviewEnabled;
+                            SyncLog.log("debug", "MatroxCIP", `Device ${sn}: Multiviewer enabled: ${cip.isMultiviewEnabled}`);
+                        } else {
+                            cip.isMultiviewEnabled = false;
+                            SyncLog.log("debug", "MatroxCIP", `Device ${sn}: No multiviewer settings found, defaulting to false`);
+                        }
+
+                        // Parse audio stream settings
+                        try {
+                            // Get TX audio stream 0 settings
+                            if(context.txAudioStream0){
+                                cip.txAudioStream0Enabled = context.txAudioStream0.enable || false;
+                                SyncLog.log("debug", "MatroxCIP", `Device ${sn}: TX Audio Stream 0 enabled: ${cip.txAudioStream0Enabled}`);
+                            } else {
+                                cip.txAudioStream0Enabled = false;
+                            }
+
+                            // Get RX audio stream 0 settings  
+                            if(context.rxAudioStream0){
+                                cip.rxAudioStream0Enabled = context.rxAudioStream0.enable || false;
+                                SyncLog.log("debug", "MatroxCIP", `Device ${sn}: RX Audio Stream 0 enabled: ${cip.rxAudioStream0Enabled}`);
+                            } else {
+                                cip.rxAudioStream0Enabled = false;
+                            }
+                        } catch(audioError) {
+                            SyncLog.log("warning", "MatroxCIP", `Device ${sn}: Could not parse audio stream settings: ${audioError.message}`);
+                            cip.txAudioStream0Enabled = false;
+                            cip.rxAudioStream0Enabled = false;
+                        }
 
                         
                     }catch(e){
@@ -1573,7 +2176,8 @@ export default class MediaDevMatroxConvertIp {
                             cip.inputResolution = this.calculateResolution(status.videos[0]);
                             cip.outputResolution = this.calculateResolution(status.frameBuffer);
                             cip.inputPresent = status.videos[0].isPresent
-                            cip.inputBitrate = 0
+                            cip.inputBitrate = 0  // TX devices take HDMI input, not IP
+                            cip.outputBitrate = status.videoStreams[0].bitrateKbits/1000  // IP output stream bitrate
                         }else{
                             cip.inputResolution = this.calculateResolution(status.frameBuffer);
                             // TODO why is the data so strange in the device...
@@ -1582,7 +2186,8 @@ export default class MediaDevMatroxConvertIp {
                             //cip.outputResolution = cip.monitorResolution;
                             cip.outputResolution = this.calculateResolution(status.videos[0]);
                             cip.inputPresent = status.frameBuffer.resolution.isPresent
-                            cip.inputBitrate = status.videoStreams[0].bitrateKbits/1000
+                            cip.inputBitrate = status.videoStreams[0].bitrateKbits/1000  // IP input stream bitrate
+                            cip.outputBitrate = 0  // RX devices output HDMI, not IP
                         }
                     }catch(e){
                         SyncLog.log("error","MatroxCIP", "Can not parse Status for:  "+ ipList.join(", "), e);
@@ -1723,9 +2328,19 @@ export default class MediaDevMatroxConvertIp {
                 let result = await axios.post(url, {
                     username:user,
                     password:password,
-                    closeExistingSessions:this.config.closeExistingSessions || force
+                    closeExistingSessions: String(this.config.closeExistingSessions || force)
                 }, {httpsAgent:this.httpsAgent});
-                this.authState[sn] = result.data.access_token;
+                
+                // Store both bearer token and session cookie (like test-multiview-post.js)
+                let sessionCookie = '';
+                if (result.headers['set-cookie']) {
+                    sessionCookie = result.headers['set-cookie'].map(cookie => cookie.split(';')[0]).join('; ');
+                }
+                
+                this.authState[sn] = {
+                    bearerToken: result.data.access_token,
+                    sessionCookie: sessionCookie
+                };
                 
             }catch(e){ 
                 if(isAxiosError(e)){
@@ -1756,26 +2371,31 @@ export default class MediaDevMatroxConvertIp {
             let url = baseUrl + href;
             try{    
                 let result:any = {};
+                const auth = this.authState[sn];
+                const authHeaders = typeof auth === 'string' 
+                    ? { Authorization: `Bearer ${auth}`, Cookie: `session_token=${auth}` }
+                    : { Authorization: `Bearer ${auth.bearerToken}`, Cookie: auth.sessionCookie };
+                    
                 if(method == "GET" ){
                     result = await axios.get(url, {
-                        headers:{
-                            Authorization: "Bearer "+this.authState[sn],
-                            Cookie:"session_token="+this.authState[sn]
-                        },
+                        headers: { ...authHeaders },
                         httpsAgent:this.httpsAgent
                     });
                 }else if(method == "POST"){
                     result = await axios.post(url, data, {
-                        headers:{
-                            Authorization: "Bearer "+this.authState[sn],
-                            Cookie:"session_token="+this.authState[sn]
-                        },
+                        headers: { ...authHeaders },
                         httpsAgent:this.httpsAgent
                     });
                 }
                 return result.data;
             }catch(e){ 
                 if(e.response?.status == 401){
+                    // Check if auto-reauthentication is disabled
+                    if(this.config.disableAutoReauth) {
+                        SyncLog.log("info", "MatroxCIP", `Auto-reauthentication disabled for device ${sn}, skipping login retry to preserve manual web UI sessions`);
+                        throw new Error("Authentication expired and auto-reauthentication is disabled");
+                    }
+                    
                     // Login expired...
                     try{
                         await doLogin(sn);
@@ -1786,20 +2406,19 @@ export default class MediaDevMatroxConvertIp {
                         try{    
                             let url = baseUrl + href;
                             let result:any = {};
+                            const auth = this.authState[sn];
+                            const authHeaders = typeof auth === 'string' 
+                                ? { Authorization: `Bearer ${auth}`, Cookie: `session_token=${auth}` }
+                                : { Authorization: `Bearer ${auth.bearerToken}`, Cookie: auth.sessionCookie };
+                                
                             if(method == "GET" ){
                                 result = await axios.get(url, {
-                                    headers:{
-                                        Authorization: "Bearer "+this.authState[sn],
-                                        Cookie:"session_token="+this.authState[sn]
-                                    },
+                                    headers: { ...authHeaders },
                                     httpsAgent:this.httpsAgent
                                 });
                             }else if(method == "POST"){
                                 result = await axios.post(url, data, {
-                                    headers:{
-                                        Authorization: "Bearer "+this.authState[sn],
-                                        Cookie:"session_token="+this.authState[sn]
-                                    },
+                                    headers: { ...authHeaders },
                                     httpsAgent:this.httpsAgent
                                 });
                             }
@@ -1813,6 +2432,11 @@ export default class MediaDevMatroxConvertIp {
                     }
                 }else{
                     SyncLog.log("error","MatroxCIP", "Can not access data on: "+ url,e);
+                    if(isAxiosError(e) && e.response?.data){
+                        throw new Error(`API Error: ${e.response.data.message || JSON.stringify(e.response.data)}`);
+                    } else {
+                        throw new Error(`Network Error: ${e.message || 'Unknown network error'}`);
+                    }
                 }
             }
         }else{
@@ -1823,7 +2447,7 @@ export default class MediaDevMatroxConvertIp {
         if(duplicate){
             throw new Error("Other Session active")
         }else{
-            throw new Error("Unknown error")
+            throw new Error("Unknown error - this should not be reached")
         }
 
 
@@ -1852,34 +2476,35 @@ export default class MediaDevMatroxConvertIp {
             SyncLog.log("error","MatroxCIP", "No connection possible to: "+ ipList.join(", "));
             return null;
         }
-        
 
         if(this.authState.hasOwnProperty(sn)){
             try{    
                 let url = baseUrl + href;
                 let result:any = {};
+                const auth = this.authState[sn];
+                const authHeaders = typeof auth === 'string' 
+                    ? { Authorization: `Bearer ${auth}`, Cookie: `session_token=${auth}` }
+                    : { Authorization: `Bearer ${auth.bearerToken}`, Cookie: auth.sessionCookie };
 
-                var formData = new FormData();
-                formData.append("file", fs.createReadStream(file), fileName);
+                const formData = new FormData();
+                formData.append(fileName, file);
                 
                 result = await axios.post(url, formData, {
                     headers:{
-                        Authorization: "Bearer "+this.authState[sn],
-                        Cookie:"session_token="+this.authState[sn],
+                        ...authHeaders,
                         ...formData.getHeaders()
                     },
                     httpsAgent:this.httpsAgent
                 });
-                //console.log(result)
-                
+                return result.data;
             }catch(e){ 
-                // TODO Logging
-                //console.log(e)
+                SyncLog.log("error","MatroxCIP", "Upload failed: "+ e.message);
+                return null;
             }
         }else{
             SyncLog.log("error","MatroxCIP", "Auth not possible: "+ ipList.join(", "));
+            return null;
         }
-
     }
 }
 

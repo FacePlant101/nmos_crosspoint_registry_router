@@ -20,6 +20,10 @@ import { Topology } from "./lib/topology";
 import { MediaDevices } from "./lib/mediaDevices";
 import { SyncObject } from "./lib/SyncServer/syncObject";
 import { parseSettings } from "./lib/parseSettings";
+import PredictiveStager from "./lib/predictiveStager";
+import { ConnectionLatencyMeasurement } from "./lib/connectionLatencyMeasurement";
+import { MatroxAuthHelper } from "./lib/matroxAuthHelper";
+import { PrometheusMetrics } from "./lib/prometheusMetrics";
 
 
 
@@ -49,6 +53,19 @@ if(settings.hasOwnProperty("logOutput")){
     log.setOutput(settings.logOutput);
 }
 
+// Configure debug log gating (from settings and optional env override)
+try{
+    const envDbg = process.env.DEBUG_LOGS || process.env.DEBUG;
+    let debugFlag = !!settings.debugLogs;
+    if (typeof envDbg === 'string') {
+        const lowered = envDbg.toLowerCase();
+        if (['1','true','yes','on'].includes(lowered)) debugFlag = true;
+        if (['0','false','no','off'].includes(lowered)) debugFlag = false;
+    }
+    SyncLog.setDebugEnabled(debugFlag);
+    SyncLog.info("server", `Debug logs ${debugFlag ? 'ENABLED' : 'disabled'}`);
+}catch(e){}
+
 let serverPort = 80;
 let serverAddress = "0.0.0.0";
 
@@ -58,10 +75,19 @@ let mdns = new MdnsService(settings);
 try{
     if(settings.hasOwnProperty("disabledModules") && settings.disabledModules.hasOwnProperty("core")){
         uiConfig.disabledModules.core = settings.disabledModules.core;
-        settings.core.forEach((m)=>{
+        settings.disabledModules.core.forEach((m)=>{
             let name = ""+m;
             modDisabled.push(name);
         });
+        // If topology is disabled, also mark m4350 as disabled for clarity/consistency
+        if (modDisabled.includes("topology")) {
+            if (!uiConfig.disabledModules.core.includes("m4350")) {
+                uiConfig.disabledModules.core.push("m4350");
+            }
+            if (!modDisabled.includes("m4350")) {
+                modDisabled.push("m4350");
+            }
+        }
     }
 }catch(e){}
 
@@ -90,7 +116,7 @@ try{
     SyncLog.log("error", "Settings", "Can not read Server Address from settings. Default to "+serverAddress+".", e);
 }
 
-WebsocketSyncServer.init(serverAddress, serverPort);
+WebsocketSyncServer.init();
 let server = WebsocketSyncServer.getInstance();
 let users:any = null;
 try {
@@ -110,6 +136,31 @@ const mediaDevices = new MediaDevices(settings);
 const crosspoint = new CrosspointAbstraction(settings);
 const nmosConnector = new NmosRegistryConnector(settings);
 
+// Initialize latency measurement system
+const latencyMeasurement = new ConnectionLatencyMeasurement();
+SyncLog.info("server", "Connection latency measurement system initialized");
+
+// Initialize Prometheus metrics
+const prometheusMetrics = PrometheusMetrics.getInstance();
+SyncLog.info("server", "Prometheus metrics system initialized");
+
+// Predictive Stager
+let predictiveStager: PredictiveStager | null = null;
+try{
+    if(settings.predictiveStaging && settings.predictiveStaging.enabled){
+        predictiveStager = new PredictiveStager(crosspoint, {
+            enabled: true,
+            cooldownMs: settings.predictiveStaging.cooldownMs,
+            perReceiver: settings.predictiveStaging.perReceiver
+        });
+        SyncLog.info("server", "PredictiveStager enabled");
+    }else{
+        SyncLog.info("server", "PredictiveStager disabled");
+    }
+}catch(e){
+    SyncLog.log("error", "server", "Failed to initialize PredictiveStager", e);
+}
+
 
 
 
@@ -122,7 +173,7 @@ server.addSyncObject("crosspoint","global",crosspoint.syncCrosspoint);
 
 
 let topology = null;
-if(modDisabled.includes["topology"]){
+if(modDisabled.includes("topology")){
     SyncLog.info("server", "disabling module topology");
 }else{
     topology = new Topology();
@@ -131,6 +182,26 @@ if(modDisabled.includes["topology"]){
 
 const uiConfigSync: SyncObject = new SyncObject("uiconfig", uiConfig);
 server.addSyncObject("uiconfig","public",uiConfigSync);
+
+// Initialize Matrox CIP authentication helper (must be done after MediaDevices initialization)
+MatroxAuthHelper.initializeAuthHelper();
+
+// Add Prometheus metrics HTTP endpoint
+server.addExpressMiddleware('/api/metrics', async (req, res) => {
+    try {
+        const metrics = await prometheusMetrics.getMetrics();
+        res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+        res.send(metrics);
+    } catch (error) {
+        res.status(500).send(`Error getting metrics: ${error}`);
+    }
+});
+
+// Register SPA catch-all route after all middleware
+server.registerSpaRoute();
+
+// Start the server after all routes are registered
+server.startServer(serverAddress, serverPort);
 
 
 
@@ -228,5 +299,6 @@ server.addRoute("POST", "crosspoint","global", (client: WebsocketClient, query:s
             .catch((m) => reject(m));
     });
 });
+
 
 

@@ -31,6 +31,10 @@ export class SyncLog extends SyncObject {
 
     
     static log(severity: string,  topic: string,text: string, raw: any= null) {
+        // Drop debug/verbose logs unless debug is enabled
+        if ((severity === "debug" || severity === "verbose") && !SyncLog.debugEnabled) {
+            return -1;
+        }
         let time = new Date().getTime();
         let date = new Date(time).toISOString();
 
@@ -67,6 +71,10 @@ export class SyncLog extends SyncObject {
 
     private static logFile = "";
     private static consoleDebug = false;
+    private static debugEnabled = false;
+    static setDebugEnabled(active:boolean){
+        SyncLog.debugEnabled = active;
+    }
     
 
     limitHistory = 200;

@@ -2,4 +2,5 @@
 .gitignore
 **/node_modules
 .vscode
-
+CIP
+docs

@@ -135,6 +135,34 @@ class CrosspointUpdateThread{
             this.updateRequest ++;
         }
 
+        if(data.hasOwnProperty('loadNmosAliases')){
+            // Merge NMOS aliases with local aliases, preferring local aliases
+            for(const [id, alias] of Object.entries(data.loadNmosAliases)){
+                if(!this.crosspointAlias.hasOwnProperty(id)){
+                    this.crosspointAlias[id] = alias as string;
+                }
+            }
+            // Persist updated aliases to local storage
+            try{
+                fs.writeFileSync("./state/alias.json", JSON.stringify(this.crosspointAlias));
+            }catch(e){
+                console.error("Error writing to file: ./state/alias.json");
+            }
+            parentPort.postMessage(JSON.stringify({
+                log:{severity:"info", topic:"alias", text:`Merged NMOS aliases with local storage`, raw:null}
+            }));
+        }
+
+        if(data.hasOwnProperty('requestAliasState')){
+            // Send current alias state back to main thread
+            const response = {
+                aliasStateResponse: true,
+                requestId: data.requestAliasState.requestId,
+                aliasState: this.crosspointAlias
+            };
+            parentPort.postMessage(JSON.stringify(response));
+        }
+
         if(data.hasOwnProperty('changeAlias')){
 
             if(data.changeAlias.alias != ""){
@@ -151,6 +179,31 @@ class CrosspointUpdateThread{
                 console.error("Error writing to file: ./state/alias.json");
             }
 
+            this.updateRequest ++;
+        }
+
+        if(data.hasOwnProperty('loadNmosAliases')){
+            // Load aliases from NMOS description fields (hybrid approach)
+            let aliasesLoaded = 0;
+            for(const [id, alias] of Object.entries(data.loadNmosAliases)){
+                if(!this.crosspointAlias.hasOwnProperty(id)){
+                    // Only load from NMOS if no local alias exists (local takes precedence)
+                    this.crosspointAlias[id] = alias as string;
+                    aliasesLoaded++;
+                }
+            }
+            
+            if(aliasesLoaded > 0){
+                try{
+                    fs.writeFileSync("./state/alias.json", JSON.stringify(this.crosspointAlias));
+                    parentPort.postMessage(JSON.stringify({
+                        log:{severity:"info", topic:"NMOS Aliases", text:`Loaded ${aliasesLoaded} aliases from NMOS description fields`, raw:null}
+                    }));
+                }catch(e){
+                    console.error("Error writing to file: ./state/alias.json");
+                }
+            }
+            
             this.updateRequest ++;
         }
 
@@ -403,6 +456,14 @@ class CrosspointUpdateThread{
     updateShadow(){
         let changed = false;
 
+        // Skip processing if NMOS state is not available yet (prevents initialization timing issues)
+        if (!this.nmosState || !this.nmosState.senders || !this.nmosState.receivers) {
+            parentPort.postMessage(JSON.stringify({
+                log:{severity:"debug", topic:"Crosspoint", text:"Skipping shadow update - NMOS state not ready", raw:null}
+            }));
+            return;
+        }
+
         // Device registry to ensure consistent grouping
         let deviceRegistry: {[deviceId: string]: string} = {}; // Maps device_id to groupId
 
@@ -417,6 +478,7 @@ class CrosspointUpdateThread{
                 }
             }
         }
+        
         // Helper function to get consistent group ID and label for a device
         const getDeviceGroupInfo = (device_id: string, flow: any, flowType: 'sender' | 'receiver') => {
             let groupId = "";
@@ -430,37 +492,13 @@ class CrosspointUpdateThread{
                     groupLabel = this.crosspointShadow.devices[groupId].name;
                 }
             } else {
-                // Determine group ID for this device
-                if(this.nmosUseGroupHints && flow.hasOwnProperty('tags') && flow.tags.hasOwnProperty("urn:x-nmos:tag:grouphint/v1.0") && Array.isArray(flow.tags["urn:x-nmos:tag:grouphint/v1.0"]) && flow.tags["urn:x-nmos:tag:grouphint/v1.0"].length > 0){
-                    let group = (flow.tags["urn:x-nmos:tag:grouphint/v1.0"][0] as string).split(':')[0];
-                    groupId = 'nmosgrp_' + md5(group + device_id);
-                    
-                    if(this.nmosState.devices.hasOwnProperty(device_id)){
-                        let groupLabels: string[] = [];
-                        // Check both senders and receivers for group labels
-                        [...this.nmosState.devices[device_id].senders, ...this.nmosState.devices[device_id].receivers].forEach((id: string) => {
-                            let nmosFlow = this.nmosState.senders[id] || this.nmosState.receivers[id];
-                            if(nmosFlow && nmosFlow.hasOwnProperty('tags') && nmosFlow.tags.hasOwnProperty("urn:x-nmos:tag:grouphint/v1.0") && Array.isArray(nmosFlow.tags["urn:x-nmos:tag:grouphint/v1.0"]) && nmosFlow.tags["urn:x-nmos:tag:grouphint/v1.0"].length > 0) {
-                                let otherGroup = (nmosFlow.tags["urn:x-nmos:tag:grouphint/v1.0"][0] as string).split(':')[0];
-                                if(!groupLabels.includes(otherGroup)){
-                                    groupLabels.push(otherGroup);
-                                }
-                            }
-                        });
-                        
-                        // Always use just the device label, no group suffix
-                        groupLabel = this.nmosState.devices[device_id].label;
-                    } else {
-                        groupLabel = group;
-                    }
+                // FIXED: Always use device-based grouping to prevent duplicates
+                // This ensures one device entry per physical device regardless of group hints
+                groupId = "nmos_" + device_id;
+                if(this.nmosState.devices.hasOwnProperty(device_id)){
+                    groupLabel = this.nmosState.devices[device_id].label;
                 } else {
-                    // Use device-based grouping (this ensures single device entry)
-                    groupId = "nmos_" + device_id;
-                    if(this.nmosState.devices.hasOwnProperty(device_id)){
-                        groupLabel = this.nmosState.devices[device_id].label;
-                    } else {
-                        groupLabel = "UNKNOWN";
-                    }
+                    groupLabel = "UNKNOWN";
                 }
                 
                 // Register this device to the group
@@ -679,6 +717,7 @@ class CrosspointUpdateThread{
                             id:send.id,
                             name: send.name,
                             order: send.order,
+                            staged:false,
                             num:send.num,
                             dynamic:true,
                             type:send.type,
@@ -724,6 +763,12 @@ class CrosspointUpdateThread{
                                     }
                                     source.capabilities.mediaTypes.push(this.nmosState.flows[this.nmosState.senders[nmosId].flow_id].media_type);
                                     source.active = this.nmosState.senders[nmosId].subscription.active
+                                    try{
+                                        const activationMode = this.nmosState.senderActiveData?.[nmosId]?.activation?.mode;
+                                        source.staged = (activationMode && activationMode !== "activate_immediate") ? true : false;
+                                    }catch(e){
+                                        source.staged = false;
+                                    }
                                 }
                             }
                         }
@@ -741,6 +786,7 @@ class CrosspointUpdateThread{
                             id:recv.id,
                             name: recv.name,
                             order: recv.order,
+                            staged:false,
                             num:recv.num,
                             dynamic:true,
                             type:recv.type,
@@ -786,13 +832,8 @@ class CrosspointUpdateThread{
                         }
                         device.receivers[recv.type].push(receiver);
                     }
-
                 }
             }
-
-
-
-
             this.crosspointState.devices.push(device);
         }
 

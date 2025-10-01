@@ -232,7 +232,7 @@
           return;
         }
         if(filter.hiddenCols.includes(id)){
-          filter.hiddenCols = filter.hiddenCols.filter((c)=>{
+          filter.hiddenCols = filter.hiddenCols.filter((c:string)=>{
             if(c == id){
               return false
             }
@@ -354,7 +354,7 @@
                         </div>
                       </div>
                       {#if col.resize}
-                        <div class="resize-handler" draggable={true}
+                        <div class="resize-handler" role="separator" aria-label="Resize column" draggable={true}
                           on:dragstart={(e)=>{startResizeDrag(e,col.id)}}
                           on:drag={(e)=>{updateResizeDrag(e,col.id)}}
                           on:dragend={(e)=>{endResizeDrag(e,col.id)}}

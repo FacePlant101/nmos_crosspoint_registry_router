@@ -1,0 +1,17 @@
+FROM grafana/grafana:latest
+
+# Copy provisioning configs and dashboards
+COPY monitoring/grafana/provisioning/ /etc/grafana/provisioning/
+COPY monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
+
+# Set environment variables
+ENV GF_SECURITY_ADMIN_USER=admin \
+    GF_SECURITY_ADMIN_PASSWORD=nmos-crosspoint \
+    GF_USERS_ALLOW_SIGN_UP=false \
+    GF_SERVER_DOMAIN=localhost \
+    GF_SERVER_HTTP_PORT=3000 \
+    GF_ANALYTICS_REPORTING_ENABLED=false \
+    GF_ANALYTICS_CHECK_FOR_UPDATES=false
+
+# Expose Grafana port
+EXPOSE 3000

@@ -38,6 +38,7 @@
         {#if isTopInterface(int.id)}
         <div class="tp-switch-interface tp-switch-interface-{int.type}">
           <Handle type="target" id={int.id} position={Position.Top}/>
+          <Handle type="source" id={int.id} position={Position.Top}/>
           {int.id}
         </div>
         {/if}
@@ -49,6 +50,7 @@
         {#if !isTopInterface(int.id)}
         <div class="tp-switch-interface tp-switch-interface-{int.type}">
           <Handle type="target" id={int.id} position={Position.Bottom} />
+          <Handle type="source" id={int.id} position={Position.Bottom} />
           {int.id}
         </div>
         {/if}

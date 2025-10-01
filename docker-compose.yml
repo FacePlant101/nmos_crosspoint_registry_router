@@ -54,6 +54,36 @@ services:
     environment:
       - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/host/run/dbus/system_bus_socket
 
+  # Prometheus metrics collection
+  prometheus:
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
+    container_name: nmos-prometheus
+    hostname: nmos-prometheus
+    network_mode: host
+    volumes:
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    depends_on:
+      - nmos-crosspoint
+
+  # Grafana visualization dashboard
+  grafana:
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+    container_name: nmos-grafana
+    hostname: nmos-grafana
+    network_mode: host
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
 volumes:
   nmos-state:
   zerotier-data:
+  prometheus-data:
+  grafana-data:

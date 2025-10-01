@@ -20,12 +20,14 @@
 
         {id:"state", name:"", sortable:true,sortField:"__customState",  resize:false , canHide:false, fixed:true},
         {id:"name", name:"Name" ,     sortable:true,sortField:"name",  resize:true  , canHide:false, fixed:true, fixedOffset:40},
+        {id:"alias", name:"Alias" ,     sortable:true,sortField:"alias",  resize:true  , canHide:true},
 
-        {id:"sn", name:"# SN" ,          sortable:true,sortField:"sn",  resize:false , canHide:false},
+        {id:"sn", name:"# SN" ,          sortable:true,sortField:"sn",  resize:false , canHide:true},
         {id:"fwversion", name:"Firmware" ,     sortable:true,sortField:"firmwareVersion",  resize:false  , canHide:true},
         {id:"fwmode", name:"Mode" ,     sortable:true,sortField:"simpleMode",  resize:false  , canHide:true},
         {id:"type", name:"Type" ,     sortable:true,sortField:"type",  resize:false  , canHide:true},
         {id:"ip", name:"IP Address" ,     sortable:true, sortField:"__customIpList", resize:true  , canHide:false},
+        {id:"bitrate", name:"Bitrate" ,     sortable:true, sortField:"__customBitrate", resize:false  , canHide:true},
         
         {id:"network", name:"Network" ,     sortable:true, sortField:"__customNetwork", resize:true  , canHide:true},
         
@@ -38,6 +40,10 @@
         {id:"ptpStatus", name:"PTP Status" ,     sortable:true, sortField:"ptpStatus", resize:false  , canHide:true},
         {id:"ptpDomain", name:"PTP Domain" ,     sortable:true, sortField:"__customPtpDomain", resize:false  , canHide:true},
         {id:"ptpMenu", name:"" ,     sortable:false,  resize:false  , canHide:true},
+        {id:"igmpVersion", name:"IGMP Version" ,     sortable:true, sortField:"igmpVersion", resize:false  , canHide:true},
+        {id:"igmpMenu", name:"" ,     sortable:false,  resize:false  , canHide:true},
+        {id:"audioStreamEnabled", name:"Audio Stream" ,     sortable:true, sortField:"audioStreamEnabled", resize:false  , canHide:true},
+        {id:"audioMenu", name:"" ,     sortable:false,  resize:false  , canHide:true},
         {id:"restartMenu", name:"" ,     sortable:false,  resize:false  , canHide:true},
         {id:"flowMode", name:"Flow Mode" ,     sortable:true, sortField:"flowMode", resize:false  , canHide:true},
 
@@ -66,12 +72,18 @@
     
 
     let filter:any = {
-      version:"112369",
-      hiddenCols:[],
+      version:"112371",
+      // Hide most columns by default, keep: Name, Mode, Type, IP Address, Master Enable, Input, Output
+      hiddenCols:[
+        "sn",
+        "fwversion","network","bitrate","temperature","frontpanelLock","hdcpEnabled","jpegxsLicensed",
+        "ptpStatus","ptpDomain","ptpMenu","igmpVersion","igmpMenu","audioStreamEnabled","audioMenu","restartMenu","flowMode",
+        "scalerMode","scalerModeMenu","audioFormat",
+        "edidMonitor","edidNativeResMonitor","edidInput","edidNativeResInput","edidModeMenu"
+      ],
       widthCols:{},
-      sortCols:[],
+      sort:{ id: "", dir: "down" },
       search:"",
-      searchIp:"",
       batchJob:"",
       batchJobReboot:false,
       nmosRegistryIp:"",
@@ -98,6 +110,9 @@
     let menu = OverlayMenuService;
 
     let sync:Subject<any> ;
+    
+    // Reactive variable for auto-reauth toggle state
+    $: isAutoReauthEnabled = !sourceState.settings?.disableAutoReauth;
 
 
     onMount(async () => {
@@ -129,168 +144,69 @@
     }
 
     function doFilter(){
-        // TODO Filtering
+        // Filtering + sorting
         list = [];
         for(let cip in sourceState.devices){
             list.push(structuredClone(sourceState.devices[cip]))
         }
         if(filter.search != ""){
-          let searchTokens = getSearchTokens(filter.search);    
+          let searchTokens = getSearchTokens(filter.search);
           list = list.filter((cip:any)=>{
-            return tokenSearch(cip, searchTokens, ["name","sn"]);
+            return (
+              tokenSearch(cip, searchTokens, ["name","sn"]) ||
+              tokenSearch((cip.ipList || []).join(" "), searchTokens)
+            );
           });
         }
 
-        if(filter.searchIp != ""){
-          let searchTokens = getSearchTokens(filter.searchIp);    
-          list = list.filter((cip:any)=>{
-            return tokenSearch(cip.ipList.join(""), searchTokens );
-          });
-          filter = {...filter};
-        }
-
-        list.sort((a:any, b:any) =>{
-          for(let col of filter.sortCols){
-            // Custom sorter
-
-            let t = col.split("__")
-            let colId = t[0];
-            let direction = t[1];
-            let sortField:string|undefined = ""
-            tableCols.forEach((c)=>{
-              if(c.id == colId){
-                sortField = c.sortField
-              }
-            })
-            
-            if(sortField){
-
-
-              if(sortField == "__customState"){
-                let at = ( (a.failed  || a.sessionConflict ) ? true:false);
-                let bt = ( (b.failed  || b.sessionConflict ) ? true:false);
-                //console.log(a.failed,a.sessionConflict,at,b.failed,b.sessionConflict,bt)
-                if(at == bt){
-                  // use next
-                }else{
-                  if(direction == "down"){
-                    if(at == true && bt == false){
-                      return 1;
-                    }else{
-                      return -1;
-                      
-                    }
-                  }else{
-                    if(at == true && bt == false){
-                      return -1;
-                    }else{
-                      return 1;
-                    }
-                  }
-                  
-                }
-              }else if(sortField == "__customPtpDomain"){
-                if(a['ptpDomain'] == b['ptpDomain']){
-                  // use next
-                }else{
-                  if(direction == "down"){
-                    return (a['ptpDomain'] < b['ptpDomain'] ? 1:-1);
-                  }else{
-                    return (a['ptpDomain'] > b['ptpDomain'] ? 1:-1);
-                  }
-                  
-                }
-              }else if(sortField == "__customNetwork"){
-                let ac = 0;
-                let bc = 0;
-
-                a.linkStatus.forEach((l:any)=>{
-                  if(l.up){
-                    ac++;
-                  }
-                })
-                b.linkStatus.forEach((l:any)=>{
-                  if(l.up){
-                    bc++;
-                  }
-                })
-                
-                if(ac === bc){
-                  // use next
-                }else{
-                  if(direction == "down"){
-                    return (ac < bc ? 1:-1);
-                  }else{
-                    return (ac > bc ? 1:-1);
-                  }
-                  
-                }
-              }else if(sortField == "__customIpList"){
-                let comp = (a["ipList"][0] as string).localeCompare(b["ipList"][0],undefined, { sensitivity: 'accent' });
-                if(comp === 0){
-                  // use next
-                }else{
-                  if(direction == "down"){
-                    return comp;
-                  }else{
-                    return comp * -1;
-                  }
-                  
-                }
-              }else{
-                if(typeof a[sortField] === "string"){
-                  let comp = (a[sortField] as string).localeCompare(b[sortField],undefined, { sensitivity: 'accent' });
-                  if(comp === 0){
-                    // use next
-                  }else{
-                    if(direction == "down"){
-                      return comp;
-                    }else{
-                      return comp * -1;
-                    }
-                    
-                  }
-                }else if(typeof a[sortField] === "boolean"){
-                  
-                  if(a[sortField] == b[sortField]){
-                    // use next
-                  }else{
-                    if(direction == "down"){
-                      if(a[sortField] == true){
-                        return 1;
-                      }else{
-                        return -1;
-                        
-                      }
-                    }else{
-                      if(a[sortField] == true){
-                        return -1;
-                      }else{
-                        return 1;
-                      }
-                    }
-                    
-                  }
-                    
-                  }else if(typeof a[sortField] === "number"){
-                    if(a[sortField] == b[sortField]){
-                      // use next
-                    }else{
-                      if(direction == "down"){
-                        return (a[sortField] < b[sortField] ? 1:-1);
-                      }else{
-                        return (a[sortField] > b[sortField] ? 1:-1);
-                      }
-                      
-                    }  
-                  }else{
-                    // Ignore and do next
-                  }
-              }
+        list.sort((a:any, b:any) => {
+          const sortId = (filter.sort && filter.sort.id) ? filter.sort.id : "";
+          if (!sortId) { return 0; }
+          let sortField: string | undefined = undefined;
+          tableCols.forEach((c) => { if (c.id === sortId) { sortField = c.sortField; } });
+          if (!sortField) { return 0; }
+          const dirMul = (filter.sort.dir === "down") ? 1 : -1;
+          if (sortField === "__customState") {
+            const at = !!(a.failed || a.sessionConflict);
+            const bt = !!(b.failed || b.sessionConflict);
+            if (at === bt) return 0;
+            return (at ? 1 : -1) * dirMul;
+          } else if (sortField === "__customPtpDomain") {
+            const av = (a.ptpDomain ?? 0);
+            const bv = (b.ptpDomain ?? 0);
+            if (av === bv) return 0;
+            return (av < bv ? 1 : -1) * dirMul;
+          } else if (sortField === "__customNetwork") {
+            let ac = 0; let bc = 0;
+            (a.linkStatus || []).forEach((l:any)=>{ if(l.up){ ac++; } });
+            (b.linkStatus || []).forEach((l:any)=>{ if(l.up){ bc++; } });
+            if (ac === bc) return 0;
+            return (ac < bc ? 1 : -1) * dirMul;
+          } else if (sortField === "__customIpList") {
+            const a0 = ((a.ipList && a.ipList[0]) || "");
+            const b0 = ((b.ipList && b.ipList[0]) || "");
+            const comp = a0.localeCompare(b0, undefined, { sensitivity: 'accent' });
+            return comp * dirMul;
+          } else if (sortField === "__customBitrate") {
+            const aBitrate = (a.inputBitrate || 0) + (a.outputBitrate || 0);
+            const bBitrate = (b.inputBitrate || 0) + (b.outputBitrate || 0);
+            if (aBitrate === bBitrate) return 0;
+            return (aBitrate < bBitrate ? 1 : -1) * dirMul;
+          } else {
+            const av:any = a[sortField];
+            const bv:any = b[sortField];
+            if (typeof av === "string" || typeof bv === "string") {
+              const as = (av ?? "").toString();
+              const bs = (bv ?? "").toString();
+              const comp = as.localeCompare(bs, undefined, { sensitivity: 'accent' });
+              return comp * dirMul;
+            } else {
+              const an = Number(av ?? 0);
+              const bn = Number(bv ?? 0);
+              if (an === bn) return 0;
+              return (an < bn ? 1 : -1) * dirMul;
             }
           }
-
-          return 0;
         });
 
         // TODO Bug with Sort Cols not icon color updating on multiple changes
@@ -463,10 +379,74 @@
         ServerConnector.startLoad();
         ServerConnector.post("matroxcip_toggleptp",{sn:sn, enabled:enabled}).then((f:any)=>{
           ServerConnector.endLoad();
-          ServerConnector.addFeedback({level:"success",message:`PTP ${enabled ? 'enabled' : 'disabled'}`})
+          ServerConnector.addFeedback({level:"success",message:enabled ? "PTP enabled" : "PTP disabled"});
+        }).catch((e:any)=>{
+            ServerConnector.endLoad();
+            ServerConnector.addFeedback({level:"error",message:"Failed to toggle PTP: " + e.message});
+        });
+     }
+
+     function toggleAudioStream(sn:string, streamType: 'tx' | 'rx', streamIndex: number, enabled:boolean){
+        ServerConnector.startLoad();
+        ServerConnector.post("matroxcip_toggleaudio",{
+            sn:sn, 
+            streamType:streamType, 
+            streamIndex:streamIndex, 
+            enabled:enabled
+        }).then((f:any)=>{
+          ServerConnector.endLoad();
+          const streamName = `${streamType.toUpperCase()} Audio Stream ${streamIndex}`;
+          ServerConnector.addFeedback({level:"success",message:`${streamName} ${enabled ? "enabled" : "disabled"}`});
+        }).catch((e:any)=>{
+            ServerConnector.endLoad();
+            ServerConnector.addFeedback({level:"error",message:"Failed to toggle audio stream: " + e.message});
+        });
+     }
+
+     function getAudioStreamState(dev: any): { type: 'tx' | 'rx', enabled: boolean, label: string } {
+        // Return the active stream type and enabled state
+        if (dev.txAudioStream0Enabled) {
+            return { type: 'tx', enabled: true, label: 'TX Audio 0' };
+        } else if (dev.rxAudioStream0Enabled) {
+            return { type: 'rx', enabled: true, label: 'RX Audio 0' };
+        } else {
+            // Default to TX when neither is enabled (most common case for encoders)
+            return { type: 'tx', enabled: false, label: 'Audio Stream' };
+        }
+     }
+
+     function toggleAutoReauth(enabled:boolean){
+        ServerConnector.startLoad();
+        ServerConnector.post("matroxcip_toggleautoreauth",{enabled:enabled}).then((f:any)=>{
+          ServerConnector.endLoad();
+          ServerConnector.addFeedback({level:"success",message:enabled ? "Auto-reauthentication enabled" : "Auto-reauthentication disabled"});
+        }).catch((e:any)=>{
+            ServerConnector.endLoad();
+            ServerConnector.addFeedback({level:"error",message:"Failed to toggle auto-reauthentication: " + e.message});
+        });
+     }
+
+      function setIgmpVersion(sn:string, version:string){
+        ServerConnector.startLoad();
+        ServerConnector.post("matroxcip_setigmp",{sn:sn, version:version}).then((f:any)=>{
+          ServerConnector.endLoad();
+          ServerConnector.addFeedback({level:"success",message:`IGMP version set to ${version.toUpperCase()}`})
+          ServerConnector.addFeedback({level:"warning",message:"Device reboot required for IGMP changes to take effect"})
         }).catch((e)=>{
           ServerConnector.endLoad();
-          ServerConnector.addFeedback({level:"error",message:"Can not toggle PTP: "+ e.message})
+          ServerConnector.addFeedback({level:"error",message:"Can not set IGMP version: "+ e.message})
+        });
+      }
+
+      function setIgmpVersionAll(version:string){
+        ServerConnector.startLoad();
+        ServerConnector.post("matroxcip_setigmpall",{version:version}).then((f:any)=>{
+          ServerConnector.endLoad();
+          ServerConnector.addFeedback({level:"success",message:`IGMP version set to ${version.toUpperCase()} on all devices`})
+          ServerConnector.addFeedback({level:"warning",message:"Device reboot required for IGMP changes to take effect on all devices"})
+        }).catch((e)=>{
+          ServerConnector.endLoad();
+          ServerConnector.addFeedback({level:"error",message:"Can not set IGMP version on all devices: "+ e.message})
         });
       }
 
@@ -479,10 +459,20 @@
           ServerConnector.endLoad();
           ServerConnector.addFeedback({level:"error",message:"Can not change resolution: "+ e.message})
         });
-     }
+      }
 
-     
-     function getMenuTxScalerMode(dev:any){
+      function formatRxScalerMode(dev:any): string {
+        const mode = (dev.monitorMode || dev.moinitorMode || "").toString();
+        switch (mode) {
+          case "force": return "Force";
+          case "stream": return "Auto";
+          case "edidpreference": return "Scale to EDID";
+          default: return mode;
+        }
+      }
+
+      
+      function getMenuTxScalerMode(dev:any){
         let data:any = {entry:[]}
         for(let res of sourceState.settings.resolutions){
           data.entry.push({label:"Force Resolution: "+res.name,callback:()=>{changeResolution(dev.sn,res.name)}})
@@ -522,29 +512,32 @@
       let activeEditorId:string = "";
       let activeEditorType:string = "";
       
-      let filterTimeouet:any = null;
+      let filterTimeout:any = null;
       function changeFilter(immediate=false){
         if(immediate){
-          if(filterTimeouet){
-            clearTimeout(filterTimeouet);
+          if(filterTimeout){
+            clearTimeout(filterTimeout);
           }
           doFilter();
           saveFilter();
           return;
         }
-        if(filterTimeouet){
-          clearTimeout(filterTimeouet);
-          filterTimeouet = null;
+        if(filterTimeout){
+          clearTimeout(filterTimeout);
+          filterTimeout = null;
         }
-        filterTimeouet = setTimeout(()=>{
+        filterTimeout = setTimeout(()=>{
           doFilter();
           saveFilter();
         },200);
       }
 
-      function toggelHiddenCol(id:string = ""){
+      function toggleHiddenCol(id:string = ""){
         if(id == ""){
           filter.hiddenCols = [];
+          // trigger reactivity and persist
+          filter = { ...filter };
+          saveFilter();
           return;
         }
         if(filter.hiddenCols.includes(id)){
@@ -588,24 +581,10 @@
 
 
       function toggleSort(id:string){
-        if(filter.sortCols.includes(id+"__down")){
-          filter.sortCols = filter.sortCols.filter((e:string)=>{
-            if(e == id+"__down"){
-              return false
-            }
-            return true
-          })
-          filter.sortCols.unshift(id+"__up")
-
-        }else if(filter.sortCols.includes(id+"__up")){
-          filter.sortCols = filter.sortCols.filter((e:string)=>{
-            if(e == id+"__up"){
-              return false
-            }
-            return true
-          })
+        if(!filter.sort || filter.sort.id !== id){
+          filter.sort = { id, dir: "down" };
         }else{
-          filter.sortCols.unshift(id+"__down")
+          filter.sort = { id, dir: (filter.sort.dir === "down" ? "up" : "down") };
         }
         doFilter();
         saveFilter();
@@ -621,31 +600,57 @@
     <ul class="menu bg-base-200 menu-horizontal rounded-box filter-nav">
       <li>
         <label class="input input-ghost flex gap-2">
-          <input bind:value={filter.search} on:input={()=>changeFilter()} type="text" class="grow" placeholder="Search Names" />
+          <input bind:value={filter.search} on:input={()=>changeFilter()} type="text" class="grow" placeholder="Search Name, SN, IP" />
           <Icon src={MagnifyingGlass}></Icon>
         </label>
       </li> 
-      <li>
-        <label class="input input-ghost flex gap-2">
-          <input bind:value={filter.searchIp} on:input={()=>changeFilter()} type="text" class="grow" placeholder="Search IP" />
-          <Icon src={MagnifyingGlass}></Icon>
-        </label>
-      </li>
       <li class="nav-spacer"></li>
       <li style="flex-wrap:nowrap; flex-direction:row;">
         <span class="text-success " use:OverlayMenuService.tooltip data-tooltip="Connected">{sourceState.quickState.detail[0].count}</span><span>/</span>
-        <span class="text-error" use:OverlayMenuService.tooltip data-tooltip="Errors ({sourceState.quickState.detail[1].count} Session Conflicts)">{sourceState.quickState.error}</span><span>/</span>
+        <span class="text-error" use:OverlayMenuService.tooltip data-tooltip={"Errors ("+sourceState.quickState.detail[1].count+" Session Conflicts)"}>{sourceState.quickState.error}</span><span>/</span>
         <span class="text-info" use:OverlayMenuService.tooltip data-tooltip="Total">{sourceState.quickState.count}</span>
       </li>
       <li class="nav-spacer"></li>
       <li>
-        <button class="btn-nav" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Bacth Jobs" on:click={()=>batchModal.showModal()}><Icon src={CodeBracket}></Icon></button>
+        <div class="form-control">
+          <label class="label cursor-pointer gap-2">
+            <span class="label-text text-sm">Auto-Reauth</span>
+            <input 
+              type="checkbox" 
+              class="toggle toggle-sm" 
+              checked={isAutoReauthEnabled}
+              on:change={() => toggleAutoReauth(!isAutoReauthEnabled)}
+              use:OverlayMenuService.tooltip 
+              data-tooltip="Toggle automatic reauthentication (disable to preserve manual web UI sessions)"
+            />
+          </label>
+        </div>
+      </li>
+      <li class="nav-spacer"></li>
+      <li>
+        <button class="btn-nav" aria-label="Batch Jobs" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Batch Jobs" on:click={()=>batchModal.showModal()}><Icon src={CodeBracket}></Icon></button>
       </li>
       <li>
-        <button class="btn-nav" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Manual NMOS Registry" on:click={()=>nmosRegistryModal.showModal()}><Icon src={Cog}></Icon></button>
+        <button class="btn-nav" aria-label="Enable PTP on all devices" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Enable PTP on all devices" on:click={()=>{ ptpEnableAll() }}><Icon src={CodeBracket}></Icon></button>
       </li>
       <li>
-        <button class="btn-nav" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Show or Hide Cols." on:click={()=>tableModal.showModal()}><Icon src={EllipsisVertical}></Icon></button>
+        <button class="btn-nav" aria-label="Disable PTP on all devices" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Disable PTP on all devices" on:click={()=>{ ptpDisableAll() }}><Icon src={CodeBracketSquare}></Icon></button>
+      </li>
+      <li>
+        <button class="btn-nav" aria-label="Set IGMP to None on all devices" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Set IGMP to None on all devices" on:click={(evt)=>{menu.open({entry:[
+          {label: "Set All to IGMP None", callback: ()=>{if(confirm('Set all devices to IGMP None?')) { setIgmpVersionAll("none") }}},
+          {label: "Set All to IGMP v2", callback: ()=>{if(confirm('Set all devices to IGMP v2?')) { setIgmpVersionAll("v2") }}},
+          {label: "Set All to IGMP v3", callback: ()=>{if(confirm('Set all devices to IGMP v3?')) { setIgmpVersionAll("v3") }}}
+        ]},evt)}}><Icon src={Microphone}></Icon></button>
+      </li>
+      <li>
+        <button class="btn-nav" aria-label="Restart all devices" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Restart all devices" on:click={()=>{ if(confirm('Restart all devices?')) { restartAll() } }}><Icon src={ArrowPath}></Icon></button>
+      </li>
+      <li>
+        <button class="btn-nav" aria-label="Manual NMOS Registry" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Manual NMOS Registry" on:click={()=>nmosRegistryModal.showModal()}><Icon src={Cog}></Icon></button>
+      </li>
+      <li>
+        <button class="btn-nav" aria-label="Show or Hide Columns" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Show or Hide Cols." on:click={()=>tableModal.showModal()}><Icon src={EllipsisVertical}></Icon></button>
       </li>
     </ul>
 
@@ -662,34 +667,21 @@
                         <div class="table-content">{col.name}</div>
                         <div class="table-functions">
                        {#if col.sortable}
-                       {#if filter.sortCols.includes(col.id + "__down")}
-                         <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
-                           <Icon class="text-info" src={BarsArrowDown}></Icon>
-                         </button>
-                       {:else if filter.sortCols.includes(col.id + "__up")}
-                         <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
-                           <Icon class="text-info" src={BarsArrowUp}></Icon>
-                         </button>
-                       {:else}
-                       <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
-                         <Icon class="" src={BarsArrowDown}></Icon>
-                       </button>
-                       {/if}
-                       {/if}
-
-                       {#if col.id == "ptpMenu"}
-                         <button class="btn btn-success btn-circle btn-sm" data-tooltip-position="bottom" use:OverlayMenuService.tooltip data-tooltip="Enable PTP on all devices" on:click={()=>{ptpEnableAll()}}>
-                           <Icon src={CodeBracket}></Icon>
-                         </button>
-                         <button class="btn btn-warning btn-circle btn-sm" data-tooltip-position="bottom" use:OverlayMenuService.tooltip data-tooltip="Disable PTP on all devices" on:click={()=>{ptpDisableAll()}}>
-                           <Icon src={CodeBracketSquare}></Icon>
-                         </button>
-                       {/if}
-
-                       {#if col.id == "restartMenu"}
-                         <button class="btn btn-error btn-circle btn-sm" data-tooltip-position="bottom" use:OverlayMenuService.tooltip data-tooltip="Restart all devices" on:click={()=>{restartAll()}}>
-                           <Icon src={ArrowPath}></Icon>
-                         </button>
+                         {#if filter.sort && filter.sort.id === col.id}
+                           {#if filter.sort.dir === "down"}
+                             <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
+                               <Icon class="text-info" src={BarsArrowDown}></Icon>
+                             </button>
+                           {:else}
+                             <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
+                               <Icon class="text-info" src={BarsArrowUp}></Icon>
+                             </button>
+                           {/if}
+                         {:else}
+                           <button class="btn btn-circle btn-ghost" on:click={()=>{toggleSort(col.id)}}>
+                             <Icon class="" src={BarsArrowDown}></Icon>
+                           </button>
+                         {/if}
                        {/if}
 
                         </div>
@@ -715,7 +707,7 @@
         </tr>
     </thead>
     <tbody>
-        {#each list as dev}
+        {#each list as dev (dev.sn)}
             <tr class={"det-device"}>
                 {#each tableCols as col}
                     {#if !filter.hiddenCols.includes(col.id)}
@@ -739,14 +731,27 @@
                             {dev.name} <small>({dev.direction})</small>
                             {/if}
 
+                            {#if col.id == "alias"}
+                            <span>{dev.alias || ""}</span>
+                            {/if}
+
                             {#if col.id == "type"}
                             {dev.type}
                             {/if}
 
                             {#if col.id == "ip"}
-                            {#each dev.ipList as ip}
-                            <a href={"https://"+ip+"/"} target="_blank">{ip}</a>
-                            {/each}
+                            {#if dev.ipList && dev.ipList.length > 0}
+                            <a href={"/device/"+dev.ipList[0]+"/access"} target="_blank" rel="noopener noreferrer">{dev.ipList[0]}</a>
+                            {/if}
+                            {/if}
+
+                            {#if col.id == "bitrate"}
+                            {@const totalBitrate = (dev.inputBitrate || 0) + (dev.outputBitrate || 0)}
+                            {#if totalBitrate > 0}
+                              <span>{totalBitrate.toFixed(1)} Mbps</span>
+                            {:else}
+                              <span class="text-gray-500">-</span>
+                            {/if}
                             {/if}
 
 
@@ -809,7 +814,30 @@
                               {#if dev.jpegxsLicensed}
                                 <div class="badge badge-success badge-sm"></div>
                               {:else}
-                                <div class="badge badge-info badge-outline badge-sm"></div>
+                                <div class="badge badge-error badge-outline badge-sm">Disabled</div>
+                              {/if}
+                            {/if}
+
+                            {#if col.id == "audioStreamEnabled"}
+                              {@const audioState = getAudioStreamState(dev)}
+                              <div class="badge {audioState.enabled ? 'badge-success' : 'badge-ghost'}">
+                                {audioState.enabled ? `${audioState.type.toUpperCase()} Enabled` : 'Disabled'}
+                              </div>
+                            {/if}
+
+                            {#if col.id == "txAudioStream0Enabled"}
+                              {#if dev.txAudioStream0Enabled}
+                                <div class="badge badge-success badge-sm">Enabled</div>
+                              {:else}
+                                <div class="badge badge-error badge-outline badge-sm">Disabled</div>
+                              {/if}
+                            {/if}
+
+                            {#if col.id == "rxAudioStream0Enabled"}
+                              {#if dev.rxAudioStream0Enabled}
+                                <div class="badge badge-success badge-sm">Enabled</div>
+                              {:else}
+                                <div class="badge badge-error badge-outline badge-sm">Disabled</div>
                               {/if}
                             {/if}
 
@@ -833,11 +861,36 @@
                             {#if col.id == "ptpDomain"}
                               {dev.ptpDomain} 
 
-                              {#if dev.ptpDomain != sourceState.ptpDomain}
-                                <button class="btn btn-info btn-circle" use:OverlayMenuService.tooltip data-tooltip="Set PTP Domain to {sourceState.ptpDomain}" on:click={()=>{fixPtpDomain(dev.sn)}}>
+                              {#if dev.ptpDomain != sourceState.settings.ptpDomain}
+                                <button class="btn btn-info btn-circle" use:OverlayMenuService.tooltip data-tooltip={"Set PTP Domain to "+sourceState.settings.ptpDomain} on:click={()=>{fixPtpDomain(dev.sn)}}>
                                   <Icon src={ArrowUturnLeft}></Icon>
                               </button> 
                               {/if}
+                            {/if}
+
+                            {#if col.id == "igmpVersion"}
+                              <span class="badge badge-outline">
+                                {dev.igmpVersion ? dev.igmpVersion.toUpperCase() : "NONE"}
+                              </span>
+                            {/if}
+
+                            {#if col.id == "igmpMenu"}
+                              <button class="btn btn-circle" on:click={(evt)=>{menu.open({entry:[
+                                {
+                                  label: "IGMP None",
+                                  callback: ()=>{setIgmpVersion(dev.sn, "none")}
+                                },
+                                {
+                                  label: "IGMP v2",
+                                  callback: ()=>{setIgmpVersion(dev.sn, "v2")}
+                                },
+                                {
+                                  label: "IGMP v3",
+                                  callback: ()=>{setIgmpVersion(dev.sn, "v3")}
+                                }
+                              ]},evt)}}>
+                                <Icon src={EllipsisVertical}></Icon>
+                              </button>
                             {/if}
 
                             {#if col.id == "ptpMenu"}
@@ -851,8 +904,20 @@
                               </button>
                             {/if}
 
+                            {#if col.id == "audioMenu"}
+                              {@const audioState = getAudioStreamState(dev)}
+                              <button class="btn btn-circle" on:click={(evt)=>{menu.open({entry:[
+                                {
+                                  label: audioState.enabled ? `Disable ${audioState.label}` : `Enable ${audioState.label}`,
+                                  callback: ()=>{toggleAudioStream(dev.sn, audioState.type, 0, !audioState.enabled)}
+                                }
+                              ]},evt)}}>
+                                <Icon src={EllipsisVertical}></Icon>
+                              </button>
+                            {/if}
+
                             {#if col.id == "restartMenu"}
-                              <button class="btn btn-error btn-circle" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Restart device" on:click={()=>{restartDevice(dev.sn)}}>
+                              <button class="btn btn-error btn-circle" data-tooltip-position="left,bottom" use:OverlayMenuService.tooltip data-tooltip="Restart device" on:click={()=>{ if(confirm('Restart device '+dev.name+' ('+dev.sn+')?')) { restartDevice(dev.sn) } }}>
                                 <Icon src={ArrowPath}></Icon>
                               </button>
                             {/if}
@@ -865,16 +930,16 @@
 
                             {#if col.id == "masterEnabled"}
                             <div class="table-cell">
-                              <div class="table-contente"></div>
-                              <div class="table-function"></div>
-                            </div>
-                            <div class="badge badge-{ dev.masterEnabled ? "success" : "error"} badge-sm"></div>
+                              <div class="table-content"></div>
+                              <div class="table-functions"></div>
+                              </div>
+                              <div class="badge badge-{ dev.masterEnabled ? "success" : "error"} badge-sm"></div>
                             {/if}
 
                             {#if col.id == "masterEnabledMenu"}
 
 
-                                <button class="btn btn-circle" on:click={(evt)=>{menu.open({entry:[{
+                                <button class="btn btn-circle" aria-label="Enable Master" on:click={(evt)=>{menu.open({entry:[{
                                   label:"Enable",callback:()=>{enableMaster(dev.sn)}
                                 }]},evt)}}>
                                   <Icon src={EllipsisVertical}></Icon>
@@ -910,14 +975,14 @@
 
                                 {#if col.id == "scalerMode"}
                                 <div class="table-cell">
-                                  <div class="table-contente"></div>
-                                  <div class="table-function"></div>
+                                  <div class="table-content"></div>
+                                  <div class="table-functions"></div>
                                 </div>
                                   {dev.outputMode}
 
                                   {/if}
                                   {#if col.id == "scalerModeMenu"}
-                                  <button class="btn btn-circle" on:click={(evt)=>{menu.open(getMenuTxScalerMode(dev),evt)}}>
+                                  <button class="btn btn-circle" aria-label="Scaler Mode Menu" on:click={(evt)=>{menu.open(getMenuTxScalerMode(dev),evt)}}>
                                     <Icon src={EllipsisVertical}></Icon>
                                   </button>
                                 {/if}
@@ -973,12 +1038,12 @@
                                     {/if}
 
                                 {#if col.id == "scalerMode"}
-                                {dev.moinitorMode}
+                                {formatRxScalerMode(dev)}
                                 {/if}
 
                                 {#if col.id == "scalerModeMenu"}
 
-                                <button class="btn btn-circle" on:click={(evt)=>{menu.open(getMenuRxScalerMode(dev),evt)}}>
+                                <button class="btn btn-circle" aria-label="Scaler Mode Menu" on:click={(evt)=>{menu.open(getMenuRxScalerMode(dev),evt)}}>
                                   <Icon src={EllipsisVertical}></Icon>
                                 </button>
 
@@ -987,8 +1052,7 @@
                                 {/if}
 
                                 {#if col.id == "outputResolution"}
-                                
-                                  {dev.outputResolution}
+                                  {dev.outputResolution || dev.monitorResolution}
                                 {/if}
 
                             
@@ -1065,13 +1129,13 @@
       <div class="form-control">
         <label class="label cursor-pointer">
           <span class="label-text">{col.name}</span> 
-          <input type="checkbox" checked={filter.hiddenCols.includes(col.id)} on:change={()=>{toggelHiddenCol(col.id);}} class="checkbox" />
+          <input type="checkbox" checked={filter.hiddenCols.includes(col.id)} on:change={()=>{toggleHiddenCol(col.id);}} class="checkbox" />
         </label>
       </div>
       {/if}
       {/each}
       <div class="modal-action">
-          <button class="btn" on:click={()=>{toggelHiddenCol("")}}>Show All</button>
+          <button class="btn" on:click={()=>{toggleHiddenCol("")}}>Show All</button>
       </div>
     </div>
   </dialog>

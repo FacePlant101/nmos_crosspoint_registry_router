@@ -16,7 +16,9 @@ RUN sed -i 's/\/usr\/sbin\/zerotier-one/\/usr\/sbin\/zerotier-one -U/g' /lib/sys
 
 WORKDIR /scripts
 COPY scripts/start.sh .
+COPY scripts/zerotier-auto-authorize.sh .
 RUN chmod +x start.sh
+RUN chmod +x zerotier-auto-authorize.sh
 RUN update-alternatives --set iptables /usr/sbin/iptables-legacy
 
 CMD /bin/bash start.sh

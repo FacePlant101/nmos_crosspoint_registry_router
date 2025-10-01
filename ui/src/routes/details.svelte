@@ -125,7 +125,7 @@
         countTotal = 0;
         searchExpandedDevices = [];
 
-        sourceState.devices.forEach((d)=>{
+        sourceState.devices.forEach((d:any)=>{
           if(d.available){
             countAvailable ++
           }else{
@@ -361,8 +361,8 @@
         return codec.join(", ");
       }
 
-      let labelModal;
-      let labelModalInput;
+      let labelModal: HTMLDialogElement;
+      let labelModalInput: HTMLInputElement;
       let labelModalId:string = "";
       let labelModalName:string = "";
       let labelModalAlias:string = "";
@@ -382,7 +382,7 @@
       }
       
 
-      let editorModal;
+      let editorModal: HTMLDialogElement;
       let activeEditorId:string = "";
       let activeEditorType:string = "";
       function openFlowEditor(flowId:string){
@@ -424,7 +424,7 @@
           return;
         }
         if(filter.hiddenCols.includes(id)){
-          filter.hiddenCols = filter.hiddenCols.filter((c)=>{
+          filter.hiddenCols = filter.hiddenCols.filter((c:string)=>{
             if(c == id){
               return false
             }
@@ -537,7 +537,7 @@
     </ul>
 
     
-    <ScrollArea autoHide={false}>
+    <ScrollArea>
   <table class="data-table">
 
     <thead>
@@ -568,7 +568,7 @@
                         </div>
                       </div>
                       {#if col.resize}
-                        <div class="resize-handler" draggable={true}
+                        <div class="resize-handler" role="separator" aria-label="Resize column" draggable={true}
                           on:dragstart={(e)=>{startResizeDrag(e,col.id)}}
                           on:drag={(e)=>{updateResizeDrag(e,col.id)}}
                           on:dragend={(e)=>{endResizeDrag(e,col.id)}}

@@ -18,6 +18,23 @@ printf "### Joining ZeroTier network: $ZT_NETWORK
 "
 zerotier-cli join $ZT_NETWORK
 
+# Run ZeroTier auto-authorization immediately after joining if API key is provided
+if [ -n "$ZT_API_KEY" ]; then
+    printf "### Running ZeroTier auto-authorization...\n"
+    if [ -f "/scripts/zerotier-auto-authorize.sh" ]; then
+        /scripts/zerotier-auto-authorize.sh
+        if [ $? -eq 0 ]; then
+            printf "### ZeroTier auto-authorization completed successfully\n"
+        else
+            printf "### WARNING: ZeroTier auto-authorization failed\n"
+        fi
+    else
+        printf "### WARNING: ZeroTier auto-authorization script not found\n"
+    fi
+else
+    printf "### Skipping auto-authorization (ZT_API_KEY not provided)\n"
+fi
+
 # Wait for network to be established and get assigned an IP
 printf "### Waiting for ZeroTier network to be ready...\n"
 COUNTER=0
@@ -268,6 +285,7 @@ iptables -t nat -L POSTROUTING -v
 
 printf "### ZeroTier routing setup complete
 "
+
 
 # Keep the container running and monitor ZeroTier
 while true; do

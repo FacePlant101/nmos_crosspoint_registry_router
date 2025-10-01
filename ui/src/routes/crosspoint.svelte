@@ -14,6 +14,7 @@
         destination:string
       };
   
+    type PreparedConnect = { srcDev: any; src: any; dstDev: any; dst: any; };
     let senders:any[] = [];
     let receivers:any[] = [];
     let sourceState:any = {}
@@ -357,7 +358,7 @@
 
 
         if(src && dst){
-          let newList = [];
+          let newList: PreparedConnect[] = [];
           newList.push({
             srcDev:srcDev,
             src:src,
@@ -377,9 +378,9 @@
             prepare:true,
             source:srcString,
             destination:dstString
-          }).then((response)=>{
-            let newList = []
-            response.data.connections.forEach((c)=>{
+          }).then((response: any)=>{
+            let newList: PreparedConnect[] = []
+            response.data.connections.forEach((c: any)=>{
               newList.push({
                 srcDev:c.srcDev,
                 src:c.src,
@@ -437,7 +438,7 @@
       updateGlobalTake();
     }
 
-    function cleanPreparedConnections(newList){
+    function cleanPreparedConnections(newList: PreparedConnect[]){
       preparedConnectList = preparedConnectList.filter((c)=>{
         for(let n of newList){
           if(n.dst.id == c.dst.id){
@@ -449,7 +450,7 @@
         return true;
           
       })
-      newList.forEach((n)=>{
+      newList.forEach((n: PreparedConnect)=>{
         preparedConnectList.push(n);
       })
 
@@ -491,6 +492,12 @@
         if(flow){
           ret+= "."+renderFlowTypeShort(flow.type) + "" +flow.num
         }
+        return ret;
+      }
+      // Fallback: if device is missing but we have a concrete flow (e.g. NMOS id),
+      // use the flow id directly so server can match by `nmos_` identifier.
+      if(flow && typeof flow.id === "string" && flow.id){
+        return flow.id;
       }
       return ret;
     }
@@ -503,9 +510,9 @@
         preview:true,
         source:srcString,
         destination:dstString
-      }).then((response)=>{
+      }).then((response: any)=>{
         previewConnectList = [];
-        response.data.connections.forEach((c)=>{
+        response.data.connections.forEach((c: any)=>{
           previewConnectList.push({src:c.src, dst:c.dst})
           
         })
@@ -650,23 +657,43 @@
             }
         }
       }
-
-      if(src && dst){
-        if(src.id == dst.connectedFlow){
-          return "active"
-        }
+ 
+     if(src && dst){
+       if(src.id == dst.connectedFlow){
+         return src.staged ? "active staged" : "active"
+       }
       }else{
-        for(let type in srcDev.senders){
-          for(let flow of srcDev.senders[type]){
-            if(dstDev.connectedFlows.includes(flow.id)){
-              return "active"
+        // Check for device-level connections when devices are collapsed
+        if(srcDev && dstDev && !src && !dst){
+          // Check if any flow from srcDev is connected to any flow in dstDev
+          let hasConnection = false;
+          let hasStaged = false;
+          
+          flowTypes.forEach((type) => {
+            if(srcDev.senders && srcDev.senders[type]){
+              srcDev.senders[type].forEach((senderFlow: any) => {
+                if(dstDev.receivers && dstDev.receivers[type]){
+                  dstDev.receivers[type].forEach((receiverFlow: any) => {
+                    if(senderFlow.id == receiverFlow.connectedFlow){
+                      hasConnection = true;
+                      if(senderFlow.staged){
+                        hasStaged = true;
+                      }
+                    }
+                  });
+                }
+              });
             }
+          });
+          
+          if(hasConnection){
+            return hasStaged ? "active staged" : "active";
           }
         }
       }
-
-      return "";
-    }
+ 
+     return "";
+   }
 
     function gotoLog(log:string){
       log = log.slice(5);
@@ -728,7 +755,7 @@
       }).finally(()=>{})
     }
 
-    function shortCaps(caps){
+    function shortCaps(caps: any){
       return "Limits: Unknown";
     }
 
@@ -746,8 +773,8 @@
     }
 
 
-    let labelModal;
-      let labelModalInput;
+    let labelModal: HTMLDialogElement;
+      let labelModalInput: HTMLInputElement;
       let labelModalId:string = "";
       let labelModalName:string = "";
       let labelModalAlias:string = "";
@@ -820,8 +847,8 @@
                         --><span class="cp-expand"><Icon src={ChevronRight}></Icon></span><!--
                         --><span class="cp-label {(dev.hidden?"hidden":"")}">{dev.alias}<!--
                         --><span class="cp-edit">
-                          <span on:click={(e)=>{e.stopPropagation(); editDevLabel(dev);}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
-                          <span on:click={(e)=>{e.stopPropagation(); toggleHidden(dev.id);}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(dev.hidden ? Eye : EyeSlash)}></Icon></span>
+                          <span role="button" tabindex="0" on:click={(e)=>{e.stopPropagation(); editDevLabel(dev);}} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){e.stopPropagation(); editDevLabel(dev);}}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
+                          <span role="button" tabindex="0" on:click={(e)=>{e.stopPropagation(); toggleHidden(dev.id);}} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){e.stopPropagation(); toggleHidden(dev.id);}}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(dev.hidden ? Eye : EyeSlash)}></Icon></span>
                           
                         </span></span><!--
                         --><span class="cp-type-spacer"></span><!--
@@ -833,12 +860,12 @@
                               --><span class="cp-expand"></span><!--
                               --><span class="cp-label {(flow.hidden?"hidden":"")}">{flow.alias}<!--
                                 --><span class="cp-edit">
-                                  <span on:click={()=>editFlowLabel(flow)} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
-                                  <span on:click={()=>toggleHidden(flow.id)} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(flow.hidden ? Eye : EyeSlash)}></Icon></span>
-                                  <span on:click={()=>activate(dev,flow)} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip data-tooltip="toggle activate"><Icon src={Link}></Icon></span>
+                                  <span role="button" tabindex="0" on:click={()=>editFlowLabel(flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){editFlowLabel(flow);}}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
+                                  <span role="button" tabindex="0" on:click={()=>toggleHidden(flow.id)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){toggleHidden(flow.id);}}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(flow.hidden ? Eye : EyeSlash)}></Icon></span>
+                                  <span role="button" tabindex="0" on:click={()=>activate(dev,flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){activate(dev,flow);}}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip data-tooltip="toggle activate"><Icon src={Link}></Icon></span>
                                 </span><!--
                                 --></span><!--
-                              --><span class={"cp-type cp-type-"+flow.type + " " + (flow.active ? "active" : "") }><Icon src={getFlowTypeIcon(flow.type)}></Icon><!--
+                              --><span class={"cp-type cp-type-"+flow.type + " " + (flow.active ? "active" : "") + " " + (flow.staged ? "staged" : "")}><Icon src={getFlowTypeIcon(flow.type)}></Icon><!--
                                 --><span class="cp-detail">{flow.format ? shortFormat(flow.format) : (flow.available ? "Unknown format": "Unavailable")}</span><!--
                               --></span><!--
                               
@@ -856,24 +883,28 @@
                     --><span class="cp-expand"><Icon src={ChevronRight}></Icon></span><!--
                     --><span class="cp-label {(dev.hidden?"hidden":"")}">{dev.alias}<!--
                         --><span class="cp-edit">
-                          <span on:click={(e)=>{e.stopPropagation(); editDevLabel(dev);}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip  data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
-                          <span on:click={(e)=>{e.stopPropagation(); toggleHidden(dev.id);}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(dev.hidden ? Eye : EyeSlash)}></Icon></span>
-                          <span on:click={(e)=>{e.stopPropagation(); connect(null, null, dev,null);}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip data-tooltip="disconnect"><Icon src={Link}></Icon></span>
+                          <span role="button" tabindex="0" on:click={(e)=>{e.stopPropagation(); editDevLabel(dev);}} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){e.stopPropagation(); editDevLabel(dev);}}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip  data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
+                          <span role="button" tabindex="0" on:click={(e)=>{e.stopPropagation(); toggleHidden(dev.id);}} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){e.stopPropagation(); toggleHidden(dev.id);}}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip data-tooltip="toggle hidden"><Icon src={(dev.hidden ? Eye : EyeSlash)}></Icon></span>
+                          <span role="button" tabindex="0" on:click={(e)=>{e.stopPropagation(); connect(null, null, dev,null);}} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){e.stopPropagation(); connect(null, null, dev,null);}}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip data-tooltip="disconnect"><Icon src={Link}></Icon></span>
                         </span><!--
                     --></span><!--
                   --></td>
 
                   {#each senders as sourceDev}
-                      <td class="cp-connect-device"><div><span class="{ getConnectClass(sourceDev, null, dev, null)}"
+                      <td class="cp-connect-device"><div><span role="button" tabindex="0" class="{ getConnectClass(sourceDev, null, dev, null)}"
                                   on:click={()=>connect( sourceDev, null, dev, null)}
-                                  on:mouseover={()=>getDeviceConnectionPreview(sourceDev, null, dev, null)} 
+                                  on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect( sourceDev, null, dev, null);}}}
+                                  on:mouseover={()=>getDeviceConnectionPreview(sourceDev, null, dev, null)}
+                                  on:focus={()=>getDeviceConnectionPreview(sourceDev, null, dev, null)} 
                                   on:mouseleave={()=>clearDeviceConnectionPreview()} ></span></div></td>
                       {#if isSenderExpanded(sourceDev.id)}
                         {#each flowTypes as type}
                           {#each sourceDev.senders[type] as sourceFlow}
-                          <td class="cp-connect-device"><div><span 
+                          <td class="cp-connect-device"><div><span role="button" tabindex="0" class="{ getConnectClass(sourceDev, sourceFlow, dev, null)}"
                                   on:click={()=>connect( sourceDev, sourceFlow, dev, null)}
+                                  on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect( sourceDev, sourceFlow, dev, null);}}}
                                   on:mouseover={()=>getDeviceConnectionPreview(sourceDev, sourceFlow, dev, null)}
+                                  on:focus={()=>getDeviceConnectionPreview(sourceDev, sourceFlow, dev, null)}
                                   on:mouseleave={()=>clearDeviceConnectionPreview()}></span></div></td>
                           {/each}
                         {/each}
@@ -891,9 +922,9 @@
                         <span class="cp-expand"></span><!--
                         --><span class="cp-label {(flow.hidden?"hidden":"")}">{flow.alias}<!--
                         --><span class="cp-edit">
-                          <span on:click={()=>editFlowLabel(flow)} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip  data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
-                          <span on:click={()=>toggleHidden(flow.id)} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip  data-tooltip="toggle hidden"><Icon src={(flow.hidden ? Eye : EyeSlash)}></Icon></span>
-                          <span on:click={()=>connect(null, null, dev,flow)} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip  data-tooltip="disconnect"><Icon src={Link}></Icon></span>
+                          <span role="button" tabindex="0" on:click={()=>editFlowLabel(flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){editFlowLabel(flow);}}} class="cp-button cp-button-edit" use:OverlayMenuService.tooltip  data-tooltip="change alias"><Icon src={Pencil}></Icon></span>
+                          <span role="button" tabindex="0" on:click={()=>toggleHidden(flow.id)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){toggleHidden(flow.id);}}} class="cp-button cp-button-visible" use:OverlayMenuService.tooltip  data-tooltip="toggle hidden"><Icon src={(flow.hidden ? Eye : EyeSlash)}></Icon></span>
+                          <span role="button" tabindex="0" on:click={()=>connect(null, null, dev,flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect(null, null, dev,flow);}}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip  data-tooltip="disconnect"><Icon src={Link}></Icon></span>
                         </span><!--
                         --></span><!--
                         --><span class={"cp-type cp-type-"+flow.type + " " + getDisconnectClass(dev,flow) + " " + (flow.active ? "active" : "")}><Icon src={getFlowTypeIcon(flow.type, false)}></Icon><!--
@@ -904,16 +935,19 @@
 
 
                       {#each senders as sourceDev}
-                      <td class="cp-connect-device"><div><span 
-                              on:click={()=>connect( sourceDev, null, dev, flow) } 
-                              on:mouseover={()=>getDeviceConnectionPreview(sourceDev, null, dev, flow) } 
+                      <td class="cp-connect-device"><div><span role="button" tabindex="0" class="{ getConnectClass(sourceDev, null, dev, flow) }"
+                              on:click={()=>connect( sourceDev, null, dev, flow) }
+                              on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect( sourceDev, null, dev, flow);}}}
+                              on:mouseover={()=>getDeviceConnectionPreview(sourceDev, null, dev, flow) }
+                              on:focus={()=>getDeviceConnectionPreview(sourceDev, null, dev, flow) } 
                               on:mouseleave={()=>clearDeviceConnectionPreview()} ></span></div></td>
                       {#if isSenderExpanded(sourceDev.id)}
                         {#each flowTypes as type}
                           {#each sourceDev.senders[type] as sourceFlow}
                             {#if receiverCapable(flow, sourceFlow) }
-                            <td class="cp-connect-flow"><div><span class="{ getConnectClass(sourceDev, sourceFlow, dev, flow)}" 
-                              on:click={()=>connect( sourceDev, sourceFlow, dev, flow) }></span></div></td>
+                            <td class="cp-connect-flow"><div><span role="button" tabindex="0" class="{ getConnectClass(sourceDev, sourceFlow, dev, flow)}" 
+                              on:click={()=>connect( sourceDev, sourceFlow, dev, flow) }
+                              on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect( sourceDev, sourceFlow, dev, flow);}}}></span></div></td>
                             {:else}
                             <td class="cp-connect-mismatch"><div></div></td>
                             {/if}

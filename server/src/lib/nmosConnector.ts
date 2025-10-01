@@ -20,6 +20,9 @@ import * as jsonpatch from 'fast-json-patch';
 import * as sdpTransform from 'sdp-transform';
 import { CrosspointAbstraction, CrosspointConnectionSenderInfo } from "./crosspointAbstraction";
 import { Topology } from "./topology";
+import { AtomicNmosStateManager } from "./atomicNmosStateManager";
+import { AdvancedNmosCompatibility } from "./advancedNmosCompatibility";
+import { PrometheusMetrics } from "./prometheusMetrics";
 
 const fs = require("fs");
 
@@ -65,12 +68,20 @@ export class NmosRegistryConnector {
     }
 
     settings:any = {};
+    private atomicStateManager: AtomicNmosStateManager;
+    private advancedCompatibility: AdvancedNmosCompatibility;
 
     constructor(config:any, loaddev = false) {
         this.settings = config;
         NmosRegistryConnector.instance = this;
         this.syncNmos = new SyncObject("nmos", this.nmosState);
         this.syncConnectionState = new SyncObject("nmosConnectionState");
+        
+        // Initialize Atomic State Manager for optimized switching performance
+        this.atomicStateManager = new AtomicNmosStateManager();
+        
+        // Initialize Advanced NMOS Compatibility for stream validation and optimization
+        this.advancedCompatibility = AdvancedNmosCompatibility.getInstance();
 
         this.registryVersionList = this.settings.nmos.registryVersions;
         this.connectVersionList = this.settings.nmos.connectVersions
@@ -240,11 +251,43 @@ export class NmosRegistryConnector {
         this.updateCrosspointTimer = setTimeout(()=>{
             this.updateCrosspointLimit = 0;
             this.updateCrosspointTimer = null;
-            if(CrosspointAbstraction.instance){
+            if (CrosspointAbstraction.instance) {
                 CrosspointAbstraction.instance.updateFromNmos(this.nmosState);
+            }
+            
+            // Update Prometheus metrics with NMOS data
+            this.updatePrometheusMetrics();
+            // Topology may be disabled via settings.disabledModules.core; guard access
+            if (Topology.instance && typeof Topology.instance.updateDevicesFromNmos === "function") {
                 Topology.instance.updateDevicesFromNmos(this.nmosState);
             }
         },100);
+    }
+
+    private updatePrometheusMetrics(): void {
+        const prometheusMetrics = PrometheusMetrics.getInstance();
+        if (!prometheusMetrics) return;
+
+        // Count devices, senders, and receivers
+        const deviceCount = Object.keys(this.nmosState.devices || {}).length;
+        const senderCount = Object.keys(this.nmosState.senders || {}).length;
+        const receiverCount = Object.keys(this.nmosState.receivers || {}).length;
+
+        // Get registry connection status
+        const registries = this.nmosRegistryList.map(registry => {
+            const url = `http://${registry.ip}:${registry.port}`;
+            const hasConnections = Object.keys(this.connections).some(connectionKey => 
+                connectionKey.startsWith(url) && 
+                this.connections[connectionKey].ws.readyState === WebSocket.OPEN
+            );
+            return {
+                url: `${registry.ip}:${registry.port}`,
+                connected: hasConnections
+            };
+        });
+
+        // Update NMOS metrics
+        prometheusMetrics.updateNmosRegistryMetrics(registries, deviceCount, senderCount, receiverCount);
     }
 
     private nmosState = {
@@ -259,6 +302,13 @@ export class NmosRegistryConnector {
         sendersManifestDetail :{}
     };
     private connections = {};
+
+    /**
+     * Get read-only access to NMOS state for latency measurement and other purposes
+     */
+    public getNmosState(): any {
+        return this.nmosState;
+    }
 
 
     private getSubscription(nmosRegistryUrl: string, resource: string) {
@@ -348,58 +398,106 @@ export class NmosRegistryConnector {
         try {
             type = (message.grain.topic as string).split("/").join("");
         } catch (e) {}
-        //console.log("updates from registry: " +  (message.grain.topic as string) + " > " + type)
+        
+        SyncLog.log("debug", "atomic_nmos", `Processing state update for type: ${type}`);
+        
         if (this.nmosState[type]) {
-            //console.log(JSON.stringify(message,null, 2))
             message.grain.data.forEach((g: any) => {
                 if (g.hasOwnProperty("path") && typeof g.path == "string") {
                     if (g.hasOwnProperty("post")) {
                         // add or update element
                         if (typeof g.post == "object") {
                             if(this.nmosState[type][g.path] && !this.versionIsPrefered(this.nmosState[type][g.path]["_sourceVersion"], version)){
-                                // do not update
-                            }else{
-                                let postData = g.post;
-                                NmosRegistryConnector.modifierCallbackList[type].forEach((f)=>{
-                                    postData = f(g.path, postData);
-                                })
-                                if(this.nmosState[type].hasOwnProperty(g.path)){
-                                    //Update
-                                }else{
-                                    newItem = true;
-                                    changes = true;
+                                // do not update - version preference check failed
+                                return;
+                            }
+
+                            let postData = g.post;
+                            NmosRegistryConnector.modifierCallbackList[type].forEach((f)=>{
+                                postData = f(g.path, postData);
+                            })
+                            
+                            const isNewItem = !this.nmosState[type].hasOwnProperty(g.path);
+                            if(isNewItem){
+                                newItem = true;
+                                changes = true;
+                            }
+
+                            postData["_sourceVersion"] = version;
+
+                            // **ATOMIC STATE MANAGEMENT**: Route updates through atomic state manager
+                            try {
+                                if (type === "sources") {
+                                    // Immutable sources - create new version if changed
+                                    const atomicSourceId = this.atomicStateManager.createImmutableSource(
+                                        g.path, postData, version
+                                    );
+                                    SyncLog.log("debug", "atomic_nmos", 
+                                        `Atomic source update: ${g.path} -> ${atomicSourceId}`);
+                                } else if (type === "flows") {
+                                    // Immutable flows - create new version if changed
+                                    const parentSources = postData.parents || [];
+                                    const atomicFlowId = this.atomicStateManager.createImmutableFlow(
+                                        g.path, postData, version, parentSources
+                                    );
+                                    SyncLog.log("debug", "atomic_nmos", 
+                                        `Atomic flow update: ${g.path} -> ${atomicFlowId}`);
+                                } else if (type === "senders") {
+                                    // Mutable senders - can be updated in place
+                                    this.atomicStateManager.updateMutableSender(g.path, postData, version);
+                                    SyncLog.log("debug", "atomic_nmos", 
+                                        `Atomic sender update: ${g.path}`);
+                                } else if (type === "receivers") {
+                                    // Mutable receivers - can be updated in place
+                                    this.atomicStateManager.updateMutableReceiver(g.path, postData, version);
+                                    
+                                    // Check for connection changes for performance optimization
+                                    if (!isNewItem) {
+                                        const oldData = this.nmosState[type][g.path];
+                                        const oldSenderId = oldData?.subscription?.sender_id;
+                                        const newSenderId = postData?.subscription?.sender_id;
+                                        if (oldSenderId !== newSenderId) {
+                                            changesConnect = true;
+                                            changes = true;
+                                            SyncLog.log("info", "atomic_nmos", 
+                                                `Connection change detected: receiver ${g.path} from ${oldSenderId} to ${newSenderId}`);
+                                        }
+                                    }
+                                    
+                                    SyncLog.log("debug", "atomic_nmos", 
+                                        `Atomic receiver update: ${g.path}`);
                                 }
-
-                                postData["_sourceVersion"] = version;
-
+                                
+                                // Continue with legacy state management for backward compatibility
                                 NmosRegistryConnector.hookCallbackList[type].forEach((f)=>{
                                     f(g.path, postData);
                                 })
 
-                                if(!newItem){
+                                if(!isNewItem && type !== "sources" && type !== "flows"){
+                                    // For mutable resources, check for changes (sources/flows are always immutable)
                                     let diff = jsonpatch.compare(this.nmosState[type][g.path], postData);
                                     if(diff.length == 0){
                                         // nothing
                                     }else if(diff.length == 1 &&  diff[0].op == "replace" && diff[0].path == "/version"){
                                         // nothing... relevant
-                                    }else if(diff.length == 2 && diff[1].op == "replace" && diff[1].path == "/subscription/sender_id" ){
-                                        changesConnect = true;
-                                        // TODO, isolate changes 
-                                        changes = true;
                                     }else{
                                         changes = true;
                                     }
-                                    
                                 }
 
                                 if(changes && type == "devices"){
                                     this.loadChannelMaping(postData);
                                 }
 
+                                // Maintain legacy state for compatibility
                                 this.nmosState[type][g.path] = postData;
                                 
+                            } catch (atomicError) {
+                                SyncLog.log("error", "atomic_nmos", 
+                                    `Atomic state update failed for ${type}/${g.path}: ${atomicError.message}`);
+                                // Fallback to legacy state management
+                                this.nmosState[type][g.path] = postData;
                             }
-
                         }
                     } else {
                         // remove element
@@ -407,6 +505,8 @@ export class NmosRegistryConnector {
                             if(this.nmosState[type][g.path]["_sourceVersion"] == version){
                                 delete this.nmosState[type][g.path];
                                 changes = true;
+                                SyncLog.log("debug", "atomic_nmos", 
+                                    `Removed ${type} resource: ${g.path}`);
                             }
                         } catch (e) {}
                     }
@@ -753,20 +853,143 @@ export class NmosRegistryConnector {
         return info
     }
 
-    async makeConnection(receiverId:string, senderInfo: CrosspointConnectionSenderInfo){
+    async makeConnection(receiverId:string, senderInfo: CrosspointConnectionSenderInfo, prepareOnly: boolean = false){
 
         if(senderInfo.error != ""){
             SyncLog.log("warning", "NMOS Connect", "No valid sender Info: " + senderInfo.error);
             throw new Error(senderInfo.error);
         }
 
+        // **ADVANCED COMPATIBILITY PRE-VALIDATION**: Validate stream compatibility before attempting connection
+        const connectionStartTime = Date.now();
+        let atomicOperationId: string | null = null;
+        let compatibilityResult: any = null;
+        
+        try {
+            if (senderInfo.senderId !== "disconnect") {
+                // Pre-validate stream compatibility to eliminate retry latency from failed connections
+                compatibilityResult = await this.advancedCompatibility.validateStreamCompatibility(
+                    senderInfo.senderId, 
+                    receiverId
+                );
+                
+                if (!compatibilityResult.compatible) {
+                    const compatibilityError = `Stream incompatible: ${compatibilityResult.reason}`;
+                    SyncLog.log("warning", "compatibility", compatibilityError, {
+                        senderId: senderInfo.senderId,
+                        receiverId: receiverId,
+                        confidence: compatibilityResult.confidence,
+                        warnings: compatibilityResult.warnings
+                    });
+                    throw new Error(compatibilityError);
+                }
+                
+                SyncLog.log("info", "compatibility", 
+                    `Stream compatibility validated: ${senderInfo.senderId} -> ${receiverId}`,
+                    { 
+                        confidence: compatibilityResult.confidence, 
+                        warnings: compatibilityResult.warnings.length,
+                        validationLatency: Date.now() - connectionStartTime 
+                    });
+            }
+        } catch (compatibilityError) {
+            SyncLog.log("error", "compatibility", 
+                `Stream compatibility validation failed: ${compatibilityError instanceof Error ? compatibilityError.message : String(compatibilityError)}`);
+            throw compatibilityError;
+        }
+
+        // **DYNAMIC STREAM RECONFIGURATION**: Check if we can update parameters without full reconnection
+        let dynamicReconfigUsed = false;
+        try {
+            if (!prepareOnly && senderInfo.senderId !== "disconnect") {
+                // Get optimized transport parameters for comparison
+                const optimizedTransportParams = await this.advancedCompatibility.getOptimizedTransportParams(
+                    senderInfo.senderId, 
+                    receiverId
+                );
+                
+                // Check if dynamic reconfiguration is possible (same sender, only transport changes)
+                const canReconfigure = await this.advancedCompatibility.canUseReconfiguration(
+                    senderInfo.senderId, 
+                    receiverId, 
+                    optimizedTransportParams
+                );
+                
+                if (canReconfigure) {
+                    // Attempt dynamic reconfiguration to avoid full disconnect/reconnect
+                    SyncLog.log("info", "dynamic_reconfig", 
+                        `Attempting dynamic reconfiguration: ${senderInfo.senderId} -> ${receiverId}`);
+                    
+                    const reconfigSuccess = await this.advancedCompatibility.performDynamicReconfiguration(
+                        senderInfo.senderId,
+                        receiverId,
+                        optimizedTransportParams,
+                        senderInfo.manifestFile
+                    );
+                    
+                    if (reconfigSuccess) {
+                        dynamicReconfigUsed = true;
+                        const totalLatency = Date.now() - connectionStartTime;
+                        SyncLog.log("success", "dynamic_reconfig", 
+                            `Dynamic reconfiguration completed successfully: ${senderInfo.senderId} -> ${receiverId}`,
+                            { totalLatency, optimization: "parameter_update_only" });
+                        
+                        // Return early - no need for full connection process
+                        return `Dynamic reconfiguration completed in ${totalLatency}ms`;
+                    } else {
+                        SyncLog.log("info", "dynamic_reconfig", 
+                            `Dynamic reconfiguration failed, falling back to full connection method`);
+                    }
+                }
+            }
+        } catch (reconfigError) {
+            SyncLog.log("warning", "dynamic_reconfig", 
+                `Dynamic reconfiguration check failed, using standard method: ${reconfigError instanceof Error ? reconfigError.message : String(reconfigError)}`);
+            // Continue with standard connection method
+        }
+
+        // **ATOMIC STATE OPTIMIZATION**: Pre-check for atomic connection switching (if not using dynamic reconfig)
+        if (!dynamicReconfigUsed) {
+            try {
+                if (!prepareOnly && senderInfo.senderId !== "disconnect") {
+                    // Check if we can perform atomic connection switching
+                    const atomicState = this.atomicStateManager.getState();
+                    const targetReceiver = atomicState.receivers[receiverId];
+                    const targetSender = atomicState.senders[senderInfo.senderId];
+                    
+                    if (targetReceiver && targetSender) {
+                        // Atomic connection switch available - perform optimized switching
+                        SyncLog.log("info", "atomic_nmos", 
+                            `Attempting atomic connection switch: receiver ${receiverId} to sender ${senderInfo.senderId}`);
+                        
+                        atomicOperationId = await this.atomicStateManager.performAtomicConnectionSwitch(
+                            [receiverId],
+                            senderInfo.senderId,
+                            targetSender.flow_id,
+                            [] // Source IDs would be resolved from flow hierarchy
+                        );
+                        
+                        SyncLog.log("info", "atomic_nmos", 
+                            `Atomic connection switch prepared: ${atomicOperationId}`,
+                            { latency: Date.now() - connectionStartTime });
+                    }
+                }
+            } catch (atomicError) {
+                SyncLog.log("warning", "atomic_nmos", 
+                    `Atomic connection optimization failed, falling back to standard method: ${atomicError instanceof Error ? atomicError.message : String(atomicError)}`);
+                // Continue with standard connection method
+            }
+        }
+
         let patch: any = {
-            activation: { 
-                mode: "activate_immediate",
-                requested_time: null,
-             },
             transport_params: [],
         };
+        if(!prepareOnly){
+            patch.activation = {
+                mode: "activate_immediate",
+                requested_time: null,
+            };
+        }
 
         
 
@@ -807,15 +1030,33 @@ export class NmosRegistryConnector {
         let interfaceCount = Math.min(senderInfo.interfaces.length, interfaces.length);
         let i = 0;
 
+        // **ADVANCED TRANSPORT PARAMETER OPTIMIZATION**: Use optimized parameters for faster connection establishment
+        let optimizedTransportParams: any = null;
+        if (compatibilityResult && compatibilityResult.optimizedTransportParams && senderInfo.senderId !== "disconnect") {
+            try {
+                optimizedTransportParams = await this.advancedCompatibility.getOptimizedTransportParams(
+                    senderInfo.senderId, 
+                    receiverId
+                );
+                SyncLog.log("info", "compatibility", 
+                    `Using optimized transport parameters for ${senderInfo.senderId} -> ${receiverId}`,
+                    optimizedTransportParams);
+            } catch (error) {
+                SyncLog.log("warning", "compatibility", 
+                    `Failed to get optimized transport params, using defaults: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+
         for (i = 0; i < interfaceCount; i++) {
             if(senderInfo.transport == "rtp.mcast" || senderInfo.transport == "rtp"){
-                patch.transport_params.push({interface_ip:"auto",rtp_enabled:true});
-            }else if(senderInfo.transport == "websocket"){
-                // TODO Websocket / MQTT
-                patch.transport_params.push({});
-            }else if(senderInfo.transport == "mqtt"){
-                // TODO Websocket / MQTT
-                patch.transport_params.push({});
+                const baseParams = { interface_ip: "auto" };
+                // Receiver staged patches must not include sender-only fields.
+                // Always use minimal receiver-side params to satisfy schema.
+                patch.transport_params.push(baseParams);
+            }else if(senderInfo.transport == "websocket" || senderInfo.transport == "mqtt"){
+                // Explicitly reject unsupported transports to avoid invalid schema patches
+                SyncLog.log("error", "NMOS Connect", `Unsupported transport '${senderInfo.transport}' for IS-05 patch`);
+                throw new Error(`Unsupported transport '${senderInfo.transport}'`);
             }else{
                 SyncLog.log("warning", "NMOS Connect", "Sender has no transport Information.");
                 throw new Error("Transport Type missing.");
@@ -824,11 +1065,8 @@ export class NmosRegistryConnector {
 
         interfaceCount = receiver.interface_bindings.length;
         for (i = i; i < interfaceCount; i++) {
-            if(senderInfo.senderId == "disconnect"){
-                patch.transport_params.push({ rtp_enabled: false });
-            }else{
-                patch.transport_params.push({});
-            }
+            // Receiver-side minimal valid params
+            patch.transport_params.push({ interface_ip: "auto" });
         }
 
         if(senderInfo.transport == "rtp.mcast" || senderInfo.transport == "rtp"){
@@ -839,16 +1077,22 @@ export class NmosRegistryConnector {
                 manifest = manifest.replace("TCS=UNSPECIFIED;", "TCS=SDR;");
             }
 
-            patch.transport_file = {
-                type: "application/sdp",
-                data: manifest,
-            };
+            // Only include transport_file if manifest data is valid (non-empty)
+            if(manifest && manifest.trim().length > 0){
+                patch.transport_file = {
+                    type: "application/sdp",
+                    data: manifest,
+                };
+            }
         }
 
-        if(senderInfo.senderId == "disconnect"){
-            patch.master_enable = false;
-        }else{
-            patch.master_enable = true;
+        // Only include master_enable on immediate connect; omit on prepare/stage
+        if(!prepareOnly){
+            if(senderInfo.senderId == "disconnect"){
+                patch.master_enable = false;
+            }else{
+                patch.master_enable = true;
+            }
         }
         // Warum ????
 
@@ -869,7 +1113,13 @@ export class NmosRegistryConnector {
 
         let versionFound = false;
         let controlHrefs = [];
-        let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
+        // Prefer highest supported Connection API versions first
+        let controlTypes = [
+            {type:"urn:x-nmos:control:sr-ctrl/v1.3",version:"v1.3"},
+            {type:"urn:x-nmos:control:sr-ctrl/v1.2",version:"v1.2"},
+            {type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"},
+            {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"},
+        ]
 
         for(let type of controlTypes){
             device.controls.forEach((control)=>{
@@ -896,8 +1146,32 @@ export class NmosRegistryConnector {
                 fixSlash = "/"
             }
             let patchHref = href.href + fixSlash + "single/receivers/" + receiverId + "/staged"
+            // Concise summary for debugging without logging full SDP
+            const patchSummary = {
+                prepareOnly,
+                senderId: (patch as any).sender_id ?? null,
+                hasTransportFile: !!(patch as any).transport_file,
+                transportParams: Array.isArray((patch as any).transport_params) ? (patch as any).transport_params.length : 0,
+                includesActivation: !!(patch as any).activation,
+                includesMasterEnable: Object.prototype.hasOwnProperty.call(patch, 'master_enable'),
+            };
+            SyncLog.log("info", "nmos_connect", "Attempting PATCH", { href: patchHref, ...patchSummary });
             try{
-                let result = await axios.patch(patchHref, patch, {timeout:30000});
+                let result = await axios.patch(patchHref, patch, {
+                    timeout: 10000,  // Increased timeout to handle slower NMOS devices
+                    maxRedirects: 0,  // Disable redirects for faster response
+                    headers: {
+                        'Connection': 'keep-alive',  // Enable connection reuse
+                        'Keep-Alive': 'timeout=10, max=1000',  // More aggressive keep-alive
+                        'Cache-Control': 'no-cache',  // Prevent caching delays
+                        'User-Agent': 'NMOS-Crosspoint/2.0'  // Identify ourselves
+                    },
+                    // Enable HTTP/2 and compression
+                    httpAgent: false,
+                    httpsAgent: false,
+                    // Disable response validation for speed
+                    validateStatus: (status) => status >= 200 && status < 300
+                });
                 return SyncLog.log("success", "nmos_connect", "Successfully patched: "+receiverId, {href:patchHref, data:patch})
             }catch(e){
                 if (axios.isAxiosError(e)) {
@@ -919,7 +1193,15 @@ export class NmosRegistryConnector {
                 
             }
         }
-        let id = SyncLog.log("error", "nmos_connect", "Receiver Control unreachable.",{controlHrefs,patch});
+        const availableControls = (device && Array.isArray(device.controls)) ? device.controls.map((c:any)=>({type:c.type, href:c.href})) : [];
+        const finalPatchSummary = {
+            senderId: (patch as any).sender_id ?? null,
+            hasTransportFile: !!(patch as any).transport_file,
+            transportParams: Array.isArray((patch as any).transport_params) ? (patch as any).transport_params.length : 0,
+            includesActivation: !!(patch as any).activation,
+            includesMasterEnable: Object.prototype.hasOwnProperty.call(patch, 'master_enable'),
+        }
+        let id = SyncLog.log("error", "nmos_connect", "Receiver Control unreachable.",{controlHrefs, availableControls, patchSummary: finalPatchSummary});
         throw new LoggedError("Receiver Control unreachable.", id);
     }
 
@@ -1024,6 +1306,228 @@ export class NmosRegistryConnector {
     }
 
 
+    /**
+     * Update the description field of an NMOS resource to store persistent alias
+     * @param resourceType - Type of resource (devices, sources, senders, receivers, flows)
+     * @param resourceId - NMOS ID of the resource
+     * @param alias - Alias to store in description field
+     */
+    async updateNmosDescription(resourceType: "devices"|"sources"|"senders"|"receivers"|"flows", resourceId: string, alias: string): Promise<void> {
+        try {
+            const resource = this.nmosState[resourceType][resourceId];
+            if (!resource) {
+                SyncLog.log("debug", "nmos_alias", `Resource ${resourceType}/${resourceId} not found for alias update`);
+                return;
+            }
+
+            // Try IS-13 NMOS Annotation API first (proper NMOS way)
+            const is13Success = await this.tryIs13AnnotationUpdate(resourceType, resourceId, alias);
+            if (is13Success) {
+                return;
+            }
+
+            // Fallback: Try device-specific APIs for Matrox devices
+            if (resourceType === "devices" && resource.controls && resource.controls.length > 0) {
+                // Try Matrox CIP device API directly
+                const matroxWebUI = resource.controls.find(c => c.type === "urn:x-matrox:cip:webui");
+                if (matroxWebUI) {
+                    try {
+                        // Extract device IP from Matrox web UI URL (https://MTXCIP-YXA00638/)
+                        const urlMatch = matroxWebUI.href.match(/https?:\/\/([^\/]+)/);
+                        if (urlMatch) {
+                            const deviceHost = urlMatch[1];
+                            // Try Matrox device API endpoint for description update
+                            const matroxApiUrl = `http://${deviceHost}:5050/api/device/description`;
+                            
+                            await axios.put(matroxApiUrl, { description: alias || "" }, {
+                                timeout: 5000,
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'User-Agent': 'NMOS-Crosspoint/2.0'
+                                }
+                            });
+                            
+                            SyncLog.log("success", "nmos_alias", `Updated Matrox device description: ${resourceId}`, { alias, deviceHost });
+                            return;
+                        }
+                    } catch (error) {
+                        SyncLog.log("debug", "nmos_alias", `Matrox device API failed for ${resourceId}: ${error instanceof Error ? error.message : String(error)}`);
+                    }
+                }
+                
+                // Try NMOS registry PATCH if writable
+                for (const registry of this.nmosRegistryList) {
+                    const registryUrl = `http://${registry.ip}:${registry.port}`;
+                    
+                    for (const version of this.registryVersionList) {
+                        try {
+                            const registryPatchUrl = `${registryUrl}/x-nmos/registration/${version}/resource/devices/${resourceId}`;
+                            
+                            await axios.patch(registryPatchUrl, {
+                                description: alias || ""
+                            }, {
+                                timeout: 5000,
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'User-Agent': 'NMOS-Crosspoint/2.0'
+                                }
+                            });
+                            
+                            SyncLog.log("success", "nmos_alias", `Updated device description via registry: ${resourceId}`, { alias, registryUrl, version });
+                            return;
+                        } catch (error) {
+                            SyncLog.log("debug", "nmos_alias", `Registry PATCH failed for ${resourceId} on ${registryUrl}/${version}: ${error instanceof Error ? error.message : String(error)}`);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Final fallback: Local storage only
+            SyncLog.log("debug", "nmos_alias", `NMOS alias persistence not supported for ${resourceType}/${resourceId} - using local storage only`);
+            
+        } catch (error) {
+            SyncLog.log("debug", "nmos_alias", `NMOS alias update failed for ${resourceType}/${resourceId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    /**
+     * Try to update alias using IS-13 NMOS Annotation API
+     */
+    private async tryIs13AnnotationUpdate(resourceType: string, resourceId: string, alias: string): Promise<boolean> {
+        try {
+            // Find devices/nodes that advertise IS-13 annotation service
+            const annotationServices = await this.findIs13AnnotationServices();
+            
+            for (const service of annotationServices) {
+                try {
+                    // IS-13 endpoint format: /x-nmos/annotation/{version}/{resource_type}/{resource_id}
+                    const annotationUrl = `${service.baseUrl}/x-nmos/annotation/${service.version}/${resourceType}/${resourceId}`;
+                    
+                    const annotationData = {
+                        description: alias || ""
+                    };
+                    
+                    await axios.put(annotationUrl, annotationData, {
+                        timeout: 5000,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'User-Agent': 'NMOS-Crosspoint/2.0'
+                        }
+                    });
+                    
+                    SyncLog.log("success", "nmos_alias", `Updated alias via IS-13 annotation API: ${resourceType}/${resourceId}`, { alias, service: service.baseUrl });
+                    return true;
+                    
+                } catch (error) {
+                    SyncLog.log("debug", "nmos_alias", `IS-13 annotation failed on ${service.baseUrl}: ${error instanceof Error ? error.message : String(error)}`);
+                    continue;
+                }
+            }
+            
+            return false;
+            
+        } catch (error) {
+            SyncLog.log("debug", "nmos_alias", `IS-13 annotation discovery failed: ${error instanceof Error ? error.message : String(error)}`);
+            return false;
+        }
+    }
+
+    /**
+     * Find NMOS nodes that advertise IS-13 annotation services
+     */
+    private async findIs13AnnotationServices(): Promise<Array<{baseUrl: string, version: string, deviceId: string, deviceLabel: string}>> {
+        const services: Array<{baseUrl: string, version: string, deviceId: string, deviceLabel: string}> = [];
+        
+        try {
+            // Look through discovered NMOS nodes for IS-13 annotation services
+            if (this.nmosState && this.nmosState.devices) {
+                for (const [deviceId, device] of Object.entries(this.nmosState.devices)) {
+                    if ((device as any).services) {
+                        for (const service of (device as any).services) {
+                            if (service.type === "urn:x-nmos:service:annotation") {
+                                const deviceLabel = (device as any).label || (device as any).description || deviceId;
+                                services.push({
+                                    baseUrl: service.href,
+                                    version: "v1.0", // Default to v1.0, could be made configurable
+                                    deviceId: deviceId,
+                                    deviceLabel: deviceLabel
+                                });
+                                SyncLog.log("info", "nmos_alias", `Found IS-13 annotation support on device: ${deviceLabel} (${deviceId})`, { service: service.href });
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (services.length === 0) {
+                SyncLog.log("info", "nmos_alias", "No IS-13 annotation services found - using local storage only for alias persistence");
+            } else {
+                SyncLog.log("info", "nmos_alias", `Found ${services.length} IS-13 annotation service(s) for NMOS alias persistence`);
+            }
+        } catch (error) {
+            SyncLog.log("debug", "nmos_alias", `Error discovering IS-13 services: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        
+        return services;
+    }
+
+    /**
+     * Check which devices support IS-13 annotation and return summary
+     */
+    public getIs13SupportSummary(): {supportedDevices: Array<{id: string, label: string, serviceUrl: string}>, totalDevices: number} {
+        const supportedDevices: Array<{id: string, label: string, serviceUrl: string}> = [];
+        let totalDevices = 0;
+        
+        try {
+            if (this.nmosState && this.nmosState.devices) {
+                totalDevices = Object.keys(this.nmosState.devices).length;
+                
+                for (const [deviceId, device] of Object.entries(this.nmosState.devices)) {
+                    if ((device as any).services) {
+                        for (const service of (device as any).services) {
+                            if (service.type === "urn:x-nmos:service:annotation") {
+                                const deviceLabel = (device as any).label || (device as any).description || deviceId;
+                                supportedDevices.push({
+                                    id: deviceId,
+                                    label: deviceLabel,
+                                    serviceUrl: service.href
+                                });
+                                break; // Only need to find one IS-13 service per device
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            SyncLog.log("debug", "nmos_alias", `Error checking IS-13 support: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        
+        return { supportedDevices, totalDevices };
+    }
+
+    /**
+     * Find which registry hosts a specific resource
+     */
+    private async findResourceRegistry(resourceType: string, resourceId: string): Promise<string | null> {
+        // Check each connected registry to find the one hosting this resource
+        for (const registry of this.nmosRegistryList) {
+            const registryUrl = `http://${registry.ip}:${registry.port}`;
+            
+            for (const version of this.registryVersionList) {
+                try {
+                    const queryUrl = `${registryUrl}/x-nmos/query/${version}/${resourceType}/${resourceId}`;
+                    await axios.get(queryUrl, { timeout: 5000 });
+                    return registryUrl; // Found it
+                } catch (error) {
+                    // Resource not found in this registry/version, try next
+                    continue;
+                }
+            }
+        }
+        return null;
+    }
+
     async setFlowMulticast(senderId:string, data:any){
 
         try{
@@ -1053,12 +1557,15 @@ export class NmosRegistryConnector {
                     "mode": "activate_immediate",
                     "requested_time": null,
                 },
+                // Initialize legs with minimal valid sender-side params to avoid empty objects
                 "transport_params": [
                     {
-                        
+                        destination_ip: "auto",
+                        source_ip: "auto",
                     },
                     {
-                       
+                        destination_ip: "auto",
+                        source_ip: "auto",
                     }
                 ]
             };

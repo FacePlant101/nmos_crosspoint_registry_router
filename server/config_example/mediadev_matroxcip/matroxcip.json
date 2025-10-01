@@ -5,10 +5,10 @@
     "ignoreHttps":true,
     "edids":[{
             "name":"1080p50",
-            "file":"./config/mediadev_matrox/edid/1080p50.bin"
+            "file":"./config/mediadev_matroxcip/edid/1080p50.bin"
         },{
             "name":"2160p50",
-            "file":"./config/mediadev_matrox/edid/2160p50.bin"
+            "file":"./config/mediadev_matroxcip/edid/2160p50.bin"
         }],
     "resolutions":[{
         "name":"1080p50",
@@ -32,5 +32,12 @@
     "manualDevices":[
         {"sn":"abc1234", "auth":{"user":"admin1","password":"password"}},
         {"sn":"abc4567", "auth":{"user":"admin1","password":"password"}}
-    ]
+    ],
+    "autoConfigNmosRegistry": {
+        "enabled": false,
+        "configureOnDiscovery": true,
+        "retryOnFailure": true,
+        "retryDelayMs": 30000
+    },
+    "disableAutoReauth": false
 }
