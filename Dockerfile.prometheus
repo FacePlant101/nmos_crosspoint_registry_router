@@ -1,4 +1,4 @@
-FROM prom/prometheus:latest
+FROM prom/prometheus:v2.52.0
 
 # Copy Prometheus configuration
 COPY monitoring/prometheus.yml /etc/prometheus/prometheus.yml
