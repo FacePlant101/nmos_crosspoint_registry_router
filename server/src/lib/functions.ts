@@ -63,6 +63,35 @@ export function ComplexCompare(a:string,b:string){
 }
 
 
+// Transport URNs used by NMOS resources, mapped to the short codes used internally
+// (see CrosspointConnectionSenderInfo.transport). Matrox USB is TCP based, not RTP.
+const transportShortCodes: {[urn:string]: "rtp" | "rtp.mcast" | "usb"} = {
+    "urn:x-nmos:transport:rtp": "rtp",
+    "urn:x-nmos:transport:rtp.mcast": "rtp.mcast",
+    "urn:x-matrox:transport:usb": "usb",
+}
+
+export function transportShortCode(urn:string): "rtp" | "rtp.mcast" | "usb" | ""{
+    if(typeof urn != "string"){ return ""; }
+    return transportShortCodes[urn] ?? "";
+}
+
+export function isUsbTransport(urn:string){
+    return transportShortCode(urn) == "usb";
+}
+
+// Crosspoint sender/receiver flow ids are always "nmos_" + the NMOS resource id, so the bare
+// id can be recovered by stripping the prefix.
+//
+// Crosspoint *device* ids cannot: legacy entries in state/crosspoint.json use
+// "nmosgrp_" + md5(grouphint + device_id), which is not reversible. Resolve a device via one of
+// its flows instead (see nmosDeviceIdFromFlowId) rather than parsing a device id.
+export function nmosIdFromCrosspointId(id:string){
+    if(typeof id != "string"){ return ""; }
+    if(id.startsWith("nmos_")){ return id.slice(5); }
+    return id;
+}
+
 export function ShortenNames(dev:string,flow:string){
     let name = "";
     let sync = true;

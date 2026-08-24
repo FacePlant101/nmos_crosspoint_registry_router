@@ -1235,7 +1235,10 @@ export interface CrosspointConnectionSenderInfo {
     interfaces:any[],
     active:boolean,
     error:string,
-    transport:string
+    transport:string,
+    // Sender TCP endpoint per leg, required to stage a Matrox USB receiver. Only set for
+    // transport "usb"; other transports derive their parameters on the receiver side.
+    senderLegs?:{source_ip:string, source_port:number}[]
 }
 
 export interface CrosspointShadowDevice {

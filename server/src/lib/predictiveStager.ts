@@ -1,4 +1,5 @@
 import { CrosspointAbstraction, CrosspointFlow, CrosspointState } from "./crosspointAbstraction";
+import { NmosRegistryConnector } from "./nmosConnector";
 import { SyncLog } from "./syncLog";
 
 export interface PredictiveStagerOptions {
@@ -15,6 +16,8 @@ export default class PredictiveStager {
   // History: receiverFlowId -> (senderFlowId -> count)
   private history: Map<string, Map<string, number>> = new Map();
   private lastStageAt: Map<string, number> = new Map();
+  private lastStagedSender: Map<string, { senderId: string; at: number }> = new Map();
+  private lastMultiviewerState: Map<string, boolean> = new Map();
 
   constructor(crosspoint: CrosspointAbstraction, options: PredictiveStagerOptions){
     this.crosspoint = crosspoint;
@@ -78,24 +81,44 @@ export default class PredictiveStager {
     const cooldown = cfg ? cfg.cooldownMs : this.cooldownMs;
     if(!enabled){ return; }
 
-    // Skip ALL receivers on Matrox CIP decoder devices when multiviewer is enabled
-    // This prevents decoder overload when already handling 4 simultaneous streams
-    if (this.shouldSkipMultiviewerReceiver(receiverId, state)) {
+    const multiviewerStatus = this.getMultiviewerStatus(receiverId, state);
+    if (multiviewerStatus.changed) {
+      this.lastStageAt.delete(receiverId);
+      this.lastStagedSender.delete(receiverId);
+    }
+    if (multiviewerStatus.skip) {
       return;
     }
 
     const last = this.lastStageAt.get(receiverId) ?? 0;
     const now = Date.now();
+
+    // The staged connection was taken up by this switch, so it is no longer pending.
+    const lastStaged = this.lastStagedSender.get(receiverId);
+    if (lastStaged && lastStaged.senderId === currentSenderId) {
+      this.lastStagedSender.delete(receiverId);
+    }
+
+    // Hard rate limit. This must not depend on which sender is predicted: predict() excludes the
+    // current sender, so on A->B->A switching the prediction flips every time and any
+    // per-sender condition would never engage, leaving the receiver unthrottled.
     if(now - last < cooldown){ return; }
 
     const predicted = this.predict(receiverId, currentSenderId);
     if(!predicted || predicted === currentSenderId){ return; }
+
+    // Already staged and still pending - re-issuing the same prepare would be a no-op.
+    const staged = this.lastStagedSender.get(receiverId);
+    if (staged && staged.senderId === predicted) {
+      return;
+    }
 
     const dst = this.findFlowById(state, receiverId, false);
     const src = this.findFlowById(state, predicted, true);
     if(!dst || !src){ return; }
 
     this.lastStageAt.set(receiverId, now);
+    this.lastStagedSender.set(receiverId, { senderId: predicted, at: now });
     SyncLog.log("info", "predictive", `Staging prediction for ${receiverId}: ${predicted}`);
     this.crosspoint.executeConnectionPrepare(src, dst)
       .then(()=>{ SyncLog.log("success", "predictive", `Staged ${predicted} -> ${receiverId}`); })
@@ -118,7 +141,7 @@ export default class PredictiveStager {
     return out;
   }
 
-  private shouldSkipMultiviewerReceiver(receiverId: string, state: CrosspointState): boolean {
+  private getMultiviewerStatus(receiverId: string, state: CrosspointState): { skip: boolean; changed: boolean } {
     try {
       // Find device that contains this receiver flow
       for (const device of state.devices) {
@@ -126,8 +149,11 @@ export default class PredictiveStager {
         for (const [type, flows] of Object.entries(device.receivers)) {
           const flowArray = flows as any[];
           if (flowArray.some(f => f.id === receiverId)) {
-            // Found the device, check if it's a Matrox decoder with multiviewer enabled
-            if (device.name && device.name.toLowerCase().includes('matrox')) {
+            // Found the device, check if it's a Matrox ConvertIP decoder with multiviewer enabled.
+            // Resolve via the receiver flow: legacy "nmosgrp_" device ids are md5 hashes and
+            // cannot be mapped back to an NMOS device id.
+            const deviceId = NmosRegistryConnector.nmosDeviceIdFromFlowId(receiverId);
+            if (NmosRegistryConnector.isMatroxCipDevice(deviceId)) {
               try {
                 const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
                 const matroxInstance = MediaDevMatroxConvertIp.instance;
@@ -135,11 +161,20 @@ export default class PredictiveStager {
                   // Skip ALL receivers on multiviewer-enabled Matrox decoders to prevent overload
                   SyncLog.log("debug", "predictive", 
                     `Skipping receiver ${receiverId} on Matrox decoder ${device.name}: multiviewer enabled (prevents overload from 4+ concurrent streams)`);
-                  return true;
+                  const previous = this.lastMultiviewerState.get(device.id);
+                  const changed = previous !== undefined && previous !== true;
+                  this.lastMultiviewerState.set(device.id, true);
+                  return { skip: true, changed };
                 }
+
+                const previous = this.lastMultiviewerState.get(device.id);
+                const changed = previous !== undefined && previous !== false;
+                this.lastMultiviewerState.set(device.id, false);
+                return { skip: false, changed };
               } catch (error) {
                 SyncLog.log("warning", "predictive", 
                   `Failed to query multiviewer state for device ${device.name}: ${error instanceof Error ? error.message : String(error)}`);
+                return { skip: false, changed: false };
               }
             }
             break; // Found the device, no need to continue searching
@@ -150,8 +185,8 @@ export default class PredictiveStager {
       SyncLog.log("warning", "predictive", 
         `Error checking multiviewer state for receiver ${receiverId}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    
-    return false; // Default to allow staging if no multiviewer conflict detected
+
+    return { skip: false, changed: false }; // Default to allow staging if no multiviewer conflict detected
   }
 
   private findFlowById(state: CrosspointState, id: string, isSender: boolean): CrosspointFlow | null{

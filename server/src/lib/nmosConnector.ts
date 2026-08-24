@@ -18,6 +18,7 @@ import * as jsonpatch from 'fast-json-patch';
 
 
 import * as sdpTransform from 'sdp-transform';
+import { isUsbTransport, nmosIdFromCrosspointId, transportShortCode } from "./functions";
 import { CrosspointAbstraction, CrosspointConnectionSenderInfo } from "./crosspointAbstraction";
 import { Topology } from "./topology";
 import { AtomicNmosStateManager } from "./atomicNmosStateManager";
@@ -310,6 +311,47 @@ export class NmosRegistryConnector {
         return this.nmosState;
     }
 
+    /**
+     * Resolve the NMOS device id owning a crosspoint sender/receiver flow id.
+     *
+     * Flow ids are always "nmos_" + the NMOS resource id, so this works regardless of the
+     * prefix on the crosspoint *device* that contains the flow. Legacy "nmosgrp_" device ids
+     * are md5 hashes and cannot be resolved directly, which is why callers should come in via
+     * a flow rather than a device id.
+     */
+    public static nmosDeviceIdFromFlowId(flowId: string): string {
+        const nmosState = NmosRegistryConnector.instance?.getNmosState?.();
+        if(!nmosState){ return ""; }
+        const resourceId = nmosIdFromCrosspointId(flowId);
+        return nmosState.receivers?.[resourceId]?.device_id
+            ?? nmosState.senders?.[resourceId]?.device_id
+            ?? "";
+    }
+
+    /**
+     * Identify a Matrox ConvertIP device from its NMOS device record, preferring the vendor
+     * control/tags over the device label (labels are user editable).
+     */
+    public static isMatroxCipDevice(nmosDeviceId: string): boolean {
+        const nmosState = NmosRegistryConnector.instance?.getNmosState?.();
+        const nmosDevice = nmosState?.devices?.[nmosDeviceId];
+        if(!nmosDevice){ return false; }
+
+        const tags = (nmosDevice.tags ?? {}) as Record<string, string[]>;
+        const manufacturer = tags["urn:x-nmos:tag:asset:manufacturer/v1.0"]?.[0];
+        const product = tags["urn:x-nmos:tag:asset:product/v1.0"]?.[0];
+        const controls = Array.isArray(nmosDevice.controls) ? nmosDevice.controls : [];
+        const hasMatroxWebUi = controls.some((control: any) => control?.type === "urn:x-matrox:cip:webui");
+        const description = typeof nmosDevice.description === "string" ? nmosDevice.description.toLowerCase() : "";
+
+        return (
+            hasMatroxWebUi ||
+            (typeof manufacturer === "string" && manufacturer.toLowerCase() === "matrox" &&
+                typeof product === "string" && product.toLowerCase() === "convertip") ||
+            description.includes("matrox")
+        );
+    }
+
 
     private getSubscription(nmosRegistryUrl: string, resource: string) {
         this.registryVersionList.forEach((version)=>{
@@ -424,6 +466,14 @@ export class NmosRegistryConnector {
                             }
 
                             postData["_sourceVersion"] = version;
+                            let diff: jsonpatch.Operation[] = [];
+                            let isVersionOnlyChange = false;
+                            if(!isNewItem && type !== "sources" && type !== "flows"){
+                                diff = jsonpatch.compare(this.nmosState[type][g.path], postData);
+                                isVersionOnlyChange = diff.length === 0 || diff.every((d)=>
+                                    d.op === "replace" && (d.path === "/version" || d.path === "/_sourceVersion")
+                                );
+                            }
 
                             // **ATOMIC STATE MANAGEMENT**: Route updates through atomic state manager
                             try {
@@ -469,18 +519,16 @@ export class NmosRegistryConnector {
                                 }
                                 
                                 // Continue with legacy state management for backward compatibility
-                                NmosRegistryConnector.hookCallbackList[type].forEach((f)=>{
-                                    f(g.path, postData);
-                                })
+                                const shouldInvokeHooks = type !== "nodes" || isNewItem || !isVersionOnlyChange;
+                                if (shouldInvokeHooks) {
+                                    NmosRegistryConnector.hookCallbackList[type].forEach((f)=>{
+                                        f(g.path, postData);
+                                    })
+                                }
 
                                 if(!isNewItem && type !== "sources" && type !== "flows"){
                                     // For mutable resources, check for changes (sources/flows are always immutable)
-                                    let diff = jsonpatch.compare(this.nmosState[type][g.path], postData);
-                                    if(diff.length == 0){
-                                        // nothing
-                                    }else if(diff.length == 1 &&  diff[0].op == "replace" && diff[0].path == "/version"){
-                                        // nothing... relevant
-                                    }else{
+                                    if(!isVersionOnlyChange){
                                         changes = true;
                                     }
                                 }
@@ -788,6 +836,59 @@ export class NmosRegistryConnector {
         CrosspointAbstraction.instance.reconnectOnChangesFromNmos(senderId);
     }
 
+    /**
+     * Extract the TCP server endpoint(s) of a Matrox USB sender from its SDP transport file.
+     *
+     * Per Matrox "NMOS With USB" the media line is 'm=application <port> TCP usb ...' and the
+     * connection address is the sender's TCP server IP, either per media descriptor or at
+     * session level. Redundant senders expose one media descriptor per leg, in leg order.
+     */
+    private usbSenderLegsFromSdp(manifestFile:string): {source_ip:string, source_port:number}[]{
+        const legs: {source_ip:string, source_port:number}[] = [];
+        if(typeof manifestFile != "string" || manifestFile.trim() == ""){ return legs; }
+        let parsed:any;
+        try{
+            parsed = sdpTransform.parse(manifestFile);
+        }catch(e){
+            SyncLog.log("warning", "NMOS Connect", `Can not parse USB sender SDP: ${e?.message || e}`);
+            return legs;
+        }
+        const sessionIp = this.stripSdpAddress(parsed?.connection?.ip);
+        const media = Array.isArray(parsed?.media) ? parsed.media : [];
+        media.forEach((m:any)=>{
+            if(m?.type != "application"){ return; }
+            if(typeof m?.protocol != "string" || !m.protocol.toUpperCase().includes("TCP")){ return; }
+            const ip = this.stripSdpAddress(m?.connection?.ip) || sessionIp;
+            const port = Number(m?.port);
+            if(!ip || !Number.isFinite(port) || port <= 0){ return; }
+            legs.push({source_ip: ip, source_port: port});
+        });
+        return legs;
+    }
+
+    // SDP connection addresses may carry a TTL or multicast count suffix ("192.0.2.1/127").
+    private stripSdpAddress(ip:any): string{
+        if(typeof ip != "string"){ return ""; }
+        return ip.split("/")[0].trim();
+    }
+
+    /**
+     * Fallback endpoint source: the sender's IS-05 active transport parameters. Only populated
+     * for devices advertising urn:x-nmos:control:sr-ctrl/v1.0, so this is best effort.
+     */
+    private usbSenderLegsFromActive(senderId:string): {source_ip:string, source_port:number}[]{
+        const legs: {source_ip:string, source_port:number}[] = [];
+        const params = this.nmosState.senderActiveData?.[senderId]?.transport_params;
+        if(!Array.isArray(params)){ return legs; }
+        params.forEach((p:any)=>{
+            const ip = this.stripSdpAddress(p?.source_ip);
+            const port = Number(p?.source_port);
+            if(!ip || !Number.isFinite(port) || port <= 0){ return; }
+            legs.push({source_ip: ip, source_port: port});
+        });
+        return legs;
+    }
+
     async connectionGetSenderInfo(senderId:string){
         let info:CrosspointConnectionSenderInfo = {
             senderId: senderId,
@@ -841,12 +942,20 @@ export class NmosRegistryConnector {
             })
         });
 
-        if(sender.transport == "urn:x-nmos:transport:rtp.mcast"){
-            info.transport = "rtp.mcast"
+        info.transport = transportShortCode(sender.transport);
+
+        if(info.transport == "usb"){
+            // A USB receiver must be told the sender's TCP server endpoint (source_ip/source_port);
+            // the sender is 'a=setup:passive' so there is nothing to guess and "auto" is not valid.
+            info.senderLegs = this.usbSenderLegsFromSdp(info.manifestFile);
+            if(info.senderLegs.length == 0){
+                info.senderLegs = this.usbSenderLegsFromActive(senderId);
+            }
+            if(info.senderLegs.length == 0){
+                info.error = "USB sender has no usable TCP endpoint in its SDP or active transport parameters";
+                return info;
+            }
         }
-        if(sender.transport == "urn:x-nmos:transport:rtp"){
-            info.transport = "rtp"
-        } 
 
         info.active = sender.subscription.active;
 
@@ -901,7 +1010,10 @@ export class NmosRegistryConnector {
         // **DYNAMIC STREAM RECONFIGURATION**: Check if we can update parameters without full reconnection
         let dynamicReconfigUsed = false;
         try {
-            if (!prepareOnly && senderInfo.senderId !== "disconnect") {
+            // USB is excluded: performDynamicReconfiguration stages { interface_ip: "auto" } only,
+            // which omits the source_ip/source_port a USB receiver requires. USB always takes the
+            // full path below, which builds complete parameters.
+            if (!prepareOnly && senderInfo.senderId !== "disconnect" && senderInfo.transport !== "usb") {
                 // Get optimized transport parameters for comparison
                 const optimizedTransportParams = await this.advancedCompatibility.getOptimizedTransportParams(
                     senderInfo.senderId, 
@@ -1053,7 +1165,20 @@ export class NmosRegistryConnector {
                 // Receiver staged patches must not include sender-only fields.
                 // Always use minimal receiver-side params to satisfy schema.
                 patch.transport_params.push(baseParams);
-            }else if(senderInfo.transport == "websocket" || senderInfo.transport == "mqtt"){
+            } else if(senderInfo.transport == "usb"){
+                // Matrox USB is TCP based: the receiver dials the sender's passive TCP server, so
+                // source_ip/source_port are required alongside interface_ip.
+                const leg = senderInfo.senderLegs?.[i] ?? senderInfo.senderLegs?.[0];
+                if(!leg){
+                    SyncLog.log("error", "NMOS Connect", `USB sender has no endpoint for leg ${i}`);
+                    throw new Error("USB sender endpoint missing.");
+                }
+                patch.transport_params.push({
+                    interface_ip: "auto",
+                    source_ip: leg.source_ip,
+                    source_port: leg.source_port,
+                });
+            } else if(senderInfo.transport == "websocket" || senderInfo.transport == "mqtt"){
                 // Explicitly reject unsupported transports to avoid invalid schema patches
                 SyncLog.log("error", "NMOS Connect", `Unsupported transport '${senderInfo.transport}' for IS-05 patch`);
                 throw new Error(`Unsupported transport '${senderInfo.transport}'`);
@@ -1065,14 +1190,20 @@ export class NmosRegistryConnector {
 
         interfaceCount = receiver.interface_bindings.length;
         for (i = i; i < interfaceCount; i++) {
-            // Receiver-side minimal valid params
-            patch.transport_params.push({ interface_ip: "auto" });
+            // Receiver-side minimal valid params. A USB receiver leg with no matching sender leg
+            // is unused, and the spec requires its source fields to be explicitly null.
+            if(senderInfo.transport == "usb"){
+                patch.transport_params.push({ interface_ip: "auto", source_ip: null, source_port: null });
+            }else{
+                patch.transport_params.push({ interface_ip: "auto" });
+            }
         }
 
-        if(senderInfo.transport == "rtp.mcast" || senderInfo.transport == "rtp"){
+        if(senderInfo.transport == "rtp.mcast" || senderInfo.transport == "rtp" || senderInfo.transport == "usb"){
             let manifest = senderInfo.manifestFile;
 
-            if(this.settings.fixSdpBugs){
+            if(senderInfo.transport != "usb" && this.settings.fixSdpBugs){
+                // Video colorimetry workarounds, not applicable to a USB SDP
                 manifest = manifest.replace("colorimetry=UNSPECIFIED;", "colorimetry=BT709;");
                 manifest = manifest.replace("TCS=UNSPECIFIED;", "TCS=SDR;");
             }
@@ -1264,6 +1395,12 @@ export class NmosRegistryConnector {
                         }
                     ]
                 };
+            }
+
+            if(isUsbTransport(sender.transport)){
+                // rtp_enabled is not part of a USB sender's transport parameters, and the leg count
+                // is device specific. master_enable alone is enough to enable/disable the stream.
+                delete patch.transport_params;
             }
 
 
@@ -1536,6 +1673,12 @@ export class NmosRegistryConnector {
 
             let sender = this.nmosState.senders[senderId];
             let device = this.nmosState.devices[sender.device_id];
+
+            if(isUsbTransport(sender.transport)){
+                // Multicast has no meaning for a point-to-point TCP transport.
+                SyncLog.log("info", "NMOS Connect", `Skipping multicast assignment for USB sender ${senderId}`);
+                return;
+            }
 
             let controlTypes = [{type:"urn:x-nmos:control:sr-ctrl/v1.1",version:"v1.1"}, {type:"urn:x-nmos:control:sr-ctrl/v1.0",version:"v1.0"}]
 

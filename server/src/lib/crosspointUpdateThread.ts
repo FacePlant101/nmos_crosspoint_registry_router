@@ -1117,6 +1117,12 @@ class CrosspointUpdateThread{
                 let workingOnLeg = false;
 
                 activeData.transport_params.forEach((p, index)=>{
+                    // Non-RTP transports (Matrox USB) have no destination_ip. Without this guard
+                    // undefined is treated as a real address: 'undefined != ""' holds, so the first
+                    // such sender claims activeMulticast[undefined] and every later one is flagged a
+                    // duplicate and handed a bogus multicast address.
+                    if(typeof p.destination_ip != "string"){ return; }
+
                     multicast.push(p.destination_ip);
 
                     

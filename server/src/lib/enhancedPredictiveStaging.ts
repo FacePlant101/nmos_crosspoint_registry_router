@@ -199,8 +199,11 @@ export class EnhancedPredictiveStaging {
                                     for (const [type, flows] of Object.entries(device.receivers)) {
                                         const flowArray = flows as any[];
                                         if (flowArray.some(f => f.id === id)) {
-                                            // Found the device, check if it's a Matrox decoder with multiviewer enabled
-                                            if (device.name && device.name.toLowerCase().includes('matrox')) {
+                                            // Found the device, check if it's a Matrox ConvertIP decoder with multiviewer
+                                            // enabled. Resolve via the receiver flow: legacy "nmosgrp_" device ids are
+                                            // md5 hashes and cannot be mapped back to an NMOS device id.
+                                            const deviceId = NmosRegistryConnector.nmosDeviceIdFromFlowId(id);
+                                            if (NmosRegistryConnector.isMatroxCipDevice(deviceId)) {
                                                 try {
                                                     const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
                                                     const matroxInstance = MediaDevMatroxConvertIp.instance;
@@ -419,4 +422,5 @@ export class EnhancedPredictiveStaging {
             SyncLog.log("info", "predictive_staging", `Cleaned up ${cleaned} expired staged connections`);
         }
     }
+
 }
