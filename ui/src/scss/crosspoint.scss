@@ -45,9 +45,6 @@ $cp-border: 1px solid transparent;
             width:$cp-headerSize;
             height:$cp-headerSize;
             background-color: theme('colors.base-100');
-            span {
-                
-            }
         }
         .cp-limit-container {
             position:absolute;
@@ -61,9 +58,6 @@ $cp-border: 1px solid transparent;
             width:100%;
             height:$cp-headerSize;
             background-color: theme('colors.base-100');
-            span {
-                
-            }
         }
 
         .cp-label {
@@ -152,6 +146,24 @@ $cp-border: 1px solid transparent;
 
                 svg {
                     color:theme('colors.white');
+                }
+            }
+            &.staged {
+                &::after {
+                    content: "";
+                    position: absolute;
+                    inset: 0;
+                    border-radius: inherit;
+                    border: 2px dashed theme('colors.yellow.500');
+                    pointer-events: none;
+                }
+                svg {
+                    color: theme('colors.yellow.400');
+                }
+            }
+            &.active.staged {
+                svg {
+                    color: theme('colors.yellow.400');
                 }
             }
             &.prepareddisconnect {
@@ -425,11 +437,7 @@ $cp-border: 1px solid transparent;
                 background-color: rgba(150,150,150,0.05);
             }
         }
-        .cp-connect-mismatch {
-            div {
-                
-            }
-        }
+        
 
         .cp-connect-none, .cp-connect-device, .cp-connect-flow, .cp-connect-mismatch {
             div {
@@ -481,6 +489,9 @@ $cp-border: 1px solid transparent;
                     &.active {
                         background-color: $cp-color-blue;
                     }
+                    &.active.staged {
+                        background-color: theme('colors.yellow.500');
+                    }
                     
                     &.prepared {
                         background-color: $cp-color-red;
@@ -507,12 +518,7 @@ $cp-border: 1px solid transparent;
             }
         }
 
-        .cp-connect-flow {
-
-        }
-        .cp-connect-mismatch {
-
-        }
+        /* removed empty .cp-connect-flow and .cp-connect-mismatch rulesets */
 
         .cp-connect-device {
             span {
@@ -523,6 +529,9 @@ $cp-border: 1px solid transparent;
                     border-radius: 8px;
                     height:16px;
                     width:16px;
+                }
+                &.active.staged {
+                    background-color: theme('colors.yellow.500');
                 }
 
                 &:hover {
@@ -593,6 +602,19 @@ html[data-theme="light"] {
     
                     svg {
                         color:theme('colors.white');
+                    }
+                }
+                &.staged {
+                    &::after {
+                        content: "";
+                        position: absolute;
+                        inset: 0;
+                        border-radius: inherit;
+                        border: 2px dashed theme('colors.yellow.600');
+                        pointer-events: none;
+                    }
+                    svg {
+                        color: theme('colors.yellow.600');
                     }
                 }
                 &.prepareddisconnect {
@@ -691,7 +713,10 @@ html[data-theme="light"] {
                     &.active {
                         background-color: $cp-color-blue;
                     }
-    
+                    &.active.staged {
+                        background-color: theme('colors.yellow.600');
+                    }
+
                     
                 }
             }

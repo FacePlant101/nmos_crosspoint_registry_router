@@ -61,7 +61,11 @@ let tooltip = {
     <div class="overlay-menu" style="left:{menu.uipos.x}px; top:{menu.uipos.y}px">
         <ul class="">
             {#each menu.entry as entry}
-                <li><a on:click={(e)=>{e.stopPropagation(); entry.callback(); closeAll(); return false;}}>{entry.label}</a></li>
+                <li>
+                    <button type="button" on:click={(e)=>{e.stopPropagation(); entry.callback(); closeAll(); return false;}}>
+                        {entry.label}
+                    </button>
+                </li>
             {/each}
           </ul>
     </div>

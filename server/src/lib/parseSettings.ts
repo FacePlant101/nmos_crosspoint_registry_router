@@ -43,7 +43,41 @@ export function parseSettings(settings:any){
     }
 
 
+    // Predictive staging configuration
+    if(!settings.hasOwnProperty("predictiveStaging")){
+        settings.predictiveStaging = { enabled: false, cooldownMs: 10000, perReceiver: {} };
+    }else{
+        const ps = settings.predictiveStaging;
+        if(typeof ps !== 'object' || ps === null){
+            settings.predictiveStaging = { enabled: false, cooldownMs: 10000, perReceiver: {} };
+        }else{
+            if(!ps.hasOwnProperty('enabled') || typeof ps.enabled !== 'boolean'){
+                ps.enabled = false;
+            }
+            if(!ps.hasOwnProperty('cooldownMs')){
+                ps.cooldownMs = 10000;
+            }else{
+                if(typeof ps.cooldownMs !== 'number'){
+                    ps.cooldownMs = 10000;
+                }else{
+                    ps.cooldownMs = Number.parseInt(ps.cooldownMs);
+                    if(ps.cooldownMs < 0){ ps.cooldownMs = 10000; }
+                }
+            }
+            if(!ps.hasOwnProperty('perReceiver') || typeof ps.perReceiver !== 'object'){
+                ps.perReceiver = {};
+            }
+        }
+    }
 
+    // Debug logs toggle (controls debug/verbose output through SyncLog)
+    if(!settings.hasOwnProperty("debugLogs")){
+        settings.debugLogs = false;
+    }else{
+        if(typeof settings.debugLogs !== "boolean"){
+            settings.debugLogs = false;
+        }
+    }
 
     return settings;
 }

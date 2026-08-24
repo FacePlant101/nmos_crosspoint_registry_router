@@ -19,8 +19,8 @@ interface SyncObjectList {
 }
 
 export class WebsocketSyncServer {
-    public static init(address:string, port:number) {
-        WebsocketSyncServer.instance = new WebsocketSyncServer(address,port);
+    public static init() {
+        WebsocketSyncServer.instance = new WebsocketSyncServer();
     }
 
     authData:any = {
@@ -160,7 +160,19 @@ export class WebsocketSyncServer {
         }
     }
 
-    private constructor(address:string, port:number) {
+    public addExpressMiddleware(path: string, middleware: any) {
+        this.server.use(path, middleware);
+    }
+
+    public getExpressApp() {
+        return this.server;
+    }
+
+    public getAuthenticatedClients() {
+        return this.clientList.filter(client => client.user !== '__noAuth');
+    }
+
+    private constructor() {
         this.wss = new WebSocket.Server({ noServer: true });
         this.wss.on("connection", (ws) => {
             
@@ -180,10 +192,39 @@ export class WebsocketSyncServer {
             next();
         });
         this.server.use(express.static("./public"));
-        this.server.all("/*", function (req, res, next) {
+        
+        // Note: Additional middleware will be added here via addExpressMiddleware() before the catch-all
+        // The catch-all SPA route is registered later via registerSpaRoute()
+    }
+
+    /**
+     * Register the SPA catch-all route (must be called after all other middleware)
+     */
+    public registerSpaRoute() {
+        // Only serve SPA for non-asset requests
+        this.server.get("*", function (req, res, next) {
+            // Skip if request is for assets, API routes, or other static content
+            if (req.path.startsWith('/assets/') || 
+                req.path.startsWith('/api/') || 
+                req.path.includes('.js') ||
+                req.path.includes('.css') ||
+                req.path.includes('.ico') ||
+                req.path.includes('.png') ||
+                req.path.includes('.jpg') ||
+                req.path.includes('.svg') ||
+                req.path.includes('.woff') ||
+                req.path.includes('.json') ||
+                req.path.includes('.webmanifest')) {
+                return next();
+            }
             res.sendFile(path.resolve("./") + "/public/index.html");
         });
+    }
 
+    /**
+     * Start the HTTP server (must be called after all middleware is registered)
+     */
+    public startServer(address: string, port: number) {
         const ls = this.server.listen(port, address, (e) => {
             SyncLog.log("error", "Server", "Failed to start on: "+address+":"+port, e )
         },() => {

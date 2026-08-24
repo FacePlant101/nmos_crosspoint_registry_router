@@ -1,0 +1,16 @@
+FROM prom/prometheus:latest
+
+# Copy Prometheus configuration
+COPY monitoring/prometheus.yml /etc/prometheus/prometheus.yml
+
+# Expose Prometheus port
+EXPOSE 9090
+
+# Use default prometheus entrypoint with our config
+CMD ["--config.file=/etc/prometheus/prometheus.yml", \
+     "--storage.tsdb.path=/prometheus", \
+     "--web.console.libraries=/etc/prometheus/console_libraries", \
+     "--web.console.templates=/etc/prometheus/consoles", \
+     "--storage.tsdb.retention.time=30d", \
+     "--web.enable-lifecycle", \
+     "--web.listen-address=0.0.0.0:9090"]

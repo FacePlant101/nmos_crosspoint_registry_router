@@ -43,6 +43,17 @@ export interface NetworkAuth {
    auth:string, 
    user?: string; 
    password?: string; 
+   // Optional per-device tuning parameters
+   pollIntervalMs?: number;
+   startJitterMs?: number;
+   fetchTimeoutMs?: number;
+   retryMax?: number;
+   retryBaseDelayMs?: number;
+   retryJitterMs?: number;
+   circuitBreaker?: {
+       failureThreshold?: number;
+       openDurationMs?: number;
+   };
 };
 
 export interface NetworkInfrastructure {

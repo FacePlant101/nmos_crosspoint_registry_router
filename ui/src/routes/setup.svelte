@@ -22,10 +22,6 @@
     ServerConnector.unsync("connectionState")
     });
 
-      function saveFilter(){
-      localStorage.setItem("nmos_details_filter", JSON.stringify(filter));
-    }
-
 
   </script>
   

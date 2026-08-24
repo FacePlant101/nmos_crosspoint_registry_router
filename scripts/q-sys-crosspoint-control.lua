@@ -394,7 +394,11 @@ function SendMultiviewerCommand(deviceSN, enabled)
     return
   end
   
-  print("Sending multiviewer command via crosspoint router for device " .. deviceSN .. ": " .. (enabled and "ENABLE" or "DISABLE"))
+  -- Strip channel suffix (.1, .2, .v1, .v2, etc.) from device serial number
+  -- NMOS backend expects base device serial number without channel identifiers
+  local baseDeviceSN = deviceSN:match("^([^%.]+)") or deviceSN
+  
+  print("Sending multiviewer command via crosspoint router for device " .. deviceSN .. " (base: " .. baseDeviceSN .. "): " .. (enabled and "ENABLE" or "DISABLE"))
   
   local command = {
     type = "request",
@@ -402,7 +406,7 @@ function SendMultiviewerCommand(deviceSN, enabled)
     route = "matroxcip_togglemultiviewer",
     id = tostring(request_id),
     data = {
-      sn = deviceSN,
+      sn = baseDeviceSN,
       enabled = enabled
     }
   }
@@ -439,7 +443,7 @@ function ConnectToMultiviewer(encoderList, decoderName, startChannel)
   local connections = {}
   for i, encoderName in ipairs(encoderList) do
     local channelNum = startChannel + i - 1
-    local destination = decoderName .. "." .. channelNum
+    local destination = decoderName .. ".v" .. channelNum
     table.insert(connections, {
       source = encoderName,
       destination = destination

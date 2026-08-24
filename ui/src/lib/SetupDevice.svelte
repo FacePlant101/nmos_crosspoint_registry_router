@@ -32,10 +32,7 @@
     <h2>Setup Device <small>( {deviceId} )</small></h2>
     
     {#if loading}
-    <div>Reload</div>
         <div>Loading</div>
-    {:else}
-        
     {/if}
 
 {/if}

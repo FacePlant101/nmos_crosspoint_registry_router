@@ -1,4 +1,4 @@
-server/node_modules/
+node_modules/
 server/dist/*
 server/config/*
 server/config_backups/*

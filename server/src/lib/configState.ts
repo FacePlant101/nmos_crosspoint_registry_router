@@ -32,6 +32,7 @@ interface CrosspointFlow {
     capabilities:string,
     channelNumber: number,
     sourceNumber: number,
+    staged?: boolean,
 };
 
 interface CrosspointDevice {
