@@ -82,8 +82,28 @@ services:
     depends_on:
       - prometheus
 
+  # InfluxDB for Proxmox metrics ingestion
+  influxdb:
+    image: influxdb:2.7
+    container_name: nmos-influxdb
+    hostname: nmos-influxdb
+    network_mode: host
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=CHANGE_ME
+      - DOCKER_INFLUXDB_INIT_PASSWORD=CHANGE_ME
+      - DOCKER_INFLUXDB_INIT_ORG=CHANGE_ME
+      - DOCKER_INFLUXDB_INIT_BUCKET=proxmox
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=CHANGE_ME
+    volumes:
+      - influxdb2-data:/var/lib/influxdb2
+      - influxdb2-config:/etc/influxdb2
+    restart: unless-stopped
+
 volumes:
   nmos-state:
   zerotier-data:
   prometheus-data:
   grafana-data:
+  influxdb2-data:
+  influxdb2-config:
