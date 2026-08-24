@@ -29,8 +29,26 @@ export class SyncLog extends SyncObject {
         return SyncLog.log("verbose",  topic,text, raw);
     }
 
-    
+    // Canonical severity names as the UI knows them. Call sites across the
+    // codebase are inconsistent ("warn" vs "warning") — normalising here means
+    // the log stream only ever carries the canonical set, so the UI filter and
+    // badge logic can rely on exact matches. Anything unknown becomes "info"
+    // rather than shipping an unfilterable category.
+    private static normaliseSeverity(severity: string): string {
+        switch (("" + severity).toLowerCase().trim()) {
+            case "error":   return "error";
+            case "warn":
+            case "warning": return "warning";
+            case "success": return "success";
+            case "info":    return "info";
+            case "verbose": return "verbose";
+            case "debug":   return "debug";
+            default:        return "info";
+        }
+    }
+
     static log(severity: string,  topic: string,text: string, raw: any= null) {
+        severity = SyncLog.normaliseSeverity(severity);
         // Drop debug/verbose logs unless debug is enabled
         if ((severity === "debug" || severity === "verbose") && !SyncLog.debugEnabled) {
             return -1;
@@ -88,7 +106,7 @@ export class SyncLog extends SyncObject {
         if (!this.startReadState(objectId)) {
             return;
         }
-        this.endReadState(objectId, { logList: [] });
+        this.endReadState(objectId, { logList: [], lastLogId: 0 });
     }
     pushMessage(id:number, time:number, severity: string, topic: string, text: string,  raw: any) {
             let message = {
@@ -100,20 +118,30 @@ export class SyncLog extends SyncObject {
                 raw,
             };
 
-            let state = this.getStateCopy();
-
             this.logHistory.push(message);
             if (this.logHistory.length > this.limitHistoryMem) {
                 this.logHistory.shift();
             }
-            state.logList.push(message);
-            if (state.logList.length > this.limitHistory) {
-                state.logList.shift();
+
+            // Explicit patch instead of setState(). setState deep-cloned the
+            // whole buffer, diffed it against the previous copy and cloned it
+            // again — and once the buffer was full the shift() re-indexed the
+            // array, so EVERY line produced a ~200-operation patch to every
+            // client. The ops below describe the same change exactly.
+            let live: any = this.getState();
+            if (!live || !Array.isArray(live.logList)) {
+                // First message before readState ran — fall back to a full set.
+                this.setState({ logList: [message], lastLogId: message.id });
+                return;
             }
-
-            state.lastLogId = message.id;
-
-            this.setState(state);
+            let patch: any[] = [{ op: "add", path: "/logList/-", value: message }];
+            if (live.logList.length + 1 > this.limitHistory) {
+                patch.push({ op: "remove", path: "/logList/0" });
+            }
+            // "add" on an object member replaces an existing value and creates
+            // a missing one, so this covers both readState shapes.
+            patch.push({ op: "add", path: "/lastLogId", value: message.id });
+            this.patchState(patch);
     }
 }
 

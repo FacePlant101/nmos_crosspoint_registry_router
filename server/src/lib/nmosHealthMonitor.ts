@@ -44,6 +44,13 @@ export class NmosHealthMonitor {
         }, this.cleanupIntervalMs);
     }
 
+    /** The `nmosHealthStats` sync object. Exposed so server.ts can register it
+     *  with the sync server — it was created but never registered, so the UI
+     *  could not subscribe to it. */
+    public getSyncHealthStats(): SyncObject {
+        return this.syncHealthStats;
+    }
+
     static getInstance(): NmosHealthMonitor {
         if (!NmosHealthMonitor.instance) {
             NmosHealthMonitor.instance = new NmosHealthMonitor();

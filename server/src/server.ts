@@ -24,6 +24,7 @@ import PredictiveStager from "./lib/predictiveStager";
 import { ConnectionLatencyMeasurement } from "./lib/connectionLatencyMeasurement";
 import { MatroxAuthHelper } from "./lib/matroxAuthHelper";
 import { PrometheusMetrics } from "./lib/prometheusMetrics";
+import { NmosHealthMonitor } from "./lib/nmosHealthMonitor";
 
 
 
@@ -108,7 +109,15 @@ try{
 
 try{
     if(settings.hasOwnProperty('server') && settings.server.hasOwnProperty('address')){
-        let serverAddressTemp = parseInt(settings.server.address);
+        // NOTE this used to parseInt() the address into an unused variable, so
+        // serverAddress was always the 0.0.0.0 default no matter what the
+        // settings said. It is a dotted-quad / hostname string, not a number.
+        let serverAddressTemp = ("" + settings.server.address).trim();
+        if(serverAddressTemp.length > 0){
+            serverAddress = serverAddressTemp;
+        }else{
+            throw new Error("Settings server address is empty.");
+        }
     }else{
         throw new Error("Settings server address not a usable.");
     }
@@ -170,6 +179,10 @@ server.addSyncObject("nmos","global",nmosConnector.syncNmos);
 server.addSyncObject("nmosConnectionState","global",nmosConnector.syncConnectionState);
 
 server.addSyncObject("crosspoint","global",crosspoint.syncCrosspoint);
+
+// The health monitor builds this sync object in its constructor but nothing
+// ever registered it, so the UI had no way to subscribe.
+server.addSyncObject("nmosHealthStats","global",NmosHealthMonitor.getInstance().getSyncHealthStats());
 
 
 let topology = null;

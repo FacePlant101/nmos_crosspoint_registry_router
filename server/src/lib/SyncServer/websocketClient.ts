@@ -30,6 +30,13 @@ export class WebsocketClient {
 
     private subscriptionList = [];
 
+    // Server-side heartbeat state — see the explainer on pingInterval below.
+    private pingInterval: any = null;
+    private pongPending: boolean = false;
+    private pingIntervalMs = 15000;
+    private pongTimeoutMs = 30000;
+    private lastPongAt: number = Date.now();
+
     constructor(s: WebSocket, e: any) {
         this.ws = s;
         this.env = e;
@@ -37,7 +44,7 @@ export class WebsocketClient {
         this.authSeed = Crypto.createHash('sha1').update(""+Math.random()).digest('hex');
 
         this.ws.on("message", (text: string) => {
-            if (text == "ping" && this.ws.OPEN) {
+            if (text == "ping" && this.ws.readyState === this.ws.OPEN) {
                 this.ws.send("pong");
             } else {
                 try {
@@ -46,9 +53,39 @@ export class WebsocketClient {
                 } catch (e) {}
             }
         });
+        // Native RFC 6455 pong frame — `ws` emits "pong" whenever the peer
+        // answers a server-issued ping. Clearing pongPending here is what
+        // lets the liveness timer below decide the socket is still alive.
+        this.ws.on("pong", () => {
+            this.pongPending = false;
+            this.lastPongAt = Date.now();
+        });
+
         this.ws.on("close", () => {
+            if (this.pingInterval) {
+                clearInterval(this.pingInterval);
+                this.pingInterval = null;
+            }
             WebsocketSyncServer.getInstance().disconnectClient(this);
         });
+
+        // Server-side heartbeat. Every pingIntervalMs we send a native ping
+        // frame; if no pong has arrived within pongTimeoutMs the connection
+        // is treated as dead and terminated. This surfaces dead clients (NAT
+        // drops, abrupt power-off) far faster than the OS TCP keepalive,
+        // which is often over two hours by default.
+        this.pingInterval = setInterval(() => {
+            try {
+                if (this.ws.readyState !== this.ws.OPEN) return;
+                if (this.pongPending && (Date.now() - this.lastPongAt) > this.pongTimeoutMs) {
+                    try { this.ws.terminate(); } catch (e) {}
+                    return;
+                }
+                this.pongPending = true;
+                this.ws.ping();
+            } catch (e) {}
+        }, this.pingIntervalMs);
+
         try{
             this.ws.send(JSON.stringify({
                 type:"authseed",
@@ -59,12 +96,15 @@ export class WebsocketClient {
 
     destructor() {}
     isConnected() {
-        return !this.ws.CLOSED;
+        // NOTE ws.OPEN / ws.CLOSED are the readyState CONSTANTS (1 / 3), not
+        // the state itself — the old checks compared against those and were
+        // always-false / always-true respectively.
+        return this.ws.readyState === this.ws.OPEN;
     }
 
     private send(obj) {
         try{
-            if (this.ws.OPEN) {
+            if (this.ws.readyState === this.ws.OPEN) {
                 this.ws.send(JSON.stringify(obj));
             }
         }catch(e){}
