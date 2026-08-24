@@ -1,5 +1,94 @@
+.setup-page {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.setup-header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid hsl(var(--b3));
+
+    h2 {
+        font-size: 1.25rem;
+        font-weight: 500;
+        line-height: 1.2;
+    }
+}
+
+.setup-version {
+    font-family: monospace;
+    font-size: 0.75rem;
+    opacity: 0.6;
+}
+
+.setup-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
 .setup-container {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 1rem;
+    // Two columns where there is room; the sections are short and unrelated,
+    // so a single long scroll wastes the width.
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
+    gap: 1rem;
+    align-content: start;
+
     .label {
         display: inline;
+    }
+}
+
+.setup-section {
+    background-color: hsl(var(--b2));
+    border-radius: var(--rounded-box, 0.5rem);
+    padding: 0.75rem 1rem 1rem;
+
+    h3 {
+        font-size: 1rem;
+        font-weight: 500;
+        margin-bottom: 0.5rem;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid hsl(var(--b3));
+    }
+}
+
+.setup-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.25rem 0;
+
+    input[type="text"],
+    input[type="number"],
+    input[type="password"] {
+        width: 14rem;
+        max-width: 55%;
+    }
+}
+
+.setup-hint {
+    font-size: 0.8rem;
+    opacity: 0.65;
+    margin: 0.25rem 0 0.5rem;
+
+    code {
+        font-family: monospace;
+        font-size: 0.75rem;
+        background-color: hsl(var(--b3));
+        border-radius: 0.25rem;
+        padding: 0 0.25rem;
     }
 }

@@ -5,6 +5,7 @@
 
 
 const fs = require("fs");
+const path = require("path");
 
 import {MdnsService} from "./lib/mdnsService"
 
@@ -38,6 +39,11 @@ const uiConfig = {
 
 const log = new SyncLog();
 SyncLog.log("info", "Process", "Server Startup.");
+
+let CROSSPOINT_VERSION = "unknown";
+try{
+    CROSSPOINT_VERSION = require(path.join(__dirname, "..", "package.json")).version || "unknown";
+}catch(e){}
 
 let settings: any = {};
 let rawSettingsText: string = "";
@@ -215,6 +221,260 @@ if(modDisabled.includes("topology")){
 
 const uiConfigSync: SyncObject = new SyncObject("uiconfig", uiConfig);
 server.addSyncObject("uiconfig","public",uiConfigSync);
+
+
+// ----- Editable setup config exposed to the UI -----
+// This is the single read model behind the Setup page. It deliberately does
+// NOT hand out the whole settings object: each field is picked and coerced so
+// the UI contract is explicit, and secrets are never included (see the DDNS
+// note when that lands — only a "…Set" boolean ever goes out).
+//
+// Some values can be applied to the running server, others cannot; the ones
+// that cannot set restartRequired on the reply so the UI can say so.
+let setupRestartRequired = false;
+function getSetupConfigState() {
+    let registry = { ip: "", port: 80 };
+    try {
+        if (Array.isArray(settings.staticNmosRegistries) && settings.staticNmosRegistries.length > 0) {
+            let r = settings.staticNmosRegistries[0] || {};
+            registry.ip = (typeof r.ip === "string") ? r.ip : "";
+            let p = parseInt("" + r.port);
+            registry.port = (!isNaN(p) && p > 0 && p < 65536) ? p : 80;
+        }
+    } catch (e) {}
+
+    // Predictive staging is a local feature that until now could only be
+    // configured by hand-editing settings.json.
+    let ps = (settings.predictiveStaging && typeof settings.predictiveStaging === "object")
+        ? settings.predictiveStaging : {};
+    let predictiveStaging = {
+        enabled: !!ps.enabled,
+        cooldownMs: (typeof ps.cooldownMs === "number") ? ps.cooldownMs : 10000
+    };
+
+    // Auth snapshot — just the configured usernames so the UI can show the
+    // current login in the change-credentials form. The stored password hash
+    // is NEVER sent out.
+    let authUsers: string[] = [];
+    try {
+        if (users && users.users && typeof users.users === "object") {
+            authUsers = Object.keys(users.users);
+        }
+    } catch (e) {}
+
+    return {
+        registry,
+        reconnectOnSdpChanges: !!settings.reconnectOnSdpChanges,
+        fixSdpBugs: !!settings.fixSdpBugs,
+        autoMulticast: !!settings.autoMulticast,
+        firstDynamicNumber: (typeof settings.firstDynamicNumber === "number") ? settings.firstDynamicNumber : 1000,
+        predictiveStaging,
+        debugLogs: !!settings.debugLogs,
+        auth: { users: authUsers },
+        // Sticky for the lifetime of the process: it means "the running server
+        // no longer matches settings.json". An unrelated later save must not
+        // clear it, so it is tracked outside this function.
+        restartRequired: setupRestartRequired,
+        version: CROSSPOINT_VERSION
+    };
+}
+const setupConfigSync: SyncObject = new SyncObject("setupConfig", getSetupConfigState());
+// "global", not "public": this snapshot includes the registry address and
+// the configured usernames, which unauthenticated clients have no need for.
+server.addSyncObject("setupConfig","global",setupConfigSync);
+
+/** Persist the current settings object to ./config/settings.json. */
+function persistSettings(){
+    let tmp = "./config/settings.json.tmp";
+    fs.writeFileSync(tmp, JSON.stringify(settings, null, 4));
+    fs.renameSync(tmp, "./config/settings.json");
+}
+
+server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        try{
+            if(!postData || typeof postData !== "object"){
+                reject({message:"No settings supplied."});
+                return;
+            }
+            // Local to this request, then folded into the sticky flag below.
+            let restartRequired = false;
+
+            // --- NMOS registry (first static entry). Needs a restart: the
+            // connector builds its registry list once at startup.
+            if(postData.hasOwnProperty("registry") && typeof postData.registry === "object" && postData.registry){
+                let ip = (typeof postData.registry.ip === "string") ? postData.registry.ip.trim() : "";
+                if(ip !== "" && !/^[0-9a-zA-Z.:_-]+$/.test(ip)){
+                    reject({message:"Registry address contains invalid characters."});
+                    return;
+                }
+                let port = parseInt("" + postData.registry.port);
+                if(isNaN(port) || port < 1 || port > 65535){
+                    reject({message:"Registry port must be between 1 and 65535."});
+                    return;
+                }
+                if(!Array.isArray(settings.staticNmosRegistries) || settings.staticNmosRegistries.length === 0){
+                    settings.staticNmosRegistries = [{ip:"", port:80, priority:10, domain:""}];
+                }
+                let cur = settings.staticNmosRegistries[0];
+                if(cur.ip !== ip || parseInt("" + cur.port) !== port){
+                    restartRequired = true;
+                }
+                cur.ip = ip;
+                cur.port = port;
+            }
+
+            // --- Plain booleans read live by the connector / update thread.
+            for(const key of ["reconnectOnSdpChanges", "fixSdpBugs", "autoMulticast"]){
+                if(postData.hasOwnProperty(key)){
+                    if(typeof postData[key] !== "boolean"){
+                        reject({message: key + " must be a boolean."});
+                        return;
+                    }
+                    settings[key] = postData[key];
+                }
+            }
+
+            // --- Crosspoint numbering. The worker thread reads this at start.
+            if(postData.hasOwnProperty("firstDynamicNumber")){
+                let n = parseInt("" + postData.firstDynamicNumber);
+                if(isNaN(n) || n < 1){
+                    reject({message:"First dynamic number must be 1 or greater."});
+                    return;
+                }
+                if(settings.firstDynamicNumber !== n){ restartRequired = true; }
+                settings.firstDynamicNumber = n;
+            }
+
+            // --- Predictive staging. The stager is constructed at startup, so
+            // enabling it from here needs a restart to take effect.
+            if(postData.hasOwnProperty("predictiveStaging") && typeof postData.predictiveStaging === "object" && postData.predictiveStaging){
+                if(!settings.predictiveStaging || typeof settings.predictiveStaging !== "object"){
+                    settings.predictiveStaging = { enabled:false, cooldownMs:10000, perReceiver:{} };
+                }
+                let target = settings.predictiveStaging;
+                if(postData.predictiveStaging.hasOwnProperty("enabled")){
+                    if(typeof postData.predictiveStaging.enabled !== "boolean"){
+                        reject({message:"predictiveStaging.enabled must be a boolean."});
+                        return;
+                    }
+                    if(target.enabled !== postData.predictiveStaging.enabled){ restartRequired = true; }
+                    target.enabled = postData.predictiveStaging.enabled;
+                }
+                if(postData.predictiveStaging.hasOwnProperty("cooldownMs")){
+                    let c = parseInt("" + postData.predictiveStaging.cooldownMs);
+                    if(isNaN(c) || c < 0){
+                        reject({message:"predictiveStaging.cooldownMs must be 0 or greater."});
+                        return;
+                    }
+                    target.cooldownMs = c;
+                }
+            }
+
+            // --- Debug logging applies immediately.
+            if(postData.hasOwnProperty("debugLogs")){
+                if(typeof postData.debugLogs !== "boolean"){
+                    reject({message:"debugLogs must be a boolean."});
+                    return;
+                }
+                settings.debugLogs = postData.debugLogs;
+                try{ SyncLog.setDebugEnabled(settings.debugLogs); }catch(e){}
+            }
+
+            try{
+                persistSettings();
+            }catch(e:any){
+                SyncLog.log("error", "Settings", "Failed to write ./config/settings.json", e);
+                reject({message:"Could not write settings.json: " + (e?.message || e)});
+                return;
+            }
+
+            if(restartRequired){ setupRestartRequired = true; }
+            setupConfigSync.setState(getSetupConfigState());
+            SyncLog.log("info", "Settings", "Setup config updated by " + client.user + ".");
+            resolve({message:200, data:{ ok:true, restartRequired: setupRestartRequired }});
+        }catch(e:any){
+            reject({message:"setupConfig failed: " + (e?.message || e)});
+        }
+    });
+});
+
+// ----- Change admin credentials -----
+// The auth model stores sha256(plaintextPassword) in users.json, and the
+// browser only ever knows that hash too — the plaintext never crosses the
+// wire. So this route takes hashes on both sides. A caller may only edit the
+// account they are authenticated as. After a rename the client is logged out,
+// because its stored hash no longer matches the new username.
+server.addRoute("POST", "changeCredentials","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        try{
+            if(!client || !client.user || client.user === "__noAuth"){
+                reject({message:"Not authenticated."});
+                return;
+            }
+            let curUser = (postData && typeof postData.currentUsername === "string") ? postData.currentUsername.trim() : "";
+            let curHash = (postData && typeof postData.currentPasswordHash === "string") ? postData.currentPasswordHash.trim().toLowerCase() : "";
+            let newUser = (postData && typeof postData.newUsername === "string") ? postData.newUsername.trim() : "";
+            let newHash = (postData && typeof postData.newPasswordHash === "string") ? postData.newPasswordHash.trim().toLowerCase() : "";
+
+            if(!curUser){ reject({message:"Current username is required."}); return; }
+            if(curUser !== client.user){
+                reject({message:"You can only change the credentials of your own account."});
+                return;
+            }
+            if(!users || !users.users || typeof users.users !== "object" || !users.users[curUser]){
+                reject({message:"User not found."});
+                return;
+            }
+            let stored = users.users[curUser];
+            let storedPass = (typeof stored.password === "string") ? stored.password.toLowerCase() : "";
+            if(!storedPass || storedPass !== curHash){
+                reject({message:"Current password is wrong."});
+                return;
+            }
+            if(newUser && newUser !== curUser){
+                if(!/^[A-Za-z0-9_.-]{1,64}$/.test(newUser)){
+                    reject({message:"New username must be 1-64 characters: letters, digits, _ . -"});
+                    return;
+                }
+                if(users.users.hasOwnProperty(newUser)){
+                    reject({message:"That username already exists."});
+                    return;
+                }
+            }
+            if(newHash && !/^[a-f0-9]{64}$/.test(newHash)){
+                reject({message:"New password hash malformed."});
+                return;
+            }
+            let finalUser = (newUser && newUser !== curUser) ? newUser : curUser;
+            if(finalUser !== curUser){
+                users.users[finalUser] = { ...stored };
+                delete users.users[curUser];
+            }
+            if(newHash){
+                users.users[finalUser].password = newHash;
+            }
+            try{
+                let tmp = "./config/users.json.tmp";
+                fs.writeFileSync(tmp, JSON.stringify(users, null, 4));
+                fs.renameSync(tmp, "./config/users.json");
+                SyncLog.log("info", "Settings", "Updated ./config/users.json (credentials change for " + curUser + (finalUser !== curUser ? " -> " + finalUser : "") + ").");
+            }catch(e:any){
+                SyncLog.log("error", "Settings", "Failed to write ./config/users.json", e);
+                reject({message:"Could not write users.json: " + (e?.message || e)});
+                return;
+            }
+            // Hot-reload the in-memory auth table so the next auth attempt is
+            // checked against the new data.
+            try{ server.relaodAuthData(users); }catch(e){}
+            try{ setupConfigSync.setState(getSetupConfigState()); }catch(e){}
+
+            resolve({message:200, data:{ ok:true, username: finalUser, passwordChanged: !!newHash }});
+        }catch(e:any){
+            reject({message:"changeCredentials failed: " + (e?.message || e)});
+        }
+    });
+});
 
 // Initialize Matrox CIP authentication helper (must be done after MediaDevices initialization)
 MatroxAuthHelper.initializeAuthHelper();
