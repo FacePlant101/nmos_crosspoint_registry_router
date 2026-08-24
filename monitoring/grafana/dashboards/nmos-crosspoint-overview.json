@@ -102,8 +102,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.50, rate(nmos_connection_latency_seconds_bucket[5m]))",
-          "legendFormat": "P50 Latency",
+          "expr": "sum(rate(nmos_connection_latency_seconds_sum[5m])) / sum(rate(nmos_connection_latency_seconds_count[5m]))",
+          "legendFormat": "Avg Latency",
           "refId": "A"
         },
         {
@@ -111,21 +111,12 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, rate(nmos_connection_latency_seconds_bucket[5m]))",
-          "legendFormat": "P95 Latency",
+          "expr": "max_over_time((sum(rate(nmos_connection_latency_seconds_sum[5m])) / sum(rate(nmos_connection_latency_seconds_count[5m])))[5m:])",
+          "legendFormat": "Max Latency (5m window)",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "histogram_quantile(0.99, rate(nmos_connection_latency_seconds_bucket[5m]))",
-          "legendFormat": "P99 Latency",
-          "refId": "C"
         }
       ],
-      "title": "Connection Latency Percentiles",
+      "title": "Connection Latency (Avg/Max)",
       "type": "timeseries"
     },
     {
@@ -276,8 +267,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, rate(nmos_connection_phase_latency_seconds_bucket{phase=\"deviceResolution\"}[5m]))",
-          "legendFormat": "Device Resolution P95",
+          "expr": "sum by (phase) (rate(nmos_connection_phase_latency_seconds_sum[5m])) / sum by (phase) (rate(nmos_connection_phase_latency_seconds_count[5m]))",
+          "legendFormat": "Avg {{phase}}",
           "refId": "A"
         },
         {
@@ -285,30 +276,12 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, rate(nmos_connection_phase_latency_seconds_bucket{phase=\"senderInfoRetrieval\"}[5m]))",
-          "legendFormat": "Sender Info P95",
+          "expr": "max_over_time((sum by (phase) (rate(nmos_connection_phase_latency_seconds_sum[5m])) / sum by (phase) (rate(nmos_connection_phase_latency_seconds_count[5m])))[5m:])",
+          "legendFormat": "Max {{phase}} (5m window)",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "histogram_quantile(0.95, rate(nmos_connection_phase_latency_seconds_bucket{phase=\"nmosPatching\"}[5m]))",
-          "legendFormat": "NMOS Patching P95",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "histogram_quantile(0.95, rate(nmos_connection_phase_latency_seconds_bucket{phase=\"streamActivation\"}[5m]))",
-          "legendFormat": "Stream Activation P95",
-          "refId": "D"
         }
       ],
-      "title": "Connection Phase Latencies (P95)",
+      "title": "Connection Phase Latencies (Avg/Max)",
       "type": "timeseries"
     },
     {
