@@ -40,14 +40,34 @@ const log = new SyncLog();
 SyncLog.log("info", "Process", "Server Startup.");
 
 let settings: any = {};
+let rawSettingsText: string = "";
 try {
     let rawFile = fs.readFileSync("./config/settings.json");
+    rawSettingsText = rawFile.toString();
     let tempSettings = JSON.parse(rawFile);
     settings = parseSettings(tempSettings);
 } catch (e) {
     SyncLog.log("error", "Settings", "Error while reading file: ./config/settings.json", e);
     SyncLog.log("error", "Settings", "Can not run without Configuration...");
     process.exit();
+}
+
+// parseSettings not only fills in defaults, it MINTS identifiers (probe
+// tokens, virtual sender/node UUIDs). Those have to survive a restart, so the
+// normalised result is written back whenever it differs from what was read.
+// ./config must therefore be writable — if it is not, say so loudly rather
+// than silently handing out a different token on every boot.
+try {
+    let serialised = JSON.stringify(settings, null, 4);
+    if (serialised !== rawSettingsText) {
+        fs.writeFileSync("./config/settings.json", serialised);
+        SyncLog.log("info", "Settings", "Normalised ./config/settings.json written back.");
+    }
+} catch (e) {
+    SyncLog.log("error", "Settings",
+        "Could not persist ./config/settings.json — any minted identifiers " +
+        "(probe token, virtual sender IDs) will change on every restart. " +
+        "Make the config directory writable.", e);
 }
 
 if(settings.hasOwnProperty("logOutput")){
