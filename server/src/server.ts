@@ -26,6 +26,8 @@ import { ConnectionLatencyMeasurement } from "./lib/connectionLatencyMeasurement
 import { MatroxAuthHelper } from "./lib/matroxAuthHelper";
 import { PrometheusMetrics } from "./lib/prometheusMetrics";
 import { NmosHealthMonitor } from "./lib/nmosHealthMonitor";
+import { Bcp008Monitor } from "./lib/bcp008Monitor";
+import { nmosIdFromCrosspointId } from "./lib/functions";
 
 
 
@@ -269,6 +271,12 @@ function getSetupConfigState() {
         autoMulticast: !!settings.autoMulticast,
         firstDynamicNumber: (typeof settings.firstDynamicNumber === "number") ? settings.firstDynamicNumber : 1000,
         predictiveStaging,
+        // Read-only IS-12 status monitoring; absent means on.
+        bcp008: { enabled: !(settings.bcp008 && settings.bcp008.enabled === false) },
+        registryDiscovery: {
+            unicastDnssd: !(settings.registryDiscovery && settings.registryDiscovery.unicastDnssd === false),
+            domain: (settings.registryDiscovery && typeof settings.registryDiscovery.domain === "string") ? settings.registryDiscovery.domain : ""
+        },
         debugLogs: !!settings.debugLogs,
         auth: { users: authUsers },
         // Sticky for the lifetime of the process: it means "the running server
@@ -368,6 +376,43 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         return;
                     }
                     target.cooldownMs = c;
+                }
+            }
+
+            // --- BCP-008 master switch. Applies live: the monitor opens or
+            // tears down its control connections itself.
+            if(postData.hasOwnProperty("bcp008") && typeof postData.bcp008 === "object" && postData.bcp008){
+                if(postData.bcp008.hasOwnProperty("enabled")){
+                    if(typeof postData.bcp008.enabled !== "boolean"){
+                        reject({message:"bcp008.enabled must be a boolean."});
+                        return;
+                    }
+                    if(!settings.bcp008 || typeof settings.bcp008 !== "object"){ settings.bcp008 = { enabled:true }; }
+                    settings.bcp008.enabled = postData.bcp008.enabled;
+                    try{ Bcp008Monitor.instance?.setEnabled(settings.bcp008.enabled); }catch(e){}
+                }
+            }
+
+            // --- Registry discovery. The domain list is re-read on the next
+            // DNS-SD pass, so both fields apply without a restart.
+            if(postData.hasOwnProperty("registryDiscovery") && typeof postData.registryDiscovery === "object" && postData.registryDiscovery){
+                if(!settings.registryDiscovery || typeof settings.registryDiscovery !== "object"){
+                    settings.registryDiscovery = { unicastDnssd:true, domain:"" };
+                }
+                if(postData.registryDiscovery.hasOwnProperty("unicastDnssd")){
+                    if(typeof postData.registryDiscovery.unicastDnssd !== "boolean"){
+                        reject({message:"registryDiscovery.unicastDnssd must be a boolean."});
+                        return;
+                    }
+                    settings.registryDiscovery.unicastDnssd = postData.registryDiscovery.unicastDnssd;
+                }
+                if(postData.registryDiscovery.hasOwnProperty("domain")){
+                    let d = ("" + postData.registryDiscovery.domain).trim();
+                    if(d !== "" && !/^[A-Za-z0-9.-]+$/.test(d)){
+                        reject({message:"Discovery domain contains invalid characters."});
+                        return;
+                    }
+                    settings.registryDiscovery.domain = d;
                 }
             }
 
@@ -516,6 +561,41 @@ server.addRoute("GET", "senderSdp","global", (client: WebsocketClient, query:str
         }else{
             reject("no SDP known for this sender");
         }
+    });
+});
+
+// BCP-008 packet counters for one flow, fetched live over IS-12 rather than
+// streamed, because they are only wanted while the status panel is open.
+server.addRoute("POST", "bcp008Counters","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        // The UI sends the crosspoint flow id ("nmos_<uuid>"); the monitor keys
+        // everything by the bare IS-04 UUID from the device's touchpoints.
+        let flowId = nmosIdFromCrosspointId((postData && typeof postData.flowId === "string") ? postData.flowId : "");
+        if(!flowId){ reject("missing flow id"); return; }
+        if(!Bcp008Monitor.instance){ reject("BCP-008 monitoring is not running"); return; }
+        Bcp008Monitor.instance.getPacketCounters(flowId).then((counters)=>{
+            if(counters){
+                resolve({message:200, data:{ counters }});
+            }else{
+                reject("no monitor for this flow");
+            }
+        }).catch((e)=>reject("counter read failed: " + (e?.message || e)));
+    });
+});
+
+server.addRoute("POST", "bcp008Reset","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        let flowId = nmosIdFromCrosspointId((postData && typeof postData.flowId === "string") ? postData.flowId : "");
+        if(!flowId){ reject("missing flow id"); return; }
+        if(!Bcp008Monitor.instance){ reject("BCP-008 monitoring is not running"); return; }
+        Bcp008Monitor.instance.resetCounters(flowId).then((ok)=>{
+            if(ok){
+                SyncLog.log("info", "BCP-008", "Counters reset for flow " + flowId + " by " + client.user + ".");
+                resolve({message:200, data:{ ok:true }});
+            }else{
+                reject("no monitor for this flow");
+            }
+        }).catch((e)=>reject("counter reset failed: " + (e?.message || e)));
     });
 });
 

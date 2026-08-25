@@ -1,4 +1,6 @@
 import { SyncObject } from "./SyncServer/syncObject";
+import { Bcp008Monitor, MonitorStatus } from "./bcp008Monitor";
+import { nmosIdFromCrosspointId } from "./functions";
 import { LoggedError, SyncLog } from "./syncLog";
 import { error } from "console";
 import { NmosRegistryConnector } from "./nmosConnector";
@@ -123,6 +125,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         // Initialize performance optimization services
         this.healthMonitor = NmosHealthMonitor.getInstance();
         this.predictiveStaging = EnhancedPredictiveStaging.getInstance();
+
+        // BCP-008 status monitoring. It lives here rather than in server.ts
+        // because its output is folded into the crosspoint state, and it needs
+        // the NMOS state this class already receives.
+        new Bcp008Monitor();
+        Bcp008Monitor.instance.onChange = () => {
+            try { this.republishEnriched(); } catch (e) {}
+        };
+        try {
+            Bcp008Monitor.instance.setEnabled(this.settings?.bcp008?.enabled !== false);
+        } catch (e) {}
 
         this.startWorker();
         // Don't call this.update() here - wait for first NMOS state to prevent 
@@ -1074,6 +1087,52 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         }
     }
     
+    /** Fold BCP-008 status into the crosspoint state and publish it.
+     *
+     *  The worker thread builds the state and knows nothing about BCP-008, so
+     *  the monitor's output is stitched in here, on the main thread, right
+     *  before publishing. Called both when the worker sends new state and when
+     *  the monitor reports a status change on its own. */
+    private republishEnriched() {
+        if (!this.crosspointState) return;
+        const mon = Bcp008Monitor.instance;
+        const enabled = !!mon?.isEnabled();
+
+        try {
+            (this.crosspointState as any).bcp008Enabled = enabled;
+            for (const dev of this.crosspointState.devices || []) {
+                // Per-device rollup, so the matrix can colour a collapsed node
+                // band without walking its flows in the UI.
+                let worstTx = 0, worstRx = 0;
+                for (const dir of ["senders", "receivers"] as const) {
+                    const groups = (dev as any)[dir] || {};
+                    for (const type of Object.keys(groups)) {
+                        const list = groups[type];
+                        if (!Array.isArray(list)) continue;
+                        for (const flow of list) {
+                            // Crosspoint ids are namespaced ("nmos_<uuid>"),
+                            // but the monitor keys its statuses by the bare
+                            // IS-04 UUID it resolved from the device's
+                            // touchpoints — map before looking up.
+                            const st = enabled ? mon?.getStatus(nmosIdFromCrosspointId(flow.id)) : null;
+                            (flow as any).monitor = st || null;
+                            if (st) {
+                                if (dir === "senders") { worstTx = Math.max(worstTx, st.status); }
+                                else { worstRx = Math.max(worstRx, st.status); }
+                            }
+                        }
+                    }
+                }
+                (dev as any).monitorSummaryTx = worstTx;
+                (dev as any).monitorSummaryRx = worstRx;
+            }
+        } catch (e) {
+            SyncLog.log("error", "crosspoint", "Failed to fold BCP-008 status into crosspoint state", e);
+        }
+
+        this.syncCrosspoint.setState(this.crosspointState);
+    }
+
     updateReturn(data: any) {
         if(data.hasOwnProperty("crosspointState")){
             const prev = this.crosspointState;
@@ -1082,7 +1141,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             // Update optimized lookup maps for O(1) performance
             this.optimizedLookup.updateFromCrosspointState(this.crosspointState);
             
-            this.syncCrosspoint.setState(this.crosspointState);
+            this.republishEnriched();
             // Notify subscribers
             try{
                 this.updateCallbacks.forEach(cb => {
@@ -1105,6 +1164,9 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
     updateFromNmos(nmosState: any) {
         const isFirstUpdate = !this.nmosState;
         this.nmosState = nmosState;
+        // Let the monitor reconcile its IS-12 control connections against the
+        // devices currently in the registry.
+        try { Bcp008Monitor.instance?.updateFromNmos(nmosState); } catch (e) {}
         this.worker.postMessage(JSON.stringify({
             nmosState: this.nmosState
         }));
@@ -1176,7 +1238,11 @@ export interface CrosspointFlow {
     capLimits:string,
     channelNumber: number,
     sourceNumber: number,
-    bitrate:CrosspointFlowBitrate
+    bitrate:CrosspointFlowBitrate,
+    /** Live BCP-008 status for this flow, or null when monitoring is off or
+     *  the owning device has no IS-12 control endpoint. Filled in on the main
+     *  thread by republishEnriched, not by the worker. */
+    monitor?: MonitorStatus | null
 };
 
 
@@ -1213,10 +1279,18 @@ export interface CrosspointDevice {
         mqtt: CrosspointFlow[],
         unknown: CrosspointFlow[],
     },
+
+    /** Worst BCP-008 status across this device's senders / receivers (0 = ok),
+     *  so a collapsed node band can be coloured without walking its flows. */
+    monitorSummaryTx?: number,
+    monitorSummaryRx?: number,
     
   }
 export interface CrosspointState {
-    devices: CrosspointDevice[]
+    devices: CrosspointDevice[],
+    /** Whether BCP-008 monitoring is on, so the UI can hide the status glyphs
+     *  entirely rather than showing every flow as "unknown". */
+    bcp008Enabled?: boolean
 }
 
 

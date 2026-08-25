@@ -20,6 +20,9 @@
         firstDynamicNumber: 1000,
         predictiveEnabled: false,
         predictiveCooldownMs: 10000,
+        bcp008Enabled: true,
+        dnssdEnabled: true,
+        dnssdDomain: "",
         debugLogs: false,
     };
     let dirty = false;
@@ -42,6 +45,9 @@
             firstDynamicNumber: s.firstDynamicNumber ?? 1000,
             predictiveEnabled: !!s.predictiveStaging?.enabled,
             predictiveCooldownMs: s.predictiveStaging?.cooldownMs ?? 10000,
+            bcp008Enabled: s.bcp008?.enabled !== false,
+            dnssdEnabled: s.registryDiscovery?.unicastDnssd !== false,
+            dnssdDomain: s.registryDiscovery?.domain ?? "",
             debugLogs: !!s.debugLogs,
         };
         if (!cred.currentUsername && Array.isArray(s.auth?.users) && s.auth.users.length > 0) {
@@ -49,6 +55,11 @@
         }
         dirty = false;
     }
+
+    // Live discovery status, so the page can show which domains DNS-SD is
+    // actually querying — the usual reason "no registry found" is a surprise.
+    let searchedDomains: string[] = [];
+    let connSync: Subject<any>;
 
     onMount(async () => {
         sync = ServerConnector.sync("setupConfig");
@@ -58,10 +69,16 @@
             // Never clobber in-progress edits.
             if (!dirty) loadForm(obj);
         });
+        connSync = ServerConnector.sync("nmosConnectionState");
+        connSync.subscribe((obj: any) => {
+            searchedDomains = obj?.discovery?.domains ?? [];
+        });
     });
     onDestroy(() => {
         if (sync) sync.unsubscribe();
         ServerConnector.unsync("setupConfig");
+        if (connSync) connSync.unsubscribe();
+        ServerConnector.unsync("nmosConnectionState");
     });
 
     function touch() {
@@ -82,6 +99,11 @@
                 predictiveStaging: {
                     enabled: !!form.predictiveEnabled,
                     cooldownMs: Number(form.predictiveCooldownMs),
+                },
+                bcp008: { enabled: !!form.bcp008Enabled },
+                registryDiscovery: {
+                    unicastDnssd: !!form.dnssdEnabled,
+                    domain: form.dnssdDomain.trim(),
                 },
                 debugLogs: !!form.debugLogs,
             };
@@ -189,6 +211,38 @@
                     <input id="registryPort" class="input input-bordered input-sm" type="number"
                         min="1" max="65535" bind:value={form.registryPort} on:input={touch} />
                 </div>
+                <div class="setup-row">
+                    <label class="label" for="dnssdEnabled">Unicast DNS-SD discovery</label>
+                    <input id="dnssdEnabled" class="toggle" type="checkbox"
+                        bind:checked={form.dnssdEnabled} on:change={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="dnssdDomain">Discovery domain</label>
+                    <input id="dnssdDomain" class="input input-bordered input-sm" type="text"
+                        placeholder="from resolv.conf" bind:value={form.dnssdDomain} on:input={touch} />
+                </div>
+                <p class="setup-hint">
+                    Finds the registry over ordinary DNS, which works where mDNS cannot reach.
+                    Leave the domain empty to use the system resolver's search list. A static
+                    registry address always wins.
+                    {#if searchedDomains.length > 0}
+                        <br />Currently searching: <code>{searchedDomains.join(", ")}</code>
+                    {/if}
+                </p>
+            </section>
+
+            <section class="setup-section">
+                <h3>Monitoring</h3>
+                <div class="setup-row">
+                    <label class="label" for="bcp008Enabled">BCP-008 status monitoring</label>
+                    <input id="bcp008Enabled" class="toggle" type="checkbox"
+                        bind:checked={form.bcp008Enabled} on:change={touch} />
+                </div>
+                <p class="setup-hint">
+                    Subscribes to each device's IS-12 sender and receiver monitors and shows
+                    live health per flow in the matrix. Read-only on the network. Applies
+                    immediately — turning it off closes every control connection.
+                </p>
             </section>
 
             <section class="setup-section">

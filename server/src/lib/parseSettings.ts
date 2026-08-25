@@ -70,6 +70,15 @@ export function parseSettings(settings:any){
         }
     }
 
+    // BCP-008 status monitoring. Read-only IS-12 client, on by default.
+    if(!settings.hasOwnProperty("bcp008") || typeof settings.bcp008 !== "object" || settings.bcp008 === null){
+        settings.bcp008 = { enabled: true };
+    }else{
+        if(!settings.bcp008.hasOwnProperty("enabled") || typeof settings.bcp008.enabled !== "boolean"){
+            settings.bcp008.enabled = true;
+        }
+    }
+
     // Registry discovery: unicast DNS-SD (RFC 6763 over normal DNS) is on by
     // default, with an optional domain override. An empty domain means "use
     // the system resolver's search list".

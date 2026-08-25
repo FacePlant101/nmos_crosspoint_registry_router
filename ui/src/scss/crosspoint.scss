@@ -726,3 +726,78 @@ html[data-theme="light"] {
         }
     }
 }
+// ----- BCP-008 status monitoring -----
+// The essence-type glyph doubles as the status indicator, so a degraded flow
+// shows up without widening an already very wide matrix. Colour is carried by
+// a ring rather than the fill, so the type icon underneath stays readable.
+.cp-type {
+    &.mon-ok      { box-shadow: inset 0 0 0 2px hsl(var(--su)); }
+    &.mon-warn    { box-shadow: inset 0 0 0 2px hsl(var(--wa)); }
+    &.mon-bad     { box-shadow: inset 0 0 0 2px hsl(var(--er)); }
+    // Monitored but not streaming — deliberately quiet: it is not a fault.
+    &.mon-inactive { box-shadow: inset 0 0 0 2px hsl(var(--bc) / 0.25); }
+
+    &.mon-warn, &.mon-bad { cursor: pointer; }
+}
+
+// Device-level rollup on the collapsed node bands, so a problem is findable
+// without expanding every device.
+.cp-device.mon-warn, .cp-line-stick.mon-warn { border-left: 3px solid hsl(var(--wa)); }
+.cp-device.mon-bad,  .cp-line-stick.mon-bad  { border-left: 3px solid hsl(var(--er)); }
+
+// ----- BCP-008 status panel -----
+.mon-flow-name {
+    font-weight: 500;
+    margin-top: 0.5rem;
+}
+
+.mon-kind {
+    font-weight: 400;
+    opacity: 0.6;
+}
+
+.mon-overall {
+    margin: 0.25rem 0 0.75rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+    display: inline-block;
+    box-shadow: none;
+
+    &.mon-ok       { background-color: hsl(var(--su) / 0.2); }
+    &.mon-warn     { background-color: hsl(var(--wa) / 0.2); }
+    &.mon-bad      { background-color: hsl(var(--er) / 0.2); }
+    &.mon-inactive { background-color: hsl(var(--bc) / 0.1); }
+}
+
+.mon-subhead {
+    font-weight: 500;
+    margin: 1rem 0 0.25rem;
+}
+
+.mon-group {
+    font-size: 0.8rem;
+    opacity: 0.7;
+    margin: 0.5rem 0 0.15rem;
+}
+
+.mon-table {
+    width: 100%;
+    font-size: 0.85rem;
+    border-collapse: collapse;
+
+    th, td {
+        text-align: left;
+        padding: 0.15rem 0.5rem;
+        border-bottom: 1px solid hsl(var(--b3));
+    }
+
+    th { font-weight: 500; opacity: 0.7; }
+
+    .mon-num { text-align: right; font-family: monospace; }
+
+    // Per-domain state cell: same 0..3 scale as the overall status.
+    .mon-cell { font-family: monospace; text-align: center; width: 4rem; }
+    .mon-s1 { color: hsl(var(--su)); }
+    .mon-s2 { color: hsl(var(--wa)); }
+    .mon-s3 { color: hsl(var(--er)); }
+}
