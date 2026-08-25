@@ -1,0 +1,27 @@
+# Image-only deployment of NMOS Crosspoint — no local build, no monitoring
+# stack. For the full development stack (local NMOS registry, ZeroTier,
+# Prometheus, Grafana, InfluxDB) use docker-compose.yml instead.
+#
+# Fresh host, four steps:
+#   1. mkdir -p server/config server/state
+#   2. docker compose -f docker-compose.deploy.yml pull
+#   3. docker compose -f docker-compose.deploy.yml up -d
+#   4. open http://<host>/ and sign in as admin / admin, then change the
+#      password on the Setup page.
+#
+# The config and state mounts may start empty: the entrypoint seeds
+# settings.json and users.json from the image on first boot and never
+# overwrites files that already exist.
+
+services:
+  nmos-crosspoint:
+    image: ghcr.io/avassdal/nmos_crosspoint_registry_router:latest
+    container_name: nmos-crosspoint
+    hostname: nmos-crosspoint
+    restart: unless-stopped
+    # host networking is required: NMOS discovery relies on mDNS/multicast,
+    # which does not cross a bridge network.
+    network_mode: host
+    volumes:
+      - ./server/config:/nmos-crosspoint/server/config
+      - ./server/state:/nmos-crosspoint/server/state

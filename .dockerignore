@@ -1,6 +1,29 @@
 .git
 .gitignore
+.github
 **/node_modules
 .vscode
 CIP
 docs
+Screenshots
+
+# Runtime config and state must never enter the build context — config/users.json
+# holds password hashes and the media-device configs hold credentials. The image
+# ships server/config.default instead, which the entrypoint seeds on first boot.
+server/config
+server/state
+server/log
+server/config_backups
+
+# Build output is produced inside the builder stages; a stale local copy would
+# only pollute the context and invalidate caching.
+server/dist
+server/public
+
+# Local dev / deployment extras the crosspoint image does not need.
+# NOTE monitoring/ and scripts/ are deliberately NOT excluded: this context is
+# shared with Dockerfile.prometheus, Dockerfile.grafana and
+# Dockerfile.zerotier.template, which COPY from those directories.
+docker-compose*.yml
+nmos_secrets.yml
+**/.DS_Store

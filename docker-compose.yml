@@ -11,6 +11,11 @@ services:
     domainname: local
     network_mode: host
     volumes:
+    # Bind-mounted, NOT baked into the image. The build context no longer
+    # includes server/config (it holds password hashes and device
+    # credentials), and the entrypoint seeds settings.json + users.json from
+    # the image's config.default on first boot if this directory is empty.
+    - ./server/config:/nmos-crosspoint/server/config
     - nmos-state:/nmos-crosspoint/server/state
     # Added depends_on for startup order (optional but good practice)
     depends_on:
