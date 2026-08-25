@@ -19,7 +19,7 @@ import * as jsonpatch from 'fast-json-patch';
 
 
 import * as sdpTransform from 'sdp-transform';
-import { isUsbTransport, nmosIdFromCrosspointId, transportShortCode } from "./functions";
+import { isUsbTransport, isMulticastTransport, nmosIdFromCrosspointId, transportShortCode } from "./functions";
 import { CrosspointAbstraction, CrosspointConnectionSenderInfo } from "./crosspointAbstraction";
 import { Topology } from "./topology";
 import { AtomicNmosStateManager } from "./atomicNmosStateManager";
@@ -1103,8 +1103,12 @@ export class NmosRegistryConnector {
     private leaseArgsFor(senderId: string): any | null {
         const sender = this.nmosState.senders?.[senderId];
         if (!sender) return null;
-        // A point-to-point transport has no multicast address to manage.
-        if (isUsbTransport(sender.transport)) return null;
+        // Only RTP carries a multicast destination address. Guarding on USB
+        // alone was not enough: an MXL sender's flow still reports
+        // format urn:x-nmos:format:video, so it was being classified as video
+        // and handed a lease, and websocket/MQTT senders were consuming the
+        // "other" pool — addresses none of them can ever use.
+        if (!isMulticastTransport(sender.transport)) return null;
 
         const flow = this.nmosState.flows?.[sender.flow_id];
         if (!flow) return null;

@@ -80,6 +80,18 @@ export function isUsbTransport(urn:string){
     return transportShortCode(urn) == "usb";
 }
 
+/**
+ * Does this transport carry a multicast destination address at all?
+ *
+ * Only the RTP transports do. MXL is shared memory, websocket and MQTT are
+ * point-to-point over TCP, and the Matrox USB transport is a direct link —
+ * none of them has a destination_ip, so multicast addressing is meaningless
+ * for them and they must never be given an address from a pool.
+ */
+export function isMulticastTransport(urn:string){
+    return ("" + urn).startsWith("urn:x-nmos:transport:rtp");
+}
+
 // Crosspoint sender/receiver flow ids are always "nmos_" + the NMOS resource id, so the bare
 // id can be recovered by stripping the prefix.
 //
