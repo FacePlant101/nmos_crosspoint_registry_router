@@ -96,6 +96,12 @@
       setupSync = ServerConnector.sync("setupConfig")
       setupSync.subscribe((obj:any)=>{
             audioMonitorEnabled = !!obj?.audioMonitor?.enabled;
+            multicastDhcpEnabled = !!obj?.autoMulticast?.enabled;
+            reRender();
+      });
+      leaseSync = ServerConnector.sync("multicastLeases")
+      leaseSync.subscribe((obj:any)=>{
+            leaseState = obj ?? { leases:{} };
             reRender();
       });
       try{
@@ -118,6 +124,8 @@
           ServerConnector.unsync("nmos")
       if(setupSync){ setupSync.unsubscribe(); }
           ServerConnector.unsync("setupConfig")
+      if(leaseSync){ leaseSync.unsubscribe(); }
+          ServerConnector.unsync("multicastLeases")
     });
 
       function saveFilter(){
@@ -605,6 +613,7 @@
   // streams it over WebRTC. Only offered when the feature is enabled in Setup
   // and the sender actually has a manifest to decode.
   let audioMonitorEnabled = false;
+  let multicastDhcpEnabled = false;
   let setupSync: Subject<any>;
   let monitorSenderId = "";
   let monitorSdp = "";
@@ -628,6 +637,53 @@
   function stopMonitor() {
     monitorSenderId = "";
     monitorSdp = "";
+  }
+
+  // ----- Multicast lease overrides -----
+  // The lease inventory tells us the reserved address per leg, so the editor
+  // can show what "clear" will fall back to instead of leaving the operator
+  // guessing what an empty field means.
+  let leaseState: any = { leases: {} };
+  let leaseSync: Subject<any>;
+  let mcModal: any;
+  let mcFlow: any = null;
+  let mcLegs: Array<{ index: number, value: string, reserved: string }> = [];
+
+  function leaseFor(flowId: string): any {
+    const id = flowId.startsWith("nmos_") ? flowId.substring(5) : flowId;
+    return leaseState.leases?.[id] ?? null;
+  }
+
+  function openMulticastEditor(flow: any) {
+    mcFlow = flow;
+    const lease = leaseFor(flow.id);
+    const legs = getSenderSettings(flow);
+    mcLegs = legs.map((leg: any, index: number) => ({
+      index,
+      // Show the override if there is one, otherwise blank so the placeholder
+      // can advertise the reserved address.
+      value: lease?.overrideIp?.["" + index] ?? "",
+      reserved: index === 0 ? (lease?.primaryIp ?? "") : (lease?.secondaryIp ?? ""),
+    }));
+    if (mcLegs.length === 0) {
+      mcLegs = [{ index: 0, value: "", reserved: lease?.primaryIp ?? "" }];
+    }
+    mcModal.showModal();
+  }
+
+  async function saveMulticast() {
+    if (!mcFlow) return;
+    try {
+      // An empty string is an explicit clear: the server drops the override and
+      // returns the leg to its reserved address.
+      await ServerConnector.post("setMulticast", {
+        id: mcFlow.id,
+        data: { legs: mcLegs.map((l) => ({ index: l.index, multicast: l.value.trim() })) },
+      });
+      ServerConnector.addFeedback({ level: "success", message: "Multicast addresses updated." });
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not set multicast: " + (e?.message ?? e) });
+    }
   }
 </script>
   
@@ -872,6 +928,13 @@
 
 
                                     {#if col.id == "flow"}
+                                      {#if multicastDhcpEnabled && getSenderSettings(flow).length > 0}
+                                        <button on:click={()=>openMulticastEditor(flow)}
+                                          class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="edit multicast addresses">
+                                          <Icon src={Pencil}></Icon>
+                                        </button>
+                                      {/if}
                                       {#each getSenderSettings(flow) as settings}
                                         {#each [dupSenders(settings.dstIp, flow.id)] as dups}
                                           <div>
@@ -989,6 +1052,37 @@
       <AudioMonitorPlayer senderId={monitorSenderId} sdp={monitorSdp} onClose={stopMonitor} />
     </div>
   {/if}
+
+  <dialog bind:this={mcModal} class="modal">
+    <div class="modal-box">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">Multicast addresses</h3>
+      {#if mcFlow}
+        <p class="mc-flow-name">{mcFlow.alias}</p>
+      {/if}
+      {#each mcLegs as leg}
+        <div class="setup-row">
+          <label class="label" for={"mcleg"+leg.index}>Leg {leg.index + 1}</label>
+          <input id={"mcleg"+leg.index} class="input input-bordered input-sm" type="text"
+            placeholder={leg.reserved ? "reserved: " + leg.reserved : "auto"}
+            bind:value={leg.value} />
+        </div>
+      {/each}
+      <p class="setup-hint">
+        Leave a field empty to use the address reserved by Multicast DHCP. A value
+        here overrides the reservation, which stays held for this sender so
+        clearing the field always returns to it.
+      </p>
+      <div class="modal-action">
+        <form method="dialog">
+          <button class="btn btn-sm btn-primary" on:click={saveMulticast}>Save</button>
+          <button class="btn btn-sm">Cancel</button>
+        </form>
+      </div>
+    </div>
+  </dialog>
 
   <dialog bind:this={forgetModal} class="modal">
     <div class="modal-box">

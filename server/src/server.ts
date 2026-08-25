@@ -30,6 +30,7 @@ import { Bcp008Monitor } from "./lib/bcp008Monitor";
 import { nmosIdFromCrosspointId } from "./lib/functions";
 import { ProbeGateway } from "./lib/probeGateway";
 import { AudioMonitorService } from "./lib/audioMonitor";
+import { MulticastLeaseManager } from "./lib/multicastLeaseManager";
 
 
 
@@ -172,6 +173,10 @@ if(users){
 // TODO.... load dynamic....
 const mediaDevices = new MediaDevices(settings);
 
+// Multicast lease manager. Constructed before the connector so the first
+// reconcile after a sender's active params arrive already finds it.
+const multicastLeaseManager = new MulticastLeaseManager(settings);
+
 const crosspoint = new CrosspointAbstraction(settings);
 const nmosConnector = new NmosRegistryConnector(settings);
 
@@ -225,6 +230,102 @@ if(modDisabled.includes("topology")){
 
 const uiConfigSync: SyncObject = new SyncObject("uiconfig", uiConfig);
 server.addSyncObject("uiconfig","public",uiConfigSync);
+
+// ----- Multicast lease inventory -----
+// The snapshot is enriched server-side with the sender label and a live status,
+// so the client does not have to join two more channels and re-derive this
+// table on every patch.
+function getMulticastLeaseSnapshot(){
+    let leases:any = {};
+    try{
+        const all = multicastLeaseManager.getAllLeases();
+        const activeIps = nmosConnector.getActiveSenderIps("");
+        const senders = nmosConnector.getNmosState()?.senders || {};
+        for(const senderId in all){
+            const l:any = { ...all[senderId], senderId };
+            const sender = senders[senderId];
+            l.senderLabel = sender?.label || "";
+            // "missing" means we hold a lease for a sender the registry no
+            // longer knows — usually a device that was replaced.
+            // Compare the EFFECTIVE address, not the reserved one. A sender
+            // with a manual override is transmitting on the override, so
+            // checking primaryIp reported a perfectly healthy sender as
+            // inactive.
+            const effective = multicastLeaseManager.getEffectiveIp(senderId, 0) || l.primaryIp;
+            l.effectiveIp = effective;
+            l.liveStatus = !sender ? "missing"
+                : (activeIps.has(effective) ? "active" : "inactive");
+            leases[senderId] = l;
+        }
+    }catch(e){}
+    return { leases, stats: multicastLeaseManager.getStats(), updatedAt: new Date().toISOString() };
+}
+const multicastLeasesSync: SyncObject = new SyncObject("multicastLeases", { leases:{}, stats:{}, updatedAt:"" });
+server.addSyncObject("multicastLeases","global",multicastLeasesSync);
+
+// Dedupe the publish: the manager fires on every lease touch and a sweep can
+// touch many in a row, which would otherwise be a patch storm.
+let lastLeaseSnapshotJson = "";
+function publishLeaseSnapshotIfChanged(){
+    try{
+        const snap = getMulticastLeaseSnapshot();
+        const j = JSON.stringify({leases:snap.leases, stats:snap.stats});
+        if(j === lastLeaseSnapshotJson){ return; }
+        lastLeaseSnapshotJson = j;
+        multicastLeasesSync.setState(snap);
+    }catch(e){}
+}
+multicastLeaseManager.setOnChange(()=>{ publishLeaseSnapshotIfChanged(); });
+multicastLeaseManager.setExternalIpsProvider((excludeSenderId:string)=>{
+    try{ return nmosConnector.getActiveSenderIps(excludeSenderId); }catch(e){ return new Set<string>(); }
+});
+// Live status depends on the wire, not just on lease changes, so refresh on a
+// slow timer as well.
+setInterval(()=>{ publishLeaseSnapshotIfChanged(); }, 5000);
+
+// Periodic reconcile. Most drift is caught the moment a sender's active params
+// are fetched; this covers the rest — a device rebooting back onto a stale
+// address, or a sender that went active while the pool was exhausted.
+setInterval(()=>{
+    try{ nmosConnector.sweepLeases(); }catch(e){}
+}, 30000);
+
+server.addRoute("POST", "releaseLease","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        let senderId = nmosIdFromCrosspointId((postData && typeof postData.senderId === "string") ? postData.senderId : "");
+        if(!senderId){ reject({message:"missing sender id"}); return; }
+        let n = multicastLeaseManager.releaseLeases([senderId]);
+        SyncLog.log("info", "Multicast Lease", "Released lease for " + senderId + " by " + client.user + ".");
+        resolve({message:200, data:{ released: n }});
+    });
+});
+
+server.addRoute("POST", "releaseAllLeases","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve) => {
+        let ids = Object.keys(multicastLeaseManager.getAllLeases());
+        let n = multicastLeaseManager.releaseLeases(ids);
+        SyncLog.log("warning", "Multicast Lease", "Released ALL " + n + " lease(s) by " + client.user + ".");
+        resolve({message:200, data:{ released: n }});
+    });
+});
+
+server.addRoute("GET", "exportLeases","global", (client: WebsocketClient, query:string[]) => {
+    return new Promise((resolve) => {
+        resolve({message:200, data: multicastLeaseManager.exportLeases()});
+    });
+});
+
+server.addRoute("POST", "importLeases","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        try{
+            let r:any = multicastLeaseManager.importLeases(postData);
+            SyncLog.log("info", "Multicast Lease", "Imported leases by " + client.user + ".", r);
+            resolve({message:200, data:r});
+        }catch(e:any){
+            reject({message:"import failed: " + (e?.message || e)});
+        }
+    });
+});
 
 // Multicast probe gateway. Registers its own /probe websocket upgrade path, so
 // it must come after WebsocketSyncServer.init() — which it does, since the
@@ -286,7 +387,11 @@ function getSetupConfigState() {
         registry,
         reconnectOnSdpChanges: !!settings.reconnectOnSdpChanges,
         fixSdpBugs: !!settings.fixSdpBugs,
-        autoMulticast: !!settings.autoMulticast,
+        autoMulticast: { enabled: !!(settings.autoMulticast && settings.autoMulticast.enabled) },
+        // Read-only here: the ranges are an operational decision made in
+        // settings.json, and the Setup page shows them so capacity is legible.
+        multicastRanges: (settings.multicastRanges && typeof settings.multicastRanges === "object")
+            ? JSON.parse(JSON.stringify(settings.multicastRanges)) : {},
         firstDynamicNumber: (typeof settings.firstDynamicNumber === "number") ? settings.firstDynamicNumber : 1000,
         predictiveStaging,
         // Read-only IS-12 status monitoring; absent means on.
@@ -355,7 +460,7 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
             }
 
             // --- Plain booleans read live by the connector / update thread.
-            for(const key of ["reconnectOnSdpChanges", "fixSdpBugs", "autoMulticast"]){
+            for(const key of ["reconnectOnSdpChanges", "fixSdpBugs"]){
                 if(postData.hasOwnProperty(key)){
                     if(typeof postData[key] !== "boolean"){
                         reject({message: key + " must be a boolean."});
@@ -435,6 +540,32 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         return;
                     }
                     settings.registryDiscovery.domain = d;
+                }
+            }
+
+            // --- Multicast DHCP master switch. Turning it ON does not
+            // immediately repoint anything: the reconcile sweep decides whether
+            // to adopt the addresses already on the wire or allocate fresh,
+            // based on the adoptExisting flag below.
+            if(postData.hasOwnProperty("autoMulticast") && typeof postData.autoMulticast === "object" && postData.autoMulticast){
+                if(postData.autoMulticast.hasOwnProperty("enabled")){
+                    if(typeof postData.autoMulticast.enabled !== "boolean"){
+                        reject({message:"autoMulticast.enabled must be a boolean."});
+                        return;
+                    }
+                    if(!settings.autoMulticast || typeof settings.autoMulticast !== "object"){
+                        settings.autoMulticast = { enabled:false };
+                    }
+                    let wasOn = !!settings.autoMulticast.enabled;
+                    settings.autoMulticast.enabled = postData.autoMulticast.enabled;
+                    try{ MulticastLeaseManager.instance?.setSettings(settings); }catch(e){}
+
+                    if(!wasOn && settings.autoMulticast.enabled){
+                        // First enable: adopt what is already on the wire unless
+                        // the operator explicitly asked for fresh addresses.
+                        let adopt = postData.autoMulticast.adoptExisting !== false;
+                        try{ nmosConnector.seedLeasesFromActive(adopt); }catch(e){}
+                    }
                 }
             }
 

@@ -25,6 +25,7 @@ import { Topology } from "./topology";
 import { AtomicNmosStateManager } from "./atomicNmosStateManager";
 import { AdvancedNmosCompatibility } from "./advancedNmosCompatibility";
 import { PrometheusMetrics } from "./prometheusMetrics";
+import { MulticastLeaseManager } from "./multicastLeaseManager";
 
 const fs = require("fs");
 
@@ -963,6 +964,9 @@ export class NmosRegistryConnector {
                         try{
                             let response = await axios.get(href);
                             this.nmosState.senderActiveData[senderId] = response.data;
+                            // Now that we know what the sender is really
+                            // transmitting on, it can be compared with its lease.
+                            try{ this.reconcileSenderWithLease(senderId); }catch(e){}
                             // NOTE this used to `return` here, so a SUCCESSFUL
                             // fetch skipped the publish below and the new active
                             // data sat unpublished until some unrelated event
@@ -1067,6 +1071,172 @@ export class NmosRegistryConnector {
     private stripSdpAddress(ip:any): string{
         if(typeof ip != "string"){ return ""; }
         return ip.split("/")[0].trim();
+    }
+
+    // ----- Multicast leases -----
+
+    /**
+     * Destination IPs currently on the wire, excluding one sender's own.
+     *
+     * Handed to the lease manager so it never allocates an address a device is
+     * already transmitting on, even when that device has no lease (a static
+     * configuration, or a sender belonging to another controller).
+     */
+    public getActiveSenderIps(excludeSenderId: string): Set<string> {
+        const out = new Set<string>();
+        try {
+            const active = this.nmosState.senderActiveData || {};
+            for (const senderId in active) {
+                if (senderId === excludeSenderId) continue;
+                const params = active[senderId]?.transport_params;
+                if (!Array.isArray(params)) continue;
+                for (const p of params) {
+                    const ip = this.stripSdpAddress(p?.destination_ip);
+                    if (ip && ip !== "auto") { out.add(ip); }
+                }
+            }
+        } catch (e) {}
+        return out;
+    }
+
+    /** Everything the lease manager needs to classify and label one sender. */
+    private leaseArgsFor(senderId: string): any | null {
+        const sender = this.nmosState.senders?.[senderId];
+        if (!sender) return null;
+        // A point-to-point transport has no multicast address to manage.
+        if (isUsbTransport(sender.transport)) return null;
+
+        const flow = this.nmosState.flows?.[sender.flow_id];
+        if (!flow) return null;
+        const source = this.nmosState.sources?.[flow.source_id];
+
+        let channels = 0;
+        try { if (Array.isArray(source?.channels)) { channels = source.channels.length; } } catch (e) {}
+
+        let deviceLabel = "", nodeId = "";
+        try {
+            const dev = this.nmosState.devices?.[sender.device_id];
+            if (dev) { deviceLabel = dev.label || ""; nodeId = dev.node_id || ""; }
+        } catch (e) {}
+
+        // Reuse whatever port the sender is already using; 5004 is the ST 2110
+        // default and the only sane fallback.
+        let port = 5004;
+        try {
+            const tp = this.nmosState.senderActiveData?.[senderId]?.transport_params?.[0];
+            if (tp && typeof tp.destination_port === "number" && tp.destination_port > 0) { port = tp.destination_port; }
+        } catch (e) {}
+
+        return {
+            senderId,
+            mediaType: flow.media_type || "",
+            format: flow.format || "",
+            channels,
+            width: flow.frame_width,
+            height: flow.frame_height,
+            deviceLabel,
+            nodeId,
+            port,
+            isActive: !!(sender.subscription && sender.subscription.active)
+        };
+    }
+
+    /**
+     * Bring one sender's addresses in line with its lease.
+     *
+     * Only ever PATCHes when the effective lease addresses differ from what is
+     * actually active, so a steady state produces no traffic. Receivers are
+     * re-executed afterwards, because a receiver pointed at the old address
+     * would otherwise sit on a dead group.
+     */
+    public reconcileSenderWithLease(senderId: string) {
+        const manager = MulticastLeaseManager.instance;
+        if (!manager || !manager.isEnabled()) return;
+
+        const args = this.leaseArgsFor(senderId);
+        if (!args) return;
+
+        const lease = manager.ensureLease(args);
+        if (!lease) return;
+
+        const desired = manager.getDesiredAddresses(senderId);
+        if (!desired) return;
+
+        const active = this.nmosState.senderActiveData?.[senderId];
+        if (!active || !Array.isArray(active.transport_params)) return;
+
+        const legs: any[] = [];
+        active.transport_params.forEach((p: any, index: number) => {
+            // Only the two legs a lease covers; a disabled leg is left alone.
+            if (index > 1) return;
+            if (p?.rtp_enabled === false) return;
+            const want = index === 0 ? desired.primaryIp : desired.secondaryIp;
+            if (!want) return;
+            const have = this.stripSdpAddress(p?.destination_ip);
+            if (have !== want) { legs.push({ index, multicast: want }); }
+        });
+
+        if (legs.length === 0) return;
+
+        SyncLog.log("info", "Multicast Lease",
+            "Applying leased address(es) to sender " + senderId + ": " +
+            legs.map((l) => "leg" + l.index + "=" + l.multicast).join(", "));
+
+        this.setFlowMulticast(senderId, { legs })
+            .then(() => { try { this.reconnectOnChanges(senderId); } catch (e) {} })
+            .catch((e: any) => {
+                SyncLog.log("warning", "Multicast Lease",
+                    "Could not apply leased address to sender " + senderId, e);
+            });
+    }
+
+    /**
+     * First-enable sweep.
+     *
+     * `adoptExisting` decides the migration story for a live network: adopting
+     * records whatever each sender is already transmitting on, so nothing is
+     * repointed and no stream breaks. Otherwise every active sender is given a
+     * fresh pair from its range, which is a deliberate re-address of the whole
+     * plant.
+     */
+    public seedLeasesFromActive(adoptExisting: boolean) {
+        const manager = MulticastLeaseManager.instance;
+        if (!manager || !manager.isEnabled()) return;
+
+        let adopted = 0, allocated = 0;
+        for (const senderId in (this.nmosState.senders || {})) {
+            const args = this.leaseArgsFor(senderId);
+            if (!args || !args.isActive) continue;
+
+            if (adoptExisting) {
+                const params = this.nmosState.senderActiveData?.[senderId]?.transport_params;
+                const primary = Array.isArray(params) ? this.stripSdpAddress(params[0]?.destination_ip) : "";
+                const secondary = Array.isArray(params) && params.length > 1 ? this.stripSdpAddress(params[1]?.destination_ip) : "";
+                if (primary && primary !== "auto") {
+                    if (manager.adoptLease({ ...args, primaryIp: primary, secondaryIp: secondary || undefined })) {
+                        adopted++;
+                        continue;
+                    }
+                }
+            }
+            if (manager.ensureLease(args)) { allocated++; }
+        }
+
+        SyncLog.log("info", "Multicast Lease",
+            "Multicast DHCP enabled: " + adopted + " sender(s) adopted at their current address, " +
+            allocated + " allocated fresh.");
+
+        // Only the freshly allocated ones can actually differ from the wire.
+        if (!adoptExisting || allocated > 0) { this.sweepLeases(); }
+    }
+
+    /** Reconcile every active sender. Cheap when nothing has drifted. */
+    public sweepLeases() {
+        const manager = MulticastLeaseManager.instance;
+        if (!manager || !manager.isEnabled()) return;
+        for (const senderId in (this.nmosState.senders || {})) {
+            try { this.reconcileSenderWithLease(senderId); } catch (e) {}
+        }
     }
 
     /**

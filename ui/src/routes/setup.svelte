@@ -3,6 +3,7 @@
     import type { Subject } from "rxjs";
     import { onDestroy, onMount } from "svelte";
     import sha256 from "js-sha256";
+    import OverlayMenuService from "../lib/OverlayMenu/OverlayMenuService";
 
     // Server-held snapshot, replaced wholesale on every sync push.
     let state: any = null;
@@ -39,6 +40,27 @@
     let probeState: any = { token: "", probes: [] };
     let probeSync: Subject<any>;
 
+    // Multicast lease inventory.
+    let leaseState: any = { leases: {}, stats: {} };
+    let leaseSync: Subject<any>;
+    let leaseFilter = "";
+    let adoptModal: any;
+
+    const CATEGORY_LABEL: any = {
+        video: "Video", videoUhd: "Video UHD", jxsv: "JPEG-XS", audio: "Audio", other: "Other",
+    };
+
+    $: leaseRows = Object.values(leaseState.leases ?? {})
+        .filter((l: any) => {
+            if (!leaseFilter) return true;
+            const t = leaseFilter.toLowerCase();
+            return (l.senderLabel ?? "").toLowerCase().includes(t)
+                || (l.deviceLabel ?? "").toLowerCase().includes(t)
+                || (l.primaryIp ?? "").includes(t)
+                || (l.category ?? "").toLowerCase().includes(t);
+        })
+        .sort((a: any, b: any) => (a.deviceLabel + a.senderLabel).localeCompare(b.deviceLabel + b.senderLabel));
+
     // Credential form is deliberately not part of `form` — it posts to its
     // own route and must never be included in a settings save.
     let cred = { currentUsername: "", currentPassword: "", newUsername: "", newPassword: "", newPassword2: "" };
@@ -51,7 +73,7 @@
             registryPort: s.registry?.port ?? 80,
             reconnectOnSdpChanges: !!s.reconnectOnSdpChanges,
             fixSdpBugs: !!s.fixSdpBugs,
-            autoMulticast: !!s.autoMulticast,
+            autoMulticast: !!s.autoMulticast?.enabled,
             firstDynamicNumber: s.firstDynamicNumber ?? 1000,
             predictiveEnabled: !!s.predictiveStaging?.enabled,
             predictiveCooldownMs: s.predictiveStaging?.cooldownMs ?? 10000,
@@ -90,6 +112,10 @@
         probeSync.subscribe((obj: any) => {
             probeState = obj ?? { token: "", probes: [] };
         });
+        leaseSync = ServerConnector.sync("multicastLeases");
+        leaseSync.subscribe((obj: any) => {
+            leaseState = obj ?? { leases: {}, stats: {} };
+        });
     });
     onDestroy(() => {
         if (sync) sync.unsubscribe();
@@ -98,6 +124,8 @@
         ServerConnector.unsync("nmosConnectionState");
         if (probeSync) probeSync.unsubscribe();
         ServerConnector.unsync("probeState");
+        if (leaseSync) leaseSync.unsubscribe();
+        ServerConnector.unsync("multicastLeases");
     });
 
     function touch() {
@@ -113,7 +141,9 @@
                 registry: { ip: form.registryIp.trim(), port: Number(form.registryPort) },
                 reconnectOnSdpChanges: !!form.reconnectOnSdpChanges,
                 fixSdpBugs: !!form.fixSdpBugs,
-                autoMulticast: !!form.autoMulticast,
+                // adoptExisting only matters on the first enable; the server
+                // ignores it otherwise.
+                autoMulticast: { enabled: !!form.autoMulticast, adoptExisting: adoptExisting },
                 firstDynamicNumber: Number(form.firstDynamicNumber),
                 predictiveStaging: {
                     enabled: !!form.predictiveEnabled,
@@ -154,6 +184,85 @@
 
     function revert() {
         loadForm(state);
+    }
+
+    // Turning Multicast DHCP on for the first time is the one destructive
+    // moment: either we record what devices already transmit on, or we hand
+    // everything a fresh address and every stream re-establishes. Default to
+    // the safe one and make the other an explicit choice.
+    let adoptExisting = true;
+
+    function askEnableMulticast() {
+        if (form.autoMulticast) {
+            // Turning it OFF needs no question — nothing is repointed.
+            touch();
+            return;
+        }
+        adoptModal.showModal();
+    }
+
+    function confirmEnableMulticast(adopt: boolean) {
+        adoptExisting = adopt;
+        form.autoMulticast = true;
+        touch();
+    }
+
+    async function releaseLease(senderId: string) {
+        try {
+            await ServerConnector.post("releaseLease", { senderId });
+            ServerConnector.addFeedback({ level: "success", message: "Lease released." });
+        } catch (e: any) {
+            ServerConnector.addFeedback({ level: "error", message: "Could not release: " + (e?.message ?? e) });
+        }
+    }
+
+    async function releaseAllLeases() {
+        try {
+            const r: any = await ServerConnector.post("releaseAllLeases", {});
+            ServerConnector.addFeedback({ level: "success", message: "Released " + (r?.data?.released ?? 0) + " lease(s)." });
+        } catch (e: any) {
+            ServerConnector.addFeedback({ level: "error", message: "Could not release: " + (e?.message ?? e) });
+        }
+    }
+
+    async function exportLeases() {
+        try {
+            const r: any = await ServerConnector.get("exportLeases");
+            const blob = new Blob([JSON.stringify(r?.data ?? {}, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "multicast-leases.json";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (e: any) {
+            ServerConnector.addFeedback({ level: "error", message: "Export failed: " + (e?.message ?? e) });
+        }
+    }
+
+    function importLeases(ev: Event) {
+        const input = ev.target as HTMLInputElement;
+        const file = input.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+            try {
+                const parsed = JSON.parse("" + reader.result);
+                const r: any = await ServerConnector.post("importLeases", parsed);
+                ServerConnector.addFeedback({
+                    level: "success",
+                    message: "Imported " + (r?.data?.imported ?? 0) + " lease(s)"
+                        + (r?.data?.dropped ? ", " + r.data.dropped + " dropped" : "") + ".",
+                });
+            } catch (e: any) {
+                ServerConnector.addFeedback({ level: "error", message: "Import failed: " + (e?.message ?? e) });
+            } finally {
+                input.value = "";
+            }
+        };
+        reader.readAsText(file);
     }
 
     async function copyProbeCommand() {
@@ -244,6 +353,34 @@
         }
     }
 </script>
+
+<dialog bind:this={adoptModal} class="modal">
+    <div class="modal-box">
+        <h3 class="font-bold text-lg">Enable Multicast DHCP</h3>
+        <p>
+            Senders on this network already have addresses. Choose what happens to them.
+        </p>
+        <ul class="adopt-list">
+            <li>
+                <strong>Keep current addresses</strong> — record what each sender is already
+                transmitting on as its lease. Nothing is repointed and no stream is
+                interrupted. Recommended on a live network.
+            </li>
+            <li>
+                <strong>Renew from the pool</strong> — give every active sender a fresh pair
+                from its essence range. Every affected stream re-establishes, and receivers
+                follow. This re-addresses the plant.
+            </li>
+        </ul>
+        <div class="modal-action">
+            <form method="dialog">
+                <button class="btn btn-sm btn-primary" on:click={()=>confirmEnableMulticast(true)}>Keep current addresses</button>
+                <button class="btn btn-sm btn-error" on:click={()=>confirmEnableMulticast(false)}>Renew from pool</button>
+                <button class="btn btn-sm">Cancel</button>
+            </form>
+        </div>
+    </div>
+</dialog>
 
 <div class="setup-page">
     <div class="setup-header">
@@ -377,17 +514,84 @@
                 </div>
             </section>
 
-            <section class="setup-section">
+            <section class="setup-section setup-section-wide">
                 <h3>Addressing</h3>
                 <div class="setup-row">
-                    <label class="label" for="autoMulticast">Automatic multicast addresses</label>
+                    <label class="label" for="autoMulticast">Multicast DHCP</label>
                     <input id="autoMulticast" class="toggle" type="checkbox"
-                        bind:checked={form.autoMulticast} on:change={touch} />
+                        checked={form.autoMulticast} on:click|preventDefault={askEnableMulticast} />
                 </div>
                 <p class="setup-hint">
-                    Assign multicast addresses from the per-essence-type ranges in
-                    <code>settings.json</code> (<code>multicastRanges</code>).
+                    Hands each active sender a reserved pair of addresses — odd and odd+1 so
+                    ST 2022-7 legs stay adjacent — drawn from the range configured for its
+                    essence type in <code>multicastRanges</code>. Manual edits on the Details
+                    page win over the reservation; clearing the field returns the leg to it.
                 </p>
+
+                <table class="mon-table">
+                    <thead><tr><th>Essence</th><th>Range</th><th>Used</th><th>Capacity</th></tr></thead>
+                    <tbody>
+                        {#each Object.keys(CATEGORY_LABEL) as cat}
+                            <tr>
+                                <td>{CATEGORY_LABEL[cat]}</td>
+                                <td class="lease-ip">{state?.multicastRanges?.[cat]?.primary ?? "—"}</td>
+                                <td class="mon-num">{leaseState.stats?.[cat]?.used ?? 0}</td>
+                                <td class="mon-num">{leaseState.stats?.[cat]?.total ?? 0}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+
+                <h4 class="setup-subhead">Lease inventory</h4>
+                <div class="setup-row">
+                    <input class="input input-bordered input-sm" type="text"
+                        placeholder="filter by name, address or essence" bind:value={leaseFilter} />
+                    <span class="lease-count">{leaseRows.length} lease{leaseRows.length === 1 ? "" : "s"}</span>
+                </div>
+                {#if leaseRows.length === 0}
+                    <p class="setup-hint">No leases yet.</p>
+                {:else}
+                    <table class="mon-table lease-table">
+                        <thead>
+                            <tr>
+                                <th>Status</th><th>Device</th><th>Sender</th><th>Essence</th>
+                                <th>Leg 1</th><th>Leg 2</th><th>Allocated</th><th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#each leaseRows as l (l.senderId)}
+                                <tr>
+                                    <td><span class="lease-dot lease-{l.liveStatus}"
+                                        use:OverlayMenuService.tooltip data-tooltip={l.liveStatus}></span></td>
+                                    <td>{l.deviceLabel || "—"}</td>
+                                    <td>{l.senderLabel || l.senderId.slice(0, 8)}</td>
+                                    <td>{CATEGORY_LABEL[l.category] ?? l.category}</td>
+                                    <td class="lease-ip">
+                                        {l.overrideIp?.["0"] ?? l.primaryIp}
+                                        {#if l.overrideIp?.["0"]}<span class="lease-override">manual</span>{/if}
+                                    </td>
+                                    <td class="lease-ip">
+                                        {l.overrideIp?.["1"] ?? l.secondaryIp}
+                                        {#if l.overrideIp?.["1"]}<span class="lease-override">manual</span>{/if}
+                                    </td>
+                                    <td>{(l.createdAt ?? "").slice(0, 10)}</td>
+                                    <td class="vp-actions">
+                                        <button class="btn btn-xs btn-error"
+                                            on:click={()=>releaseLease(l.senderId)} title="release this lease">✕</button>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+                <div class="setup-row lease-actions">
+                    <button class="btn btn-sm" on:click={exportLeases}>Export</button>
+                    <label class="btn btn-sm">
+                        Import
+                        <input type="file" accept="application/json" class="hidden" on:change={importLeases} />
+                    </label>
+                    <button class="btn btn-sm btn-error" on:click={releaseAllLeases}>Release all</button>
+                </div>
             </section>
 
             <section class="setup-section">

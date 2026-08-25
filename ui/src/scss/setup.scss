@@ -143,3 +143,62 @@
     border-radius: 0.25rem;
     margin: 0.25rem 0;
 }
+
+// ----- Multicast lease inventory -----
+.lease-ip {
+    font-family: monospace;
+    white-space: nowrap;
+}
+
+.lease-count {
+    font-size: 0.8rem;
+    opacity: 0.6;
+    white-space: nowrap;
+}
+
+.lease-override {
+    display: inline-block;
+    margin-left: 0.3rem;
+    padding: 0 0.25rem;
+    border-radius: 0.2rem;
+    font-family: inherit;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    background-color: hsl(var(--in) / 0.2);
+    color: hsl(var(--in));
+}
+
+// Live status of a lease against the wire.
+.lease-dot {
+    display: inline-block;
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    background-color: hsl(var(--bc) / 0.3);
+
+    &.lease-active   { background-color: hsl(var(--su)); }
+    &.lease-inactive { background-color: hsl(var(--wa)); }
+    // Held for a sender the registry no longer knows.
+    &.lease-missing  { background-color: hsl(var(--er)); }
+}
+
+.lease-table {
+    // The inventory can be long; keep the section from growing without bound.
+    display: block;
+    max-height: 22rem;
+    overflow-y: auto;
+}
+
+.lease-actions {
+    justify-content: flex-start;
+    gap: 0.5rem;
+}
+
+.adopt-list {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    font-size: 0.85rem;
+    list-style: disc;
+
+    li { margin-bottom: 0.5rem; }
+}

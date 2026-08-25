@@ -19,11 +19,50 @@ export function parseSettings(settings:any){
     }
 
 
+    // Multicast DHCP. This used to be a bare boolean; the lease manager needs
+    // room for more than one flag, so a boolean is migrated in place rather
+    // than reset — an operator who had it on keeps it on.
     if(!settings.hasOwnProperty("autoMulticast")){
-        settings.autoMulticast = false;
-    }else{
-        if(typeof settings.autoMulticast != "boolean"){
-            settings.autoMulticast = false;
+        settings.autoMulticast = { enabled: false };
+    }else if(typeof settings.autoMulticast === "boolean"){
+        settings.autoMulticast = { enabled: settings.autoMulticast };
+    }else if(typeof settings.autoMulticast !== "object" || settings.autoMulticast === null){
+        settings.autoMulticast = { enabled: false };
+    }else if(typeof settings.autoMulticast.enabled !== "boolean"){
+        settings.autoMulticast.enabled = false;
+    }
+
+    // Per-essence multicast ranges. These select which pool a lease is drawn
+    // from, so a missing or malformed entry means that essence type simply has
+    // no capacity — which the Setup page shows rather than silently papering
+    // over with a shared default.
+    if(!settings.hasOwnProperty("multicastRanges") || typeof settings.multicastRanges !== "object" || settings.multicastRanges === null){
+        settings.multicastRanges = {};
+    }
+    {
+        const CIDR = /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/;
+        const defaults:any = {
+            video:    "239.120.0.0/16",
+            videoUhd: "239.121.0.0/16",
+            jxsv:     "239.122.0.0/16",
+            audio:    "239.130.0.0/16",
+            other:    "239.140.0.0/16"
+        };
+        for(const cat of Object.keys(defaults)){
+            let e = settings.multicastRanges[cat];
+            if(!e || typeof e !== "object"){
+                e = {};
+                settings.multicastRanges[cat] = e;
+            }
+            if(typeof e.primary !== "string" || !CIDR.test(e.primary)){
+                e.primary = defaults[cat];
+            }
+            // `secondary` is retained for backwards compatibility but no longer
+            // consulted: a lease's two legs must be adjacent for ST 2022-7, and
+            // two independent ranges cannot express that.
+            if(typeof e.secondary !== "string" || !CIDR.test(e.secondary)){
+                e.secondary = e.primary;
+            }
         }
     }
 

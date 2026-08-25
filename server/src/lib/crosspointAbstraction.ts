@@ -1,6 +1,7 @@
 import { SyncObject } from "./SyncServer/syncObject";
 import { Bcp008Monitor, MonitorStatus } from "./bcp008Monitor";
 import { nmosIdFromCrosspointId } from "./functions";
+import { MulticastLeaseManager } from "./multicastLeaseManager";
 import { LoggedError, SyncLog } from "./syncLog";
 import { error } from "console";
 import { NmosRegistryConnector } from "./nmosConnector";
@@ -365,6 +366,39 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         return new Promise((resolve, reject) => {
             if(id.startsWith("nmos_")){
                 let nmosId = id.slice(5);
+                // Record the edit against the lease FIRST. Otherwise the next
+                // reconcile sees the sender sitting on an address that is not
+                // its reserved one and immediately patches it back — the manual
+                // edit would survive only until the following sweep.
+                // An empty string is an explicit clear, which drops the
+                // override and returns the leg to its reserved address.
+                try{
+                    if(MulticastLeaseManager.instance && Array.isArray(data?.legs)){
+                        for(const leg of data.legs){
+                            const index = Number(leg?.index);
+                            if(!Number.isFinite(index)){ continue; }
+                            MulticastLeaseManager.instance.recordManualEdit(nmosId, index, leg?.multicast);
+                        }
+                    }
+                }catch(e){
+                    SyncLog.log("warning", "Multicast Lease", "Could not record a manual multicast edit", e);
+                }
+
+                // A cleared leg has no address of its own to send, so resolve
+                // the effective one from the lease before patching.
+                try{
+                    const mgr = MulticastLeaseManager.instance;
+                    if(mgr && mgr.isEnabled() && Array.isArray(data?.legs)){
+                        data = { ...data, legs: data.legs.map((leg:any)=>{
+                            const index = Number(leg?.index);
+                            const wanted = (leg?.multicast === "" || leg?.multicast == null)
+                                ? mgr.getEffectiveIp(nmosId, index)
+                                : leg.multicast;
+                            return { index, multicast: wanted };
+                        }).filter((leg:any)=> !!leg.multicast) };
+                    }
+                }catch(e){}
+
                 NmosRegistryConnector.instance.setFlowMulticast(nmosId,data);
             } 
             resolve({});
