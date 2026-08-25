@@ -70,6 +70,21 @@ export function parseSettings(settings:any){
         }
     }
 
+    // Registry discovery: unicast DNS-SD (RFC 6763 over normal DNS) is on by
+    // default, with an optional domain override. An empty domain means "use
+    // the system resolver's search list".
+    if(!settings.hasOwnProperty("registryDiscovery") || typeof settings.registryDiscovery !== "object" || settings.registryDiscovery === null){
+        settings.registryDiscovery = { unicastDnssd: true, domain: "" };
+    }else{
+        const rd = settings.registryDiscovery;
+        if(!rd.hasOwnProperty("unicastDnssd") || typeof rd.unicastDnssd !== "boolean"){
+            rd.unicastDnssd = true;
+        }
+        if(!rd.hasOwnProperty("domain") || typeof rd.domain !== "string"){
+            rd.domain = "";
+        }
+    }
+
     // Debug logs toggle (controls debug/verbose output through SyncLog)
     if(!settings.hasOwnProperty("debugLogs")){
         settings.debugLogs = false;

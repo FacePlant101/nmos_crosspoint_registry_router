@@ -4,6 +4,7 @@
 */
 
 import * as WebSocket from "ws";
+import * as dns from "dns";
 import axios from "axios";
 import { SyncObject } from "./SyncServer/syncObject";
 import { Subject } from "rxjs";
@@ -108,7 +109,7 @@ export class NmosRegistryConnector {
                 }
 
             } catch (e) {}
-            this.syncNmos.setState(this.nmosState);
+            this.scheduleSyncNmos();
             this.updateCrosspoint();
         }
         // ----- dev cleanup
@@ -139,6 +140,14 @@ export class NmosRegistryConnector {
             this.mdnsQuery();
         }, 20000);
 
+        // Unicast DNS-SD runs on its own, slower cadence: it is a handful of
+        // ordinary DNS lookups, not multicast traffic, so re-querying every
+        // 60 s is enough to pick up a registry that appears later.
+        this.dnssdQuery();
+        this.dnssdQueryInterval = setInterval(() => {
+            this.dnssdQuery();
+        }, 60000);
+
         MdnsService.registerHook((response) => {
             response.answers.forEach((answer) => {
                 
@@ -161,6 +170,95 @@ export class NmosRegistryConnector {
         });
     }
 
+    // Discovery cascade: an operator-entered address (static config or a
+    // runtime manual add) always outranks automatic discovery, and unicast
+    // DNS-SD beats mDNS. Used to decide which source label wins when the same
+    // endpoint is found twice — see addRegistry.
+    private static sourceRank(source: string): number {
+        if (source === "static" || source === "manual") return 3;
+        if (source === "dnssd") return 2;
+        return 1; // mdns
+    }
+
+    /** The DNS-SD domains to query: the configured override if set, otherwise
+     *  the system resolver's search domains. Reading /etc/resolv.conf works in
+     *  the container and on Linux hosts; anywhere else the empty list is a
+     *  clean no-op and we fall back to mDNS / the static registry. */
+    private dnssdSearchDomains(): string[] {
+        let cfg = "";
+        try { cfg = ("" + (this.settings?.registryDiscovery?.domain || "")).trim().replace(/\.+$/, ""); } catch (e) {}
+        if (cfg) { return [cfg]; }
+        try {
+            const txt = fs.readFileSync("/etc/resolv.conf", "utf8");
+            const domains: string[] = [];
+            for (const line of ("" + txt).split("\n")) {
+                const m = line.match(/^\s*(search|domain)\s+(.+)$/);
+                if (!m) continue;
+                for (const d of m[2].trim().split(/\s+/)) {
+                    // "local" belongs to mDNS, which we already query separately.
+                    const clean = d.trim().replace(/\.+$/, "");
+                    if (clean && clean !== "local" && !domains.includes(clean)) { domains.push(clean); }
+                }
+            }
+            return domains;
+        } catch (e) { return []; }
+    }
+
+    /** Unicast DNS-SD (RFC 6763 over ordinary DNS):
+     *  PTR on _nmos-register._tcp.<domain> (plus the deprecated
+     *  _nmos-registration._tcp name) -> SRV per instance -> A record.
+     *  This finds a registry on a routed network where mDNS cannot reach. */
+    private async dnssdQuery() {
+        // Resolve the domains before the enabled check, so the Setup page can
+        // always show what *would* be searched.
+        const domains = this.dnssdSearchDomains();
+        const domainsChanged = domains.join(",") !== this.lastDnssdDomains.join(",");
+        this.lastDnssdDomains = domains;
+        if (domainsChanged) { this.updateSyncConnectionState(); }
+
+        try {
+            if (this.settings?.registryDiscovery?.unicastDnssd === false) return;
+        } catch (e) {}
+
+        if (domains.length === 0) {
+            if (!this.loggedDnssdNoDomain) {
+                this.loggedDnssdNoDomain = true;
+                SyncLog.log("verbose", "NMOS", "Unicast DNS-SD discovery: no DNS search domain found and none configured - relying on mDNS / static registry.");
+            }
+            return;
+        }
+
+        const services = ["_nmos-register._tcp.", "_nmos-registration._tcp."];
+        for (const domain of domains) {
+            for (const svc of services) {
+                let instances: string[] = [];
+                try { instances = await dns.promises.resolvePtr(svc + domain); }
+                catch (e) { continue; }   // NXDOMAIN and friends - try the next name
+                for (const inst of instances) {
+                    try {
+                        const srvs = await dns.promises.resolveSrv(inst);
+                        for (const srv of srvs) {
+                            const target = ("" + srv.name).replace(/\.+$/, "");
+                            if (!target || !srv.port) continue;
+                            let ip = target;
+                            try {
+                                const addrs = await dns.promises.resolve4(target);
+                                if (addrs.length > 0) { ip = addrs[0]; }
+                            } catch (e) { /* keep the hostname - it works in the URL too */ }
+                            this.addRegistry({
+                                ip,
+                                port: srv.port,
+                                priority: (typeof srv.priority === "number") ? srv.priority : 100,
+                                source: "dnssd",
+                                domain,
+                            });
+                        }
+                    } catch (e) { /* instance without SRV - skip */ }
+                }
+            }
+        }
+    }
+
     private mdnsQuery() {
         MdnsService.query({
             questions: [
@@ -173,30 +271,41 @@ export class NmosRegistryConnector {
         });
     }
     private addRegistry(registry: NmosRegistry) {
-        
-        let addNew = true;
-        let update = -1;
+        const rank = NmosRegistryConnector.sourceRank(registry.source);
 
+        // Already known endpoint: keep the existing connection and only
+        // relabel it when a higher-ranked source confirms the same address.
+        // The old code relabelled whenever the entry was not "static", so a
+        // periodic mDNS answer could downgrade a manual entry's source.
         for (let i = 0; i < this.nmosRegistryList.length; i++) {
             const el = this.nmosRegistryList[i];
             if (el.ip + ":" + el.port == registry.ip + ":" + registry.port) {
-                addNew = false;
-                if (el.source != "static") {
-                    update = i;
+                if (rank > NmosRegistryConnector.sourceRank(el.source)) {
+                    this.nmosRegistryList[i] = registry;
+                    this.updateSyncConnectionState();
                 }
+                return;
             }
         }
 
-        if (addNew) {
-            this.nmosRegistryList.push(registry);
-            SyncLog.log("info","NMOS Settings","Adding Registry: "+registry.ip + ":"+registry.port );
-            this.connectRegistry(registry);
-
+        // NOTE we deliberately do NOT tear down lower-ranked registries here.
+        // Exclusive source arbitration needs the generation counter that makes
+        // lingering reconnect timers bail out; without it a stale timer would
+        // simply resurrect a registry we just dropped. Until then we connect
+        // to every distinct endpoint, as before, and only note the ranking.
+        let bestRank = 0;
+        for (const el of this.nmosRegistryList) {
+            bestRank = Math.max(bestRank, NmosRegistryConnector.sourceRank(el.source));
+        }
+        if (bestRank > rank) {
+            SyncLog.log("verbose", "NMOS Settings",
+                "Registry " + registry.ip + ":" + registry.port + " found via " + registry.source +
+                ", but a higher-priority source is already connected.");
         }
 
-        if (update != -1) {
-            this.nmosRegistryList[update] = registry;
-        }
+        this.nmosRegistryList.push(registry);
+        SyncLog.log("info","NMOS Settings","Adding Registry ("+registry.source+"): "+registry.ip + ":"+registry.port );
+        this.connectRegistry(registry);
 
         this.updateSyncConnectionState();
     }
@@ -228,12 +337,51 @@ export class NmosRegistryConnector {
     }
 
     private mdnsQueryInterval = null;
+    private dnssdQueryInterval: any = null;
+    private loggedDnssdNoDomain = false;
+    // Domains the last DNS-SD pass would query (override or the resolv.conf
+    // search list). Surfaced on the connection-state channel so the Setup page
+    // can show what is actually being searched.
+    private lastDnssdDomains: string[] = [];
     private mdnsBrowser: any = null;
     private registryVersionList = ["v1.3","v1.2"];
     private connectVersionList = ["v1.1", "v1.0"];
     private channelmappingVersionList = ["v1.0"];
     private nmosRegistryList: NmosRegistry[] = [];
 
+
+    // ----- syncNmos coalescing -----
+    // A busy registry fires dozens of WebSocket grains per second, and the raw
+    // flow called syncNmos.setState() on EVERY one. setState deep-clones the
+    // whole nmosState and runs a full JSON-patch diff against the previous
+    // copy — on a registry with thousands of senders and flows that is
+    // milliseconds of CPU per call, burnt even for a no-op version bump.
+    // Coalescing collapses a burst of N grains into one clone+diff+broadcast.
+    // The published state is always the latest, because nmosState is read at
+    // flush time rather than captured at schedule time.
+    //
+    // NOTE the payload still includes sendersManifestDetail, which dominates
+    // its size. Dropping it needs details.svelte to fetch single SDPs through
+    // the senderSdp route instead of reading them out of this channel.
+    private syncNmosTimer: any = null;
+    private scheduleSyncNmos() {
+        if (this.syncNmosTimer != null) return;
+        this.syncNmosTimer = setTimeout(() => {
+            this.syncNmosTimer = null;
+            try { this.syncNmos.setState(this.nmosState); } catch (e) {}
+        }, 80);
+    }
+
+    /** Raw + parsed SDP for one sender, for the UI's SDP viewer and the audio
+     *  monitor. Reading it on demand keeps single-sender lookups off the
+     *  broadcast channel. */
+    public getSenderSdp(senderId: string): any {
+        try {
+            const d = this.nmosState["sendersManifestDetail"][senderId];
+            if (!d) return null;
+            return { raw: d._RAWSDP || "", parsed: d };
+        } catch (e) { return null; }
+    }
 
     updateCrosspointTimer:any = null;
     updateCrosspointLimit = 0;
@@ -381,8 +529,18 @@ export class NmosRegistryConnector {
                 ws: new WebSocket(subscription.ws_href),
             };
 
-            this.connections[fullResource].ws.error = () => {
+            // NOTE this used to assign a plain property called `error`, which
+            // is not an event handler — `ws` needs `onerror`. With no handler
+            // attached, a socket error is emitted as an unhandled 'error'
+            // event and takes the WHOLE SERVER down: a registry that moved or
+            // closed its subscription websocket port crashed the process.
+            // `ws` always emits 'close' after 'error', so the reconnect below
+            // still drives retries; this handler only has to log.
+            this.connections[fullResource].ws.onerror = (event: any) => {
                 this.connections[fullResource].ws.onmessage = (message) => {};
+                SyncLog.log("warning", "NMOS",
+                    "Subscription websocket error for Registry: " + nmosRegistryUrl + ", " + resource + ", " + version +
+                    (event && event.message ? " (" + event.message + ")" : ""));
             };
 
             this.connections[fullResource].ws.onclose = () => {
@@ -563,7 +721,7 @@ export class NmosRegistryConnector {
         }
         // TODO
         //fs.writeFileSync("./state/devnmosstate/devnmosstate.json", JSON.stringify(this.nmosState));
-        this.syncNmos.setState(this.nmosState);
+        this.scheduleSyncNmos();
         if(newItem){
             if(this.updateNewNmosItemTimer){
                 clearTimeout(this.updateNewNmosItemTimer);
@@ -648,12 +806,58 @@ export class NmosRegistryConnector {
             }
         }
 
-        this.syncNmos.setState(this.nmosState);
+        this.scheduleSyncNmos();
         this.updateCrosspoint();
 
     }
 
 
+
+    /** Fetch and store one sender's SDP manifest.
+     *  A single retry after 5 s covers the common case of a device that has
+     *  only just announced its sender and is not serving the manifest yet;
+     *  without it that sender stayed without an SDP until its next update. */
+    private fetchSenderManifest(href: string, senderId: string, label: string, allowRetry: boolean) {
+        axios.get(href).then(response => {
+            if (response.data.length > 10) {
+                // TODO Check for BAD SDP Files, is this already enough, more than 10 chars and more than 0 flows
+                let sdp = sdpTransform.parse(response.data);
+                sdp["_RAWSDP"] = response.data;
+                if (sdp.media.length == 0) {
+                    SyncLog.log("warning", "NMOS", "Got BAD SDP File for Flow: " + label + " ( ID: " + senderId + " )")
+                    try {
+                        // TODO Test
+                        delete this.nmosState["sendersManifestDetail"][senderId];
+                        this.scheduleSyncNmos();
+                    } catch (e) {}
+                } else {
+                    if (this.nmosState["sendersManifestDetail"][senderId] && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP.length > 10) {
+                        if (this.nmosState["sendersManifestDetail"][senderId]._RAWSDP != sdp["_RAWSDP"]) {
+                            this.reconnectOnChanges(senderId);
+                        }
+                    }
+                    this.nmosState["sendersManifestDetail"][senderId] = sdp;
+                    this.scheduleSyncNmos();
+                    this.updateCrosspoint();
+                }
+            } else {
+                SyncLog.log("warning", "NMOS", "Got BAD SDP File for Flow: " + label + " ( ID: " + senderId + " )")
+                try {
+                    // TODO Test
+                    delete this.nmosState["sendersManifestDetail"][senderId];
+                } catch (e) {}
+            }
+        }).catch(e => {
+            if (allowRetry) {
+                SyncLog.log("verbose", "NMOS", "SDP fetch failed for Flow: " + label + " ( ID: " + senderId + " ) - retrying once in 5s.");
+                setTimeout(() => {
+                    this.fetchSenderManifest(href, senderId, label, false);
+                }, 5000);
+                return;
+            }
+            SyncLog.log("warning", "NMOS", "Can not get SDP File for Flow: " + label + " ( ID: " + senderId + " )")
+        });
+    }
 
     getSenderManifestData(type:string, g:any){
         if (g.hasOwnProperty("path") && typeof g.path == "string") {
@@ -690,39 +894,12 @@ export class NmosRegistryConnector {
 
                     
                     if (manifest_href && active && senderId) {
-                        //console.log("----- load manifest for "+label)
-                        axios.get(g.post.manifest_href).then(response => {
-                            if(response.data.length > 10){
-                                // TODO Check for BAD SDP Files, is this already enough, more than 10 chars and more than 0 flows
-                                let sdp = sdpTransform.parse(response.data);
-                                sdp["_RAWSDP"] = response.data;
-                                if(sdp.media.length == 0){
-                                    SyncLog.log("warn", "NMOS", "Got BAD SDP File for Flow: " + label + " ( ID: " + senderId +" )")  
-                                    try{
-                                        // TODO Test
-                                        delete this.nmosState["sendersManifestDetail"][senderId];
-                                        this.syncNmos.setState(this.nmosState);
-                                    }catch(e){}
-                                }else{
-                                    if(this.nmosState["sendersManifestDetail"][senderId] && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP && this.nmosState["sendersManifestDetail"][senderId]._RAWSDP.length > 10 ){
-                                        if(this.nmosState["sendersManifestDetail"][senderId]._RAWSDP != sdp["_RAWSDP"]){
-                                            this.reconnectOnChanges(senderId);
-                                        }
-                                    }
-                                    this.nmosState["sendersManifestDetail"][senderId] = sdp;
-                                    this.syncNmos.setState(this.nmosState);
-                                    this.updateCrosspoint();
-                                }
-                            }else{
-                                SyncLog.log("warn", "NMOS", "Got BAD SDP File for Flow: " + label + " ( ID: " + senderId +" )")    
-                                try{
-                                    // TODO Test
-                                    delete this.nmosState["sendersManifestDetail"][senderId];
-                                }catch(e){}
-                            }
-                        }).catch(e=>{
-                            SyncLog.log("warn", "NMOS", "Can not get SDP File for Flow: " + label + " ( ID: " + senderId +" )")
-                        });
+                        // NOTE this used to fetch g.post.manifest_href. For
+                        // type == "flows" the manifest_href lives on the
+                        // referenced SENDER, not on the flow, so g.post had no
+                        // such field and every flow-triggered refresh fetched
+                        // undefined and failed. Use the resolved href.
+                        this.fetchSenderManifest(manifest_href, senderId, label, true);
                     }
                 }
             } else {
@@ -730,7 +907,7 @@ export class NmosRegistryConnector {
                     // remove element
                     try {
                         delete this.nmosState["sendersManifestDetail"][g.path];
-                        this.syncNmos.setState(this.nmosState);
+                        this.scheduleSyncNmos();
                         this.updateCrosspoint();
                     } catch (e) {}
                     
@@ -785,7 +962,7 @@ export class NmosRegistryConnector {
                         }
                     }
 
-                    this.syncNmos.setState(this.nmosState);
+                    this.scheduleSyncNmos();
                     this.updateCrosspoint();
                 }
             } else {
@@ -793,7 +970,7 @@ export class NmosRegistryConnector {
                     // remove element
                     try {
                         delete this.nmosState.senderActiveData[g.path];
-                        this.syncNmos.setState(this.nmosState);
+                        this.scheduleSyncNmos();
                         this.updateCrosspoint();
                     } catch (e) {}
                     
@@ -825,7 +1002,15 @@ export class NmosRegistryConnector {
             } catch (e) {}
             list.push(entry);
         });
-        this.syncConnectionState.setState({ registries: list });
+        this.syncConnectionState.setState({
+            registries: list,
+            // What unicast DNS-SD is searching, so the Setup page can explain
+            // "no registry found" without the operator guessing.
+            discovery: {
+                unicastDnssd: this.settings?.registryDiscovery?.unicastDnssd !== false,
+                domains: this.lastDnssdDomains
+            }
+        });
         setTimeout(()=>{
             this.updateSyncConnectionState();
         },2000)
@@ -1802,7 +1987,7 @@ interface NmosRegistry {
     port: number;
     domain: string;
     priority: number;
-    source: "mdns" | "static" | "manual";
+    source: "mdns" | "dnssd" | "static" | "manual";
 }
 
 interface ConnectionList {

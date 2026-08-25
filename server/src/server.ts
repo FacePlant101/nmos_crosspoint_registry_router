@@ -500,6 +500,25 @@ server.startServer(serverAddress, serverPort);
 
 
 
+// Raw + parsed SDP for a single sender. Fetched on demand rather than read out
+// of the broadcast `nmos` channel, so the UI's SDP viewer and the audio monitor
+// do not depend on the whole manifest set being pushed to every client.
+server.addRoute("GET", "senderSdp","global", (client: WebsocketClient, query:string[]) => {
+    return new Promise((resolve, reject) => {
+        let senderId = query[0];
+        if(!senderId){
+            reject("missing sender id");
+            return;
+        }
+        let sdp = nmosConnector.getSenderSdp(senderId);
+        if(sdp && sdp.raw){
+            resolve({message:200, data:sdp});
+        }else{
+            reject("no SDP known for this sender");
+        }
+    });
+});
+
 server.addRoute("GET", "flowInfo","global" , (client: WebsocketClient, query:string[]) => {
     return new Promise((resolve, reject) => {
         let flowId = query[0];
