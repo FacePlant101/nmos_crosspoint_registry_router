@@ -125,3 +125,21 @@
         .btn { margin-left: 0.15rem; }
     }
 }
+
+.setup-subhead {
+    font-weight: 500;
+    margin: 0.75rem 0 0.25rem;
+}
+
+.probe-cmd {
+    font-family: monospace;
+    font-size: 0.7rem;
+    line-height: 1.45;
+    // The command is long and must not wrap mid-flag, so let it scroll.
+    white-space: pre;
+    overflow-x: auto;
+    padding: 0.5rem;
+    background-color: hsl(var(--b3));
+    border-radius: 0.25rem;
+    margin: 0.25rem 0;
+}

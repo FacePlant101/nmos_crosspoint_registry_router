@@ -21,6 +21,7 @@
         predictiveEnabled: false,
         predictiveCooldownMs: 10000,
         bcp008Enabled: true,
+        audioMonitorEnabled: false,
         dnssdEnabled: true,
         dnssdDomain: "",
         debugLogs: false,
@@ -32,6 +33,11 @@
     // Device Web-UI link profiles. Edited as a list rather than folded into
     // `form`, because rows are added and removed as well as changed.
     let profiles: any[] = [];
+
+    // Multicast probe status, so the operator can see whether a probe is
+    // actually attached before wondering why the monitor is silent.
+    let probeState: any = { token: "", probes: [] };
+    let probeSync: Subject<any>;
 
     // Credential form is deliberately not part of `form` — it posts to its
     // own route and must never be included in a settings save.
@@ -50,6 +56,7 @@
             predictiveEnabled: !!s.predictiveStaging?.enabled,
             predictiveCooldownMs: s.predictiveStaging?.cooldownMs ?? 10000,
             bcp008Enabled: s.bcp008?.enabled !== false,
+            audioMonitorEnabled: !!s.audioMonitor?.enabled,
             dnssdEnabled: s.registryDiscovery?.unicastDnssd !== false,
             dnssdDomain: s.registryDiscovery?.domain ?? "",
             debugLogs: !!s.debugLogs,
@@ -79,12 +86,18 @@
         connSync.subscribe((obj: any) => {
             searchedDomains = obj?.discovery?.domains ?? [];
         });
+        probeSync = ServerConnector.sync("probeState");
+        probeSync.subscribe((obj: any) => {
+            probeState = obj ?? { token: "", probes: [] };
+        });
     });
     onDestroy(() => {
         if (sync) sync.unsubscribe();
         ServerConnector.unsync("setupConfig");
         if (connSync) connSync.unsubscribe();
         ServerConnector.unsync("nmosConnectionState");
+        if (probeSync) probeSync.unsubscribe();
+        ServerConnector.unsync("probeState");
     });
 
     function touch() {
@@ -107,6 +120,7 @@
                     cooldownMs: Number(form.predictiveCooldownMs),
                 },
                 bcp008: { enabled: !!form.bcp008Enabled },
+                audioMonitor: { enabled: !!form.audioMonitorEnabled },
                 registryDiscovery: {
                     unicastDnssd: !!form.dnssdEnabled,
                     domain: form.dnssdDomain.trim(),
@@ -140,6 +154,28 @@
 
     function revert() {
         loadForm(state);
+    }
+
+    async function copyProbeCommand() {
+        const cmd = probeRunCommand();
+        try {
+            await navigator.clipboard.writeText(cmd);
+            ServerConnector.addFeedback({ level: "success", message: "Probe command copied." });
+        } catch (e) {
+            ServerConnector.addFeedback({ level: "error", message: "The browser refused clipboard access." });
+        }
+    }
+
+    // Ready-to-paste command for the probe sidecar. Host networking is required
+    // so it can actually join the media network's multicast groups.
+    function probeRunCommand(): string {
+        const origin = window.location.host || "crosspoint";
+        return "docker run -d --restart unless-stopped --network host \\\n" +
+            "  -e MODE=probe \\\n" +
+            "  -e CROSSPOINT_URL=ws://" + origin + " \\\n" +
+            "  -e PROBE_TOKEN=" + (probeState.token || "<token>") + " \\\n" +
+            '  -e PROBE_NAME="Studio A" \\\n' +
+            "  ghcr.io/avassdal/nmos_crosspoint_registry_router:latest";
     }
 
     function addProfile() {
@@ -281,6 +317,41 @@
                     live health per flow in the matrix. Read-only on the network. Applies
                     immediately — turning it off closes every control connection.
                 </p>
+
+                <div class="setup-row">
+                    <label class="label" for="audioMonitorEnabled">Audio monitor</label>
+                    <input id="audioMonitorEnabled" class="toggle" type="checkbox"
+                        bind:checked={form.audioMonitorEnabled} on:change={touch} />
+                </div>
+                <p class="setup-hint">
+                    Adds a listen button next to each audio sender on the Details page. The
+                    server joins the multicast, transcodes to Opus and streams it to the
+                    browser over WebRTC. It needs access to the media network — or a probe
+                    below, which it then uses automatically.
+                </p>
+
+                <h4 class="setup-subhead">Multicast probe</h4>
+                <p class="setup-hint">
+                    Run this on a host that <em>is</em> attached to the media network. It
+                    forwards multicast to the crosspoint as unicast over an authenticated
+                    websocket, so the crosspoint container needs no multicast access at all.
+                </p>
+                <pre class="probe-cmd">{probeRunCommand()}</pre>
+                <div class="setup-row">
+                    <button class="btn btn-sm" on:click={copyProbeCommand}>Copy command</button>
+                </div>
+                {#if probeState.probes && probeState.probes.length > 0}
+                    <table class="mon-table">
+                        <thead><tr><th>Probe</th><th>Address</th><th>Streams</th></tr></thead>
+                        <tbody>
+                            {#each probeState.probes as p}
+                                <tr><td>{p.name}</td><td>{p.address}</td><td>{p.streams}</td></tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {:else}
+                    <p class="setup-hint">No probe connected.</p>
+                {/if}
             </section>
 
             <section class="setup-section">

@@ -47,3 +47,12 @@
     margin-left: 0.25rem;
     vertical-align: middle;
 }
+
+// The audio monitor floats over the table rather than living in a row: it
+// outlives scrolling and filtering, and only one plays at a time.
+.audio-monitor-dock {
+    position: fixed;
+    right: 5rem;
+    bottom: 1rem;
+    z-index: 40;
+}

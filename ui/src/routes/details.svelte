@@ -14,6 +14,7 @@
     import SetupDevice from "../lib/SetupDevice.svelte";
 
     import ScrollArea from "../lib/ScrollArea.svelte";
+    import AudioMonitorPlayer from "../lib/AudioMonitor/AudioMonitorPlayer.svelte";
     import { getSearchTokens, tokenSearch } from "../lib/functions";
     import OverlayMenuService from "../lib/OverlayMenu/OverlayMenuService";
 
@@ -92,6 +93,11 @@
             nmosState = obj;
             reRender();
       });
+      setupSync = ServerConnector.sync("setupConfig")
+      setupSync.subscribe((obj:any)=>{
+            audioMonitorEnabled = !!obj?.audioMonitor?.enabled;
+            reRender();
+      });
       try{
         let f = localStorage.getItem("nmos_details_filter");
         if(f){
@@ -110,6 +116,8 @@
           ServerConnector.unsync("crosspoint")
       syncNmos.unsubscribe();
           ServerConnector.unsync("nmos")
+      if(setupSync){ setupSync.unsubscribe(); }
+          ServerConnector.unsync("setupConfig")
     });
 
       function saveFilter(){
@@ -590,6 +598,37 @@
       forgetTarget = null;
     }
   }
+
+  // ----- Audio monitor -----
+  // A headphone button next to each audio sender. The server joins the
+  // multicast (directly, or through a connected probe), transcodes to Opus and
+  // streams it over WebRTC. Only offered when the feature is enabled in Setup
+  // and the sender actually has a manifest to decode.
+  let audioMonitorEnabled = false;
+  let setupSync: Subject<any>;
+  let monitorSenderId = "";
+  let monitorSdp = "";
+
+  function canMonitor(flow: any): boolean {
+    return audioMonitorEnabled && flow.type === "audio" && flow.available && flow.manifestOk;
+  }
+
+  async function startMonitor(flow: any) {
+    // The player wants the SDP for channel-pair detection; the server uses its
+    // own cached copy for the actual join, so this is display-only.
+    try {
+      const res: any = await ServerConnector.get("senderSdp/" + flow.id);
+      monitorSdp = res?.data?.raw ?? "";
+      monitorSenderId = flow.id;
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not start the monitor: " + (e?.message ?? e) });
+    }
+  }
+
+  function stopMonitor() {
+    monitorSenderId = "";
+    monitorSdp = "";
+  }
 </script>
   
 
@@ -814,6 +853,12 @@
                                           <Icon src={DocumentText}></Icon>
                                         </button>
                                       {/if}
+                                      {#if canMonitor(flow)}
+                                        <button on:click={()=>startMonitor(flow)} class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="listen to this sender">
+                                          <Icon src={SpeakerWave}></Icon>
+                                        </button>
+                                      {/if}
                                     {/if}
 
                                     {#if col.id == "sync"}
@@ -938,6 +983,12 @@
     </div>
   </dialog>
 
+
+  {#if monitorSenderId}
+    <div class="audio-monitor-dock">
+      <AudioMonitorPlayer senderId={monitorSenderId} sdp={monitorSdp} onClose={stopMonitor} />
+    </div>
+  {/if}
 
   <dialog bind:this={forgetModal} class="modal">
     <div class="modal-box">

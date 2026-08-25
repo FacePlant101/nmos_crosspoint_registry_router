@@ -50,15 +50,17 @@ RUN npm run build
 
 
 # ============================ Production deps ============================
-# Runs under the TARGET platform so that any dependency shipping a native
-# binding matches the architecture of the final image. build-essential and
-# python3 are here for node-gyp; they are dropped from the runtime stage.
+# Runs under the TARGET platform because @discordjs/opus ships a native
+# binding that must match the architecture of the final image. build-essential,
+# python3 and libopus-dev are here for node-gyp; they are dropped from the
+# runtime stage, which keeps only the shared library.
 FROM node:20 AS prod-deps
 WORKDIR /build/server
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential python3 \
+        libopus-dev libopus0 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY server/package*.json ./
@@ -69,6 +71,11 @@ RUN npm ci --omit=dev --no-audit --no-fund --prefer-offline \
 # ============================== Runtime ==================================
 FROM node:20-slim AS runtime
 WORKDIR /nmos-crosspoint/server
+
+# The audio monitor's Opus binding links against libopus at runtime.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libopus0 \
+ && rm -rf /var/lib/apt/lists/*
 
 # node_modules come from the prod-deps stage — same architecture and the same
 # glibc as this node:20-slim image, so no rebuild is needed here.

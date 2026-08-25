@@ -111,6 +111,27 @@ export function parseSettings(settings:any){
             });
     }
 
+    // Multicast probe: a shared secret the probe container authenticates with.
+    // Minted once and then persisted — this is the reason settings.json is
+    // written back at startup, since a fresh token every boot would lock out
+    // every already-deployed probe.
+    if(!settings.hasOwnProperty("probe") || typeof settings.probe !== "object" || settings.probe === null){
+        settings.probe = { token: "" };
+    }
+    if(typeof settings.probe.token !== "string" || settings.probe.token.length < 32){
+        settings.probe.token = require("crypto").randomBytes(24).toString("hex");
+    }
+
+    // Audio monitor: WebRTC listen-in on audio senders. Off by default — it
+    // needs the server to reach the media network, or a probe to do it.
+    if(!settings.hasOwnProperty("audioMonitor") || typeof settings.audioMonitor !== "object" || settings.audioMonitor === null){
+        settings.audioMonitor = { enabled: false };
+    }else{
+        if(typeof settings.audioMonitor.enabled !== "boolean"){
+            settings.audioMonitor.enabled = false;
+        }
+    }
+
     // BCP-008 status monitoring. Read-only IS-12 client, on by default.
     if(!settings.hasOwnProperty("bcp008") || typeof settings.bcp008 !== "object" || settings.bcp008 === null){
         settings.bcp008 = { enabled: true };

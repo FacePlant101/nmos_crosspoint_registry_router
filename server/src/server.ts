@@ -28,6 +28,8 @@ import { PrometheusMetrics } from "./lib/prometheusMetrics";
 import { NmosHealthMonitor } from "./lib/nmosHealthMonitor";
 import { Bcp008Monitor } from "./lib/bcp008Monitor";
 import { nmosIdFromCrosspointId } from "./lib/functions";
+import { ProbeGateway } from "./lib/probeGateway";
+import { AudioMonitorService } from "./lib/audioMonitor";
 
 
 
@@ -224,6 +226,22 @@ if(modDisabled.includes("topology")){
 const uiConfigSync: SyncObject = new SyncObject("uiconfig", uiConfig);
 server.addSyncObject("uiconfig","public",uiConfigSync);
 
+// Multicast probe gateway. Registers its own /probe websocket upgrade path, so
+// it must come after WebsocketSyncServer.init() — which it does, since the
+// sync server is created far above.
+const probeGateway = new ProbeGateway(
+    (settings.probe && typeof settings.probe.token === "string") ? settings.probe.token : "");
+server.addSyncObject("probeState","global",probeGateway.syncProbes);
+
+// Audio monitor. When a probe is connected the monitor uses it, so the
+// crosspoint container itself needs no multicast access.
+const audioMonitor = new AudioMonitorService();
+// Tear a listener's peer connection down the moment its browser tab closes;
+// otherwise the producer lingers until werift's DTLS keep-alives time out.
+server.onClientDisconnect.push((c: WebsocketClient) => {
+    try { audioMonitor.dropWsClient(c).catch(()=>{}); } catch(e) {}
+});
+
 
 // ----- Editable setup config exposed to the UI -----
 // This is the single read model behind the Setup page. It deliberately does
@@ -273,6 +291,7 @@ function getSetupConfigState() {
         predictiveStaging,
         // Read-only IS-12 status monitoring; absent means on.
         bcp008: { enabled: !(settings.bcp008 && settings.bcp008.enabled === false) },
+        audioMonitor: { enabled: !!(settings.audioMonitor && settings.audioMonitor.enabled) },
         vendorProfiles: Array.isArray(settings.vendorProfiles)
             ? settings.vendorProfiles.map((v:any) => ({...v}))
             : [],
@@ -416,6 +435,24 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         return;
                     }
                     settings.registryDiscovery.domain = d;
+                }
+            }
+
+            // --- Audio monitor master switch.
+            if(postData.hasOwnProperty("audioMonitor") && typeof postData.audioMonitor === "object" && postData.audioMonitor){
+                if(postData.audioMonitor.hasOwnProperty("enabled")){
+                    if(typeof postData.audioMonitor.enabled !== "boolean"){
+                        reject({message:"audioMonitor.enabled must be a boolean."});
+                        return;
+                    }
+                    if(!settings.audioMonitor || typeof settings.audioMonitor !== "object"){ settings.audioMonitor = { enabled:false }; }
+                    let wasEnabled = !!settings.audioMonitor.enabled;
+                    settings.audioMonitor.enabled = postData.audioMonitor.enabled;
+                    if(wasEnabled && !settings.audioMonitor.enabled){
+                        // Stop every producer rather than leaving multicast
+                        // memberships open after the feature is switched off.
+                        try{ audioMonitor.shutdownAll().catch(()=>{}); }catch(e){}
+                    }
                 }
             }
 
@@ -596,15 +633,110 @@ server.addRoute("GET", "senderSdp","global", (client: WebsocketClient, query:str
         // the UI can pass the flow id it already has.
         let senderId = nmosIdFromCrosspointId(query[0] || "");
         if(!senderId){
-            reject("missing sender id");
+            reject({message:"missing sender id"});
             return;
         }
         let sdp = nmosConnector.getSenderSdp(senderId);
         if(sdp && sdp.raw){
             resolve({message:200, data:sdp});
         }else{
-            reject("no SDP known for this sender");
+            reject({message:"no SDP known for this sender"});
         }
+    });
+});
+
+// ----- Audio monitor -----
+// WebRTC signalling for listening in on an audio sender. The SDP comes from the
+// server's own manifest cache rather than the client, so a client cannot point
+// the server at an arbitrary multicast group.
+function audioMonitorGuard(reject: (m: any) => void): boolean {
+    if (!(settings.audioMonitor && settings.audioMonitor.enabled)) {
+        reject({message:"The audio monitor is disabled in Setup."});
+        return false;
+    }
+    return true;
+}
+
+server.addRoute("POST", "audioMonitorSubscribe","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        if(!audioMonitorGuard(reject)){ return; }
+        let senderId = nmosIdFromCrosspointId((postData && typeof postData.senderId === "string") ? postData.senderId : "");
+        let listenerId = (postData && typeof postData.listenerId === "string") ? postData.listenerId : "";
+        if(!senderId || !listenerId){ reject({message:"missing sender or listener id"}); return; }
+
+        let sdp = nmosConnector.getSenderSdp(senderId);
+        if(!sdp || !sdp.raw){ reject({message:"no SDP known for this sender"}); return; }
+
+        let channels: [number, number] | undefined = undefined;
+        if(Array.isArray(postData.channels) && postData.channels.length === 2){
+            let a = parseInt("" + postData.channels[0]);
+            let b = parseInt("" + postData.channels[1]);
+            if(!isNaN(a) && !isNaN(b) && a >= 0 && b >= 0){ channels = [a, b]; }
+        }
+
+        audioMonitor.subscribe({ senderId, listenerId, sdp: sdp.raw, channels })
+            .then((r:any)=>{
+                if(r && r.ok){
+                    // Remember which WS client owns this listener, so the
+                    // disconnect hook can tear it down immediately.
+                    audioMonitor.registerListenerForClient(client, listenerId);
+                    resolve({message:200, data:{ offer: r.offer }});
+                }else{
+                    reject({message:(r && r.error) || "could not start the audio monitor"});
+                }
+            })
+            .catch((e:any)=>reject({message:"audio monitor failed: " + (e?.message || e)}));
+    });
+});
+
+server.addRoute("POST", "audioMonitorAnswer","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        if(!audioMonitorGuard(reject)){ return; }
+        let listenerId = (postData && typeof postData.listenerId === "string") ? postData.listenerId : "";
+        if(!listenerId || !postData.answer){ reject({message:"missing listener id or answer"}); return; }
+        audioMonitor.answer(listenerId, postData.answer)
+            .then((r:any)=>{ r && r.ok ? resolve({message:200, data:{ok:true}}) : reject({message:(r && r.error) || "answer rejected"}); })
+            .catch((e:any)=>reject({message:"answer failed: " + (e?.message || e)}));
+    });
+});
+
+server.addRoute("POST", "audioMonitorIce","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        if(!audioMonitorGuard(reject)){ return; }
+        let listenerId = (postData && typeof postData.listenerId === "string") ? postData.listenerId : "";
+        if(!listenerId || !postData.candidate){ reject({message:"missing listener id or candidate"}); return; }
+        audioMonitor.ice(listenerId, postData.candidate)
+            .then(()=>resolve({message:200, data:{ok:true}}))
+            .catch((e:any)=>reject({message:"ice failed: " + (e?.message || e)}));
+    });
+});
+
+server.addRoute("POST", "audioMonitorSetChannels","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        if(!audioMonitorGuard(reject)){ return; }
+        let listenerId = (postData && typeof postData.listenerId === "string") ? postData.listenerId : "";
+        if(!listenerId || !Array.isArray(postData.channels) || postData.channels.length !== 2){
+            reject({message:"missing listener id or channel pair"});
+            return;
+        }
+        let a = parseInt("" + postData.channels[0]);
+        let b = parseInt("" + postData.channels[1]);
+        if(isNaN(a) || isNaN(b) || a < 0 || b < 0){ reject({message:"invalid channel pair"}); return; }
+        if(audioMonitor.setChannels(listenerId, [a, b])){
+            resolve({message:200, data:{ok:true}});
+        }else{
+            reject({message:"no such listener"});
+        }
+    });
+});
+
+server.addRoute("POST", "audioMonitorUnsubscribe","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve, reject) => {
+        let listenerId = (postData && typeof postData.listenerId === "string") ? postData.listenerId : "";
+        if(!listenerId){ reject({message:"missing listener id"}); return; }
+        audioMonitor.unsubscribe(listenerId)
+            .then(()=>resolve({message:200, data:{ok:true}}))
+            .catch(()=>resolve({message:200, data:{ok:true}}));
     });
 });
 
@@ -615,31 +747,31 @@ server.addRoute("POST", "bcp008Counters","global", (client: WebsocketClient, que
         // The UI sends the crosspoint flow id ("nmos_<uuid>"); the monitor keys
         // everything by the bare IS-04 UUID from the device's touchpoints.
         let flowId = nmosIdFromCrosspointId((postData && typeof postData.flowId === "string") ? postData.flowId : "");
-        if(!flowId){ reject("missing flow id"); return; }
-        if(!Bcp008Monitor.instance){ reject("BCP-008 monitoring is not running"); return; }
+        if(!flowId){ reject({message:"missing flow id"}); return; }
+        if(!Bcp008Monitor.instance){ reject({message:"BCP-008 monitoring is not running"}); return; }
         Bcp008Monitor.instance.getPacketCounters(flowId).then((counters)=>{
             if(counters){
                 resolve({message:200, data:{ counters }});
             }else{
-                reject("no monitor for this flow");
+                reject({message:"no monitor for this flow"});
             }
-        }).catch((e)=>reject("counter read failed: " + (e?.message || e)));
+        }).catch((e)=>reject({message:"counter read failed: " + (e?.message || e)}));
     });
 });
 
 server.addRoute("POST", "bcp008Reset","global", (client: WebsocketClient, query:string[], postData: any) => {
     return new Promise((resolve, reject) => {
         let flowId = nmosIdFromCrosspointId((postData && typeof postData.flowId === "string") ? postData.flowId : "");
-        if(!flowId){ reject("missing flow id"); return; }
-        if(!Bcp008Monitor.instance){ reject("BCP-008 monitoring is not running"); return; }
+        if(!flowId){ reject({message:"missing flow id"}); return; }
+        if(!Bcp008Monitor.instance){ reject({message:"BCP-008 monitoring is not running"}); return; }
         Bcp008Monitor.instance.resetCounters(flowId).then((ok)=>{
             if(ok){
                 SyncLog.log("info", "BCP-008", "Counters reset for flow " + flowId + " by " + client.user + ".");
                 resolve({message:200, data:{ ok:true }});
             }else{
-                reject("no monitor for this flow");
+                reject({message:"no monitor for this flow"});
             }
-        }).catch((e)=>reject("counter reset failed: " + (e?.message || e)));
+        }).catch((e)=>reject({message:"counter reset failed: " + (e?.message || e)}));
     });
 });
 
