@@ -550,7 +550,9 @@ server.startServer(serverAddress, serverPort);
 // do not depend on the whole manifest set being pushed to every client.
 server.addRoute("GET", "senderSdp","global", (client: WebsocketClient, query:string[]) => {
     return new Promise((resolve, reject) => {
-        let senderId = query[0];
+        // Accept either the bare IS-04 UUID or a crosspoint-namespaced id, so
+        // the UI can pass the flow id it already has.
+        let senderId = nmosIdFromCrosspointId(query[0] || "");
         if(!senderId){
             reject("missing sender id");
             return;

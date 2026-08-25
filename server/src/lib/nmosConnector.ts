@@ -368,6 +368,11 @@ export class NmosRegistryConnector {
         if (this.syncNmosTimer != null) return;
         this.syncNmosTimer = setTimeout(() => {
             this.syncNmosTimer = null;
+            try {
+                // Recomputed on publish so the UI never annotates stale
+                // conflicts against fresh transport params.
+                this.nmosState.multicastConflicts = this.getMulticastConflicts();
+            } catch (e) {}
             try { this.syncNmos.setState(this.nmosState); } catch (e) {}
         }, 80);
     }
@@ -447,6 +452,8 @@ export class NmosRegistryConnector {
         flows: {},
         nodes: {},
         senderActiveData:{},
+        // address -> sender ids claiming it, only where more than one does.
+        multicastConflicts:{},
         channelmapping:{},
         sendersManifestDetail :{}
     };
@@ -956,9 +963,14 @@ export class NmosRegistryConnector {
                         try{
                             let response = await axios.get(href);
                             this.nmosState.senderActiveData[senderId] = response.data;
-                            return;
+                            // NOTE this used to `return` here, so a SUCCESSFUL
+                            // fetch skipped the publish below and the new active
+                            // data sat unpublished until some unrelated event
+                            // came along. Break instead, so the store is always
+                            // followed by a publish.
+                            break;
                         }catch(e){
-                            SyncLog.log("warn", "NMOS", "Can not get active configuration of sender:",{error: e.message, href : href});
+                            SyncLog.log("warning", "NMOS", "Can not get active configuration of sender:",{error: e.message, href : href});
                         }
                     }
 
@@ -1055,6 +1067,48 @@ export class NmosRegistryConnector {
     private stripSdpAddress(ip:any): string{
         if(typeof ip != "string"){ return ""; }
         return ip.split("/")[0].trim();
+    }
+
+    /**
+     * Multicast addresses in use by more than one active sender leg.
+     *
+     * Two senders on the same group address is a real fault that is otherwise
+     * invisible until a receiver shows the wrong picture, so it is computed
+     * from the IS-05 ACTIVE transport parameters rather than from the SDP:
+     * the active params are what the device is really transmitting on.
+     *
+     * Returns a map of address -> the sender ids claiming it, only for
+     * addresses claimed more than once. Cheap enough to recompute on publish
+     * (one pass over active senders), so there is no cache to invalidate.
+     */
+    public getMulticastConflicts(): { [address: string]: string[] } {
+        const byAddress: { [address: string]: string[] } = {};
+        try {
+            const active = this.nmosState.senderActiveData || {};
+            for (const senderId in active) {
+                // An inactive sender is not transmitting, so it cannot conflict.
+                if (active[senderId]?.master_enable === false) { continue; }
+                const params = active[senderId]?.transport_params;
+                if (!Array.isArray(params)) { continue; }
+                for (const p of params) {
+                    // rtp_enabled === false marks a disabled 2022-7 leg.
+                    if (p?.rtp_enabled === false) { continue; }
+                    const ip = this.stripSdpAddress(p?.destination_ip);
+                    // "auto" means the device has not been told an address yet.
+                    if (!ip || ip === "auto") { continue; }
+                    if (!byAddress[ip]) { byAddress[ip] = []; }
+                    if (!byAddress[ip].includes(senderId)) { byAddress[ip].push(senderId); }
+                }
+            }
+        } catch (e) { return {}; }
+
+        const conflicts: { [address: string]: string[] } = {};
+        for (const ip in byAddress) {
+            // Several legs of the SAME sender on one address is odd but not a
+            // cross-device clash, so only report distinct senders.
+            if (byAddress[ip].length > 1) { conflicts[ip] = byAddress[ip]; }
+        }
+        return conflicts;
     }
 
     /**

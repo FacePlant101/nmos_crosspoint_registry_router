@@ -7,7 +7,8 @@
        VideoCamera, Microphone, SpeakerWave, Tv,
        ArrowRightStartOnRectangle, ArrowLeftEndOnRectangle,
        CodeBracketSquare,
-       BarsArrowDown, BarsArrowUp, ArrowUturnLeft, CodeBracket
+       BarsArrowDown, BarsArrowUp, ArrowUturnLeft, CodeBracket,
+      DocumentText
      } from "svelte-hero-icons";
     import SetupFlow from "../lib/SetupFlow.svelte";
     import SetupDevice from "../lib/SetupDevice.svelte";
@@ -488,7 +489,77 @@
       }
 
 
-  </script>
+  
+  // ----- SDP viewer -----
+  // The raw manifest is fetched on demand via the senderSdp route rather than
+  // read out of the broadcast nmos channel, so opening one sender's SDP costs
+  // one request instead of every client carrying every manifest.
+  let sdpModal: any;
+  let sdpModalFlow: any = null;
+  let sdpModalText = "";
+  let sdpModalBusy = false;
+
+  async function openSdp(flow: any) {
+    sdpModalFlow = flow;
+    sdpModalText = "";
+    sdpModalBusy = true;
+    sdpModal.showModal();
+    try {
+      const res: any = await ServerConnector.get("senderSdp/" + flow.id);
+      sdpModalText = res?.data?.raw ?? "";
+    } catch (e: any) {
+      sdpModalText = "";
+      ServerConnector.addFeedback({ level: "error", message: "Could not load SDP: " + (e?.message ?? e) });
+    } finally {
+      sdpModalBusy = false;
+    }
+  }
+
+  async function copySdp() {
+    try {
+      await navigator.clipboard.writeText(sdpModalText);
+      ServerConnector.addFeedback({ level: "success", message: "SDP copied to the clipboard." });
+    } catch (e) {
+      ServerConnector.addFeedback({ level: "error", message: "The browser refused clipboard access." });
+    }
+  }
+
+  function downloadSdp() {
+    // Object URL rather than a data: URI so a large manifest is not capped by
+    // URL length limits.
+    const blob = new Blob([sdpModalText], { type: "application/sdp" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (sdpModalFlow?.alias || "sender").replace(/[^A-Za-z0-9._-]/g, "_") + ".sdp";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // ----- Duplicate multicast detection -----
+  // The server computes clashes from the IS-05 ACTIVE transport params (what
+  // devices are really transmitting on), keyed by address. Two senders on one
+  // group address is otherwise invisible until a receiver shows the wrong
+  // picture, so the offending leg is flagged right where its address is shown.
+  function dupSenders(address: string, selfFlowId: string): string[] {
+    try {
+      const claimers: string[] = nmosState.multicastConflicts?.[address] ?? [];
+      if (claimers.length < 2) return [];
+      const selfNmosId = selfFlowId.startsWith("nmos_") ? selfFlowId.substring(5) : selfFlowId;
+      // Name the OTHER senders — the operator already knows which row they are on.
+      return claimers.filter((id) => id !== selfNmosId);
+    } catch (e) { return []; }
+  }
+
+  function dupLabel(ids: string[]): string {
+    const names = ids.map((id) => {
+      try { return nmosState.senders?.[id]?.label || id.substring(0, 8); } catch (e) { return id.substring(0, 8); }
+    });
+    return "Also used by: " + names.join(", ");
+  }
+</script>
   
 
   <div class="content-container">
@@ -680,6 +751,11 @@
                                       </span>
                                       {#if !flow.manifestOk}
                                         <span class="text-error">No Manifest Loaded</span>
+                                      {:else}
+                                        <button on:click={()=>openSdp(flow)} class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="view SDP">
+                                          <Icon src={DocumentText}></Icon>
+                                        </button>
                                       {/if}
                                     {/if}
 
@@ -695,10 +771,18 @@
 
                                     {#if col.id == "flow"}
                                       {#each getSenderSettings(flow) as settings}
-                                        <div>
-                                          <!--<span>{settings.name} : </span>-->
-                                          <span>Dst: {settings.dstIp} Src: {settings.srcIp}</span>
-                                        </div>
+                                        {#each [dupSenders(settings.dstIp, flow.id)] as dups}
+                                          <div>
+                                            <!--<span>{settings.name} : </span>-->
+                                            <span class={dups.length > 0 ? "mc-dup" : ""}
+                                              use:OverlayMenuService.tooltip
+                                              data-tooltip={dups.length > 0 ? dupLabel(dups) : ""}
+                                              >Dst: {settings.dstIp} Src: {settings.srcIp}</span>
+                                            {#if dups.length > 0}
+                                              <span class="mc-dup-badge">duplicate</span>
+                                            {/if}
+                                          </div>
+                                        {/each}
                                       {/each}
                                     {/if}
 
@@ -797,6 +881,30 @@
     </div>
   </dialog>
 
+
+  <dialog bind:this={sdpModal} class="modal">
+    <div class="modal-box" style="max-width:52rem;">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">SDP manifest</h3>
+      {#if sdpModalFlow}
+        <p class="sdp-flow-name">{sdpModalFlow.alias}</p>
+      {/if}
+      {#if sdpModalBusy}
+        <p>Loading…</p>
+      {:else if sdpModalText == ""}
+        <p class="text-error">No SDP available for this sender.</p>
+      {:else}
+        <pre class="sdp-body">{sdpModalText}</pre>
+      {/if}
+      <div class="modal-action">
+        <button class="btn btn-sm" disabled={sdpModalText == ""} on:click={copySdp}>Copy</button>
+        <button class="btn btn-sm" disabled={sdpModalText == ""} on:click={downloadSdp}>Download</button>
+        <form method="dialog"><button class="btn btn-sm">Close</button></form>
+      </div>
+    </div>
+  </dialog>
 
   <dialog bind:this={labelModal} class="modal">
     <div class="modal-box">
