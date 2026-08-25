@@ -8,7 +8,7 @@
        ArrowRightStartOnRectangle, ArrowLeftEndOnRectangle,
        CodeBracketSquare,
        BarsArrowDown, BarsArrowUp, ArrowUturnLeft, CodeBracket,
-      DocumentText
+      DocumentText, ArrowTopRightOnSquare, Trash
      } from "svelte-hero-icons";
     import SetupFlow from "../lib/SetupFlow.svelte";
     import SetupDevice from "../lib/SetupDevice.svelte";
@@ -559,6 +559,37 @@
     });
     return "Also used by: " + names.join(", ");
   }
+
+  // ----- Forget offline devices and flows -----
+  // The server already supports a "delete" crosspoint change, which drops the
+  // shadow entry and its aliases. It was never reachable from the UI, so an
+  // offline device stayed in the matrix forever. Only offered while something
+  // is unavailable — forgetting a live device would just be re-discovered.
+  let forgetModal: any;
+  let forgetTarget: any = null;      // { kind, devId, flowId, label }
+
+  function askForget(kind: "device" | "flow", devId: string, flowId: string, label: string) {
+    forgetTarget = { kind, devId, flowId, label };
+    forgetModal.showModal();
+  }
+
+  async function confirmForget() {
+    if (!forgetTarget) return;
+    const t = forgetTarget;
+    try {
+      await ServerConnector.post("crosspoint", {
+        action: "delete",
+        devId: t.devId,
+        // "" means the whole device; the worker branches on it.
+        flowId: t.kind === "device" ? "" : t.flowId,
+      });
+      ServerConnector.addFeedback({ level: "success", message: "Forgot " + t.label + "." });
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not forget " + t.label + ": " + (e?.message ?? e) });
+    } finally {
+      forgetTarget = null;
+    }
+  }
 </script>
   
 
@@ -664,7 +695,16 @@
                             {/if}
 
                             {#if col.id == "available"}
-                            <div class="badge badge-{ dev.available ? "success" : "error"} badge-sm"></div>
+                            <div class="badge badge-{ dev.available ? "success" : "error"} badge-sm"
+                              use:OverlayMenuService.tooltip
+                              data-tooltip={dev.available ? "online" : "offline"}></div>
+                            {#if !dev.available}
+                              <button class="btn btn-round btn-hover forget-btn"
+                                on:click={(e)=>{e.stopPropagation(); askForget("device", dev.id, "", dev.alias || dev.name || dev.id);}}
+                                use:OverlayMenuService.tooltip data-tooltip="forget this offline device">
+                                <Icon src={Trash}></Icon>
+                              </button>
+                            {/if}
                             {/if}
 
                             {#if col.id == "name"}
@@ -680,6 +720,14 @@
 
                             {#if col.id == "info"}
                             {renderId(dev.id)}
+                            {#if dev.deviceUrl}
+                              <a href={dev.deviceUrl} target="_blank" rel="noopener noreferrer"
+                                 class="btn btn-round btn-hover" on:click={(e)=>e.stopPropagation()}
+                                 use:OverlayMenuService.tooltip
+                                 data-tooltip="Open device web UI: {dev.deviceUrl}">
+                                <Icon src={ArrowTopRightOnSquare}></Icon>
+                              </a>
+                            {/if}
                             {/if}
 
                         </td>
@@ -705,7 +753,16 @@
                                     {/if}
 
                                     {#if col.id == "available"}
-                                    <div class="badge badge-{ flow.available ? (flow.manifestOk ? "success" : "warning") : "error"} badge-sm"></div>
+                                    <div class="badge badge-{ flow.available ? (flow.manifestOk ? "success" : "warning") : "error"} badge-sm"
+                                      use:OverlayMenuService.tooltip
+                                      data-tooltip={flow.available ? (flow.manifestOk ? "online" : "online, no manifest") : "offline"}></div>
+                                    {#if !flow.available}
+                                      <button class="btn btn-round btn-hover forget-btn"
+                                        on:click={(e)=>{e.stopPropagation(); askForget("flow", dev.id, flow.id, flow.alias || flow.name || flow.id);}}
+                                        use:OverlayMenuService.tooltip data-tooltip="forget this offline flow">
+                                        <Icon src={Trash}></Icon>
+                                      </button>
+                                    {/if}
                                     {/if}
 
                                     {#if col.id == "name"}
@@ -881,6 +938,26 @@
     </div>
   </dialog>
 
+
+  <dialog bind:this={forgetModal} class="modal">
+    <div class="modal-box">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">Forget {forgetTarget?.kind ?? ""}</h3>
+      <p>
+        Remove <strong>{forgetTarget?.label ?? ""}</strong> and its aliases from the
+        crosspoint. If the {forgetTarget?.kind ?? "item"} comes back online it will be
+        rediscovered as new, without its number or alias.
+      </p>
+      <div class="modal-action">
+        <form method="dialog">
+          <button class="btn btn-sm btn-error" on:click={confirmForget}>Forget</button>
+          <button class="btn btn-sm">Cancel</button>
+        </form>
+      </div>
+    </div>
+  </dialog>
 
   <dialog bind:this={sdpModal} class="modal">
     <div class="modal-box" style="max-width:52rem;">

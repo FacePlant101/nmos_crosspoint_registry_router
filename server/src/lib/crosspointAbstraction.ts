@@ -1087,6 +1087,87 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         }
     }
     
+    /** Re-publish the current state with enrichment recomputed.
+     *
+     *  Needed when something the enrichment depends on changes without the
+     *  worker producing new state — editing the Web-UI link profiles in Setup
+     *  is exactly that case, and without this the links stayed stale until
+     *  some unrelated device event came along. */
+    public republishForSettingsChange() {
+        try { this.republishEnriched(); } catch (e) {}
+    }
+
+    /** Resolve the "open device web UI" link for one crosspoint device.
+     *
+     *  Two sources, in order of authority:
+     *    1. A webui control the device itself advertises. That is the device
+     *       telling us where its UI lives, so it always wins — this tree
+     *       already sees urn:x-matrox:cip:webui on Matrox ConvertIP.
+     *    2. Otherwise the first configured vendor profile whose comma-separated
+     *       labels substring-match the NMOS node label, combined with the host
+     *       the node advertises. Matching on the NODE label (not the device
+     *       label) is what makes one profile cover a whole product family.
+     *
+     *  Returns "" when nothing matches, which the UI reads as "no link".
+     */
+    private resolveDeviceUrl(crosspointDeviceId: string): string {
+        try {
+            const nmosDeviceId = nmosIdFromCrosspointId(crosspointDeviceId);
+            const device = this.nmosState?.devices?.[nmosDeviceId];
+            if (!device) return "";
+
+            // 1. An explicit webui control from the device itself.
+            const controls = Array.isArray(device.controls) ? device.controls : [];
+            for (const c of controls) {
+                if (typeof c?.type === "string" && c.type.includes("webui")
+                    && typeof c?.href === "string" && c.href.startsWith("http")) {
+                    return c.href;
+                }
+            }
+
+            // 2. Vendor profile matched against the node label.
+            const node = this.nmosState?.nodes?.[device.node_id];
+            const label = ("" + (node?.label || device?.label || "")).toLowerCase();
+            if (!label) return "";
+
+            // Prefer the API endpoint host — node.href can carry a port that
+            // belongs to the NMOS API rather than the device's own web UI.
+            let host = "";
+            try {
+                const ep = node?.api?.endpoints?.[0];
+                if (ep?.host) { host = "" + ep.host; }
+            } catch (e) {}
+            if (!host) {
+                try {
+                    const m = ("" + (node?.href || "")).match(/^https?:\/\/([^\/:]+)/);
+                    if (m) { host = m[1]; }
+                } catch (e) {}
+            }
+            if (!host) return "";
+
+            const profiles = Array.isArray(this.settings?.vendorProfiles) ? this.settings.vendorProfiles : [];
+            for (const prof of profiles) {
+                const needles = ("" + (prof?.labels || "")).split(",")
+                    .map((x: string) => x.trim().toLowerCase())
+                    .filter((x: string) => x.length > 0);
+                if (needles.length === 0) continue;
+                // First match wins, so profile order is the operator's priority.
+                if (!needles.some((n: string) => label.includes(n))) continue;
+
+                const protocol = (prof.protocol === "https") ? "https" : "http";
+                const port = Number(prof.port) || (protocol === "https" ? 443 : 80);
+                let path = ("" + (prof.path || "/"));
+                if (!path.startsWith("/")) { path = "/" + path; }
+                // Leave the default port off, so the link reads like one a
+                // person would type.
+                const portPart = ((protocol === "https" && port === 443) || (protocol === "http" && port === 80))
+                    ? "" : ":" + port;
+                return protocol + "://" + host + portPart + path;
+            }
+        } catch (e) {}
+        return "";
+    }
+
     /** Fold BCP-008 status into the crosspoint state and publish it.
      *
      *  The worker thread builds the state and knows nothing about BCP-008, so
@@ -1125,6 +1206,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 }
                 (dev as any).monitorSummaryTx = worstTx;
                 (dev as any).monitorSummaryRx = worstRx;
+                (dev as any).deviceUrl = this.resolveDeviceUrl(dev.id);
             }
         } catch (e) {
             SyncLog.log("error", "crosspoint", "Failed to fold BCP-008 status into crosspoint state", e);
@@ -1284,6 +1366,9 @@ export interface CrosspointDevice {
      *  so a collapsed node band can be coloured without walking its flows. */
     monitorSummaryTx?: number,
     monitorSummaryRx?: number,
+
+    /** Resolved "open device web UI" link, or "" when nothing matched. */
+    deviceUrl?: string,
     
   }
 export interface CrosspointState {

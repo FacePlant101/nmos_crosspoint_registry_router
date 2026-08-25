@@ -29,6 +29,10 @@
     let saving = false;
     let restartRequired = false;
 
+    // Device Web-UI link profiles. Edited as a list rather than folded into
+    // `form`, because rows are added and removed as well as changed.
+    let profiles: any[] = [];
+
     // Credential form is deliberately not part of `form` — it posts to its
     // own route and must never be included in a settings save.
     let cred = { currentUsername: "", currentPassword: "", newUsername: "", newPassword: "", newPassword2: "" };
@@ -53,6 +57,8 @@
         if (!cred.currentUsername && Array.isArray(s.auth?.users) && s.auth.users.length > 0) {
             cred.currentUsername = s.auth.users[0];
         }
+        // Deep copy so edits do not mutate the synced state in place.
+        profiles = (s.vendorProfiles ?? []).map((v: any) => ({ ...v }));
         dirty = false;
     }
 
@@ -106,6 +112,14 @@
                     domain: form.dnssdDomain.trim(),
                 },
                 debugLogs: !!form.debugLogs,
+                vendorProfiles: profiles.map((v) => ({
+                    id: v.id,
+                    name: v.name ?? "",
+                    labels: v.labels ?? "",
+                    protocol: v.protocol === "https" ? "https" : "http",
+                    port: Number(v.port) || 80,
+                    path: v.path || "/",
+                })),
             };
             const res: any = await ServerConnector.post("setupConfig", payload);
             dirty = false;
@@ -126,6 +140,30 @@
 
     function revert() {
         loadForm(state);
+    }
+
+    function addProfile() {
+        profiles = [...profiles, {
+            id: "v_" + Math.random().toString(36).slice(2, 8),
+            name: "", labels: "", protocol: "http", port: 80, path: "/",
+        }];
+        touch();
+    }
+
+    function removeProfile(id: string) {
+        profiles = profiles.filter((p) => p.id !== id);
+        touch();
+    }
+
+    // Order is priority — first match wins on the server — so rows need to be
+    // movable, not just editable.
+    function moveProfile(index: number, delta: number) {
+        const next = index + delta;
+        if (next < 0 || next >= profiles.length) return;
+        const copy = [...profiles];
+        [copy[index], copy[next]] = [copy[next], copy[index]];
+        profiles = copy;
+        touch();
     }
 
     async function saveCredentials() {
@@ -310,6 +348,58 @@
                     Applies immediately. The <code>DEBUG_LOGS</code> environment variable
                     overrides this at startup.
                 </p>
+            </section>
+
+            <section class="setup-section setup-section-wide">
+                <h3>Device Web UI links</h3>
+                <p class="setup-hint">
+                    Builds the "open device web UI" link on the Details page. Labels are
+                    matched as comma-separated substrings against the NMOS <em>node</em>
+                    label, and the first matching row wins — so order is priority. A webui
+                    control advertised by the device itself always takes precedence over
+                    these.
+                </p>
+                <table class="vp-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th><th>Labels match</th><th>Proto</th>
+                            <th>Port</th><th>Path</th><th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {#each profiles as prof, i (prof.id)}
+                            <tr>
+                                <td><input class="input input-bordered input-xs" type="text"
+                                    bind:value={prof.name} on:input={touch} /></td>
+                                <td><input class="input input-bordered input-xs vp-labels" type="text"
+                                    placeholder="Matrox, ConvertIP"
+                                    bind:value={prof.labels} on:input={touch} /></td>
+                                <td>
+                                    <select class="select select-bordered select-xs"
+                                        bind:value={prof.protocol} on:change={touch}>
+                                        <option value="http">http</option>
+                                        <option value="https">https</option>
+                                    </select>
+                                </td>
+                                <td><input class="input input-bordered input-xs vp-port" type="number"
+                                    min="1" max="65535" bind:value={prof.port} on:input={touch} /></td>
+                                <td><input class="input input-bordered input-xs vp-path" type="text"
+                                    bind:value={prof.path} on:input={touch} /></td>
+                                <td class="vp-actions">
+                                    <button class="btn btn-xs" disabled={i === 0}
+                                        on:click={()=>moveProfile(i,-1)} title="move up">↑</button>
+                                    <button class="btn btn-xs" disabled={i === profiles.length-1}
+                                        on:click={()=>moveProfile(i,1)} title="move down">↓</button>
+                                    <button class="btn btn-xs btn-error"
+                                        on:click={()=>removeProfile(prof.id)} title="remove">✕</button>
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+                <div class="setup-row">
+                    <button class="btn btn-sm" on:click={addProfile}>Add profile</button>
+                </div>
             </section>
 
             <section class="setup-section">

@@ -70,6 +70,47 @@ export function parseSettings(settings:any){
         }
     }
 
+    // Device Web-UI link profiles. Matched by substring against the NMOS node
+    // label, first match wins, so the array order is the operator's priority.
+    // A webui control advertised by the device itself always outranks these.
+    const defaultVendorProfiles = [
+        { id:"matrox",      name:"Matrox ConvertIP", labels:"Matrox, ConvertIP",   protocol:"https", port:443, path:"/" },
+        { id:"embrionix",   name:"Riedel Embrionix", labels:"Embrionix",           protocol:"https", port:443, path:"/" },
+        { id:"riedel",      name:"Riedel",           labels:"Riedel",              protocol:"http",  port:80,  path:"/" },
+        { id:"lawo",        name:"Lawo",             labels:"Lawo",                protocol:"http",  port:80,  path:"/" },
+        { id:"aja",         name:"AJA",              labels:"AJA",                 protocol:"http",  port:80,  path:"/" },
+        { id:"imagine",     name:"Imagine",          labels:"Imagine",             protocol:"http",  port:80,  path:"/" },
+        { id:"sony",        name:"Sony",             labels:"Sony",                protocol:"http",  port:80,  path:"/" },
+        { id:"grassvalley", name:"Grass Valley",     labels:"Grass Valley",        protocol:"http",  port:80,  path:"/" },
+        { id:"blackmagic",  name:"Blackmagic",       labels:"Blackmagic",          protocol:"http",  port:80,  path:"/admin" },
+        { id:"merging",     name:"Merging",          labels:"Anubis, Hapi, Horus", protocol:"http",  port:80,  path:"/advanced" },
+        { id:"directout",   name:"DirectOut",        labels:"ExBox",               protocol:"http",  port:80,  path:"/" },
+        { id:"qsc",         name:"QSC",              labels:"Core",                protocol:"http",  port:80,  path:"/" },
+        { id:"netgear",     name:"NETGEAR M4350",    labels:"M4350",               protocol:"http",  port:80,  path:"/" }
+    ];
+    if(!Array.isArray(settings.vendorProfiles)){
+        settings.vendorProfiles = defaultVendorProfiles;
+    }else{
+        settings.vendorProfiles = settings.vendorProfiles
+            .filter((v:any) => v && typeof v === "object")
+            .map((v:any) => {
+                let port = parseInt(""+v.port);
+                if(isNaN(port) || port <= 0 || port > 65535){ port = 80; }
+                let protocol = (""+v.protocol).toLowerCase();
+                if(protocol !== "http" && protocol !== "https"){ protocol = "http"; }
+                let path = (typeof v.path === "string" && v.path) ? v.path : "/";
+                if(!path.startsWith("/")){ path = "/" + path; }
+                return {
+                    id: (typeof v.id === "string" && v.id) ? v.id : ("v_" + Math.random().toString(36).slice(2,8)),
+                    name: (typeof v.name === "string") ? v.name : "",
+                    labels: (typeof v.labels === "string") ? v.labels : "",
+                    protocol,
+                    port,
+                    path
+                };
+            });
+    }
+
     // BCP-008 status monitoring. Read-only IS-12 client, on by default.
     if(!settings.hasOwnProperty("bcp008") || typeof settings.bcp008 !== "object" || settings.bcp008 === null){
         settings.bcp008 = { enabled: true };

@@ -273,6 +273,9 @@ function getSetupConfigState() {
         predictiveStaging,
         // Read-only IS-12 status monitoring; absent means on.
         bcp008: { enabled: !(settings.bcp008 && settings.bcp008.enabled === false) },
+        vendorProfiles: Array.isArray(settings.vendorProfiles)
+            ? settings.vendorProfiles.map((v:any) => ({...v}))
+            : [],
         registryDiscovery: {
             unicastDnssd: !(settings.registryDiscovery && settings.registryDiscovery.unicastDnssd === false),
             domain: (settings.registryDiscovery && typeof settings.registryDiscovery.domain === "string") ? settings.registryDiscovery.domain : ""
@@ -414,6 +417,45 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                     }
                     settings.registryDiscovery.domain = d;
                 }
+            }
+
+            // --- Device Web-UI link profiles. Replaced wholesale, then
+            // re-normalised by parseSettings so the stored shape is canonical
+            // no matter what the client sent.
+            if(postData.hasOwnProperty("vendorProfiles")){
+                if(!Array.isArray(postData.vendorProfiles)){
+                    reject({message:"vendorProfiles must be an array."});
+                    return;
+                }
+                if(postData.vendorProfiles.length > 200){
+                    reject({message:"Too many vendor profiles (limit 200)."});
+                    return;
+                }
+                for(const v of postData.vendorProfiles){
+                    if(!v || typeof v !== "object"){
+                        reject({message:"Each vendor profile must be an object."});
+                        return;
+                    }
+                    let port = parseInt("" + v.port);
+                    if(isNaN(port) || port < 1 || port > 65535){
+                        reject({message:"Vendor profile port must be between 1 and 65535."});
+                        return;
+                    }
+                    if(v.protocol !== "http" && v.protocol !== "https"){
+                        reject({message:"Vendor profile protocol must be http or https."});
+                        return;
+                    }
+                    if(typeof v.path === "string" && /[\s"'<>]/.test(v.path)){
+                        reject({message:"Vendor profile path contains invalid characters."});
+                        return;
+                    }
+                }
+                settings.vendorProfiles = postData.vendorProfiles;
+                // Re-run the normaliser over just this key.
+                settings = parseSettings(settings);
+                // Device links are computed during enrichment, so without a
+                // republish they stay stale until an unrelated device event.
+                try{ crosspoint.republishForSettingsChange(); }catch(e){}
             }
 
             // --- Debug logging applies immediately.

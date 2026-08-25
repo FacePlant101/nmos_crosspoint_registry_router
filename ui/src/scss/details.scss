@@ -40,3 +40,10 @@
     background-color: hsl(var(--er) / 0.2);
     color: hsl(var(--er));
 }
+
+// The Forget button sits next to the online/offline badge and only appears for
+// unavailable rows, so it must not push the badge around when it shows up.
+.forget-btn {
+    margin-left: 0.25rem;
+    vertical-align: middle;
+}
