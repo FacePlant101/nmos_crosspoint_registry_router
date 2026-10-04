@@ -209,30 +209,41 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         // Request current alias state from worker thread
         return new Promise((resolve) => {
             const requestId = Math.random().toString(36).substring(7);
+            let timeout: any = null;
 
-            // Set up listener for response
-            const messageHandler = (event: MessageEvent) => {
+            // NOTE this listener was written against the browser Worker API:
+            // addEventListener/removeEventListener with an event object
+            // carrying .data. `this.worker` is a Node worker_threads Worker,
+            // which uses on/off and hands the posted value straight to the
+            // handler. Calling addEventListener threw immediately, so this
+            // migration never ran once — it only ever logged
+            // "this.worker.addEventListener is not a function".
+            const messageHandler = (message: any) => {
                 try {
-                    const data = JSON.parse(event.data);
+                    const data = JSON.parse(message);
                     if (data.aliasStateResponse && data.requestId === requestId) {
-                        this.worker.removeEventListener('message', messageHandler);
+                        this.worker.off('message', messageHandler);
+                        if (timeout) { clearTimeout(timeout); timeout = null; }
                         this.processAliasMigration(data.aliasState).then(resolve);
                     }
                 } catch (e) {
-                    // Ignore parsing errors
+                    // Every worker message passes through here, so anything
+                    // that is not our response is simply not ours to handle.
                 }
             };
 
-            this.worker.addEventListener('message', messageHandler);
+            this.worker.on('message', messageHandler);
 
             // Request alias state
             this.worker.postMessage(JSON.stringify({
                 requestAliasState: { requestId }
             }));
 
-            // Timeout after 5 seconds
-            setTimeout(() => {
-                this.worker.removeEventListener('message', messageHandler);
+            // Give up after 5 seconds rather than leaving the caller hanging
+            // if the worker is restarting and never answers.
+            timeout = setTimeout(() => {
+                this.worker.off('message', messageHandler);
+                SyncLog.log("warning", "alias", "Timed out waiting for the worker's alias state; migration skipped this run.");
                 resolve();
             }, 5000);
         });
