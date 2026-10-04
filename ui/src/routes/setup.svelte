@@ -192,9 +192,15 @@
     // the safe one and make the other an explicit choice.
     let adoptExisting = true;
 
+    // The click is intercepted with preventDefault so that enabling can ask the
+    // adopt-or-renew question BEFORE the toggle moves. That means this handler
+    // owns the state in both directions: the browser will not flip the checkbox
+    // for us, so forgetting to assign here left the toggle permanently stuck on.
     function askEnableMulticast() {
         if (form.autoMulticast) {
-            // Turning it OFF needs no question — nothing is repointed.
+            // Turning it OFF repoints nothing, so it needs no question — but it
+            // does still need the assignment the preventDefault suppressed.
+            form.autoMulticast = false;
             touch();
             return;
         }
