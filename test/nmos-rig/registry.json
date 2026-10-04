@@ -1,0 +1,6 @@
+{
+  "logging_level": 0,
+  "label": "rig-registry",
+  "http_port": 8080,
+  "domain": "local."
+}

@@ -378,6 +378,39 @@ export class NmosRegistryConnector {
         }, 80);
     }
 
+    // Senders with an active-data fetch already pending, so a burst of events
+    // cannot stack several retry chains on one sender.
+    private activeRetryPending: { [senderId: string]: boolean } = {};
+
+    /**
+     * Retry a failed IS-05 active fetch with a short backoff.
+     *
+     * Bounded at three attempts: beyond that the device is not merely busy, and
+     * the 30 s lease sweep will pick it up anyway.
+     */
+    private scheduleActiveRetry(senderId: string, hrefs: string[], attempt: number) {
+        if (attempt > 3) { return; }
+        if (this.activeRetryPending[senderId]) { return; }
+        this.activeRetryPending[senderId] = true;
+
+        setTimeout(async () => {
+            this.activeRetryPending[senderId] = false;
+            // The sender may have gone away while we waited.
+            if (!this.nmosState.senders?.[senderId]) { return; }
+            for (const href of hrefs) {
+                try {
+                    const response = await axios.get(href);
+                    this.nmosState.senderActiveData[senderId] = response.data;
+                    try { this.reconcileSenderWithLease(senderId); } catch (e) {}
+                    this.scheduleSyncNmos();
+                    this.updateCrosspoint();
+                    return;
+                } catch (e) { /* try the next href, then re-schedule below */ }
+            }
+            this.scheduleActiveRetry(senderId, hrefs, attempt + 1);
+        }, 1000 * attempt);
+    }
+
     /** Raw + parsed SDP for one sender, for the UI's SDP viewer and the audio
      *  monitor. Reading it on demand keeps single-sender lookups off the
      *  broadcast channel. */
@@ -942,16 +975,22 @@ export class NmosRegistryConnector {
                         sender = g.post;
                         device = this.nmosState.devices[sender.device_id];
 
-                        device.controls.forEach((c)=>{
-                            if(c.type == "urn:x-nmos:control:sr-ctrl/v1.0" ){
-                                let href = c.href;
-                                if(href[href.length-1] != "/"){
-                                    href += "/";
+                        // Prefer v1.1 and fall back to v1.0, the same order
+                        // setFlowMulticast uses. This only accepted v1.0, so a
+                        // device advertising both was pinned to the older API
+                        // for reads while being written through the newer one.
+                        for(const wanted of ["urn:x-nmos:control:sr-ctrl/v1.1", "urn:x-nmos:control:sr-ctrl/v1.0"]){
+                            device.controls.forEach((c)=>{
+                                if(c.type == wanted){
+                                    let href = c.href;
+                                    if(href[href.length-1] != "/"){
+                                        href += "/";
+                                    }
+                                    href += "single/senders/"+senderId+"/active/";
+                                    active_href.push(href)
                                 }
-                                href += "single/senders/"+senderId+"/active/";
-                                active_href.push(href)
-                            }
-                        });
+                            });
+                        }
                         
                         
                     }catch(e){}
@@ -960,6 +999,7 @@ export class NmosRegistryConnector {
                         SyncLog.log("warn", "NMOS", "Can not get active configuration of sender, no controls available.")
                     }
 
+                    let gotActive = false;
                     for(let href of active_href){
                         try{
                             let response = await axios.get(href);
@@ -972,10 +1012,24 @@ export class NmosRegistryConnector {
                             // data sat unpublished until some unrelated event
                             // came along. Break instead, so the store is always
                             // followed by a publish.
+                            gotActive = true;
                             break;
-                        }catch(e){
-                            SyncLog.log("warning", "NMOS", "Can not get active configuration of sender:",{error: e.message, href : href});
+                        }catch(e:any){
+                            // 409 Conflict means the device is mid-activation —
+                            // which this controller itself causes when a lease
+                            // sweep PATCHes several senders at once. Treating it
+                            // as fatal left those senders with no active data
+                            // until some unrelated event came along, so retry
+                            // transient failures a few times before giving up.
+                            const status = e?.response?.status;
+                            const transient = (status === 409 || status === 423 || status === 503 || status === undefined);
+                            SyncLog.log(transient ? "verbose" : "warning", "NMOS",
+                                "Can not get active configuration of sender:",
+                                {error: e.message, status, href});
                         }
+                    }
+                    if(!gotActive && active_href.length > 0){
+                        this.scheduleActiveRetry(senderId, active_href, 1);
                     }
 
                     this.scheduleSyncNmos();

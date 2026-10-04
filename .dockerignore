@@ -27,3 +27,6 @@ server/public
 docker-compose*.yml
 nmos_secrets.yml
 **/.DS_Store
+
+# Throwaway NMOS test rig; never part of an image.
+test
