@@ -1199,6 +1199,23 @@ export class NmosRegistryConnector {
         };
     }
 
+    // How many times in a row we will try to move one sender onto its leased
+    // address before backing off, and how long we then wait.
+    //
+    // A device can refuse to converge for reasons we cannot fix from here: it
+    // rejects the PATCH, or accepts it and keeps reporting a different
+    // destination_ip. Without a limit the 30 s sweep re-PATCHes such a sender
+    // forever, and every apparent success also re-executes all its receivers.
+    // The back-off is a long retry rather than a permanent stop, so a device
+    // that recovers (reboot, firmware fix, config change) heals on its own
+    // without needing a server restart.
+    private static readonly LEASE_APPLY_MAX_ATTEMPTS = 5;
+    private static readonly LEASE_APPLY_COOLDOWN_MS = 10 * 60 * 1000;
+
+    // Per sender: which address pair we were driving towards, how many
+    // consecutive attempts have failed to stick, and when to try again.
+    private leaseApplyState: { [senderId: string]: { key: string, attempts: number, nextAttemptAt: number } } = {};
+
     /**
      * Bring one sender's addresses in line with its lease.
      *
@@ -1234,7 +1251,39 @@ export class NmosRegistryConnector {
             if (have !== want) { legs.push({ index, multicast: want }); }
         });
 
-        if (legs.length === 0) return;
+        if (legs.length === 0) {
+            // Converged. Forget any past trouble so a future change to this
+            // sender starts with a clean budget.
+            delete this.leaseApplyState[senderId];
+            return;
+        }
+
+        // The target is the pair we are trying to reach. A manual override, a
+        // release or a re-allocation changes it, and that is a new intent —
+        // it must not inherit the previous target's exhausted budget.
+        const key = desired.primaryIp + "|" + desired.secondaryIp;
+        let st = this.leaseApplyState[senderId];
+        if (!st || st.key !== key) {
+            st = { key, attempts: 0, nextAttemptAt: 0 };
+            this.leaseApplyState[senderId] = st;
+        }
+
+        const now = Date.now();
+        if (st.nextAttemptAt > now) { return; }
+
+        st.attempts++;
+        if (st.attempts >= NmosRegistryConnector.LEASE_APPLY_MAX_ATTEMPTS) {
+            st.nextAttemptAt = now + NmosRegistryConnector.LEASE_APPLY_COOLDOWN_MS;
+            // Logged once per back-off, not once per sweep.
+            SyncLog.log("warning", "Multicast Lease",
+                "Sender " + senderId + " has not taken its leased address after " +
+                st.attempts + " attempts (wanted " + key.replace("|", " / ") +
+                "). Backing off for " + Math.round(NmosRegistryConnector.LEASE_APPLY_COOLDOWN_MS / 60000) +
+                " minutes. Check whether the device accepts the IS-05 patch, or set the address manually.");
+            // Reset the counter so the next window is a fresh burst rather
+            // than a single attempt every cooldown forever.
+            st.attempts = 0;
+        }
 
         SyncLog.log("info", "Multicast Lease",
             "Applying leased address(es) to sender " + senderId + ": " +
@@ -1292,8 +1341,15 @@ export class NmosRegistryConnector {
     public sweepLeases() {
         const manager = MulticastLeaseManager.instance;
         if (!manager || !manager.isEnabled()) return;
-        for (const senderId in (this.nmosState.senders || {})) {
+        const senders = this.nmosState.senders || {};
+        for (const senderId in senders) {
             try { this.reconcileSenderWithLease(senderId); } catch (e) {}
+        }
+        // Drop back-off state for senders that are gone, so the map tracks the
+        // live network rather than growing for the lifetime of the process. A
+        // sender that returns is treated as new and gets a fresh budget.
+        for (const senderId in this.leaseApplyState) {
+            if (!senders[senderId]) { delete this.leaseApplyState[senderId]; }
         }
     }
 
