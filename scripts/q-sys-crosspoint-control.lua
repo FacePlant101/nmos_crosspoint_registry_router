@@ -394,9 +394,9 @@ function SendMultiviewerCommand(deviceSN, enabled)
     return
   end
   
-  -- Strip channel suffix (.1, .2, .v1, .v2, etc.) from device serial number
-  -- NMOS backend expects base device serial number without channel identifiers
-  local baseDeviceSN = deviceSN:match("^([^%.]+)") or deviceSN
+  -- Strip a flow suffix (.1, .v2, .a1, .u3, .v) the way the router parses addresses;
+  -- other dots belong to the device name and are kept
+  local baseDeviceSN = deviceSN:match("^(.*)%.[vadu]%d*$") or deviceSN:match("^(.*)%.%d+$") or deviceSN
   
   print("Sending multiviewer command via crosspoint router for device " .. deviceSN .. " (base: " .. baseDeviceSN .. "): " .. (enabled and "ENABLE" or "DISABLE"))
   
@@ -443,7 +443,7 @@ function ConnectToMultiviewer(encoderList, decoderName, startChannel)
   local connections = {}
   for i, encoderName in ipairs(encoderList) do
     local channelNum = startChannel + i - 1
-    local destination = decoderName .. ".v" .. channelNum
+    local destination = decoderName .. "." .. channelNum
     table.insert(connections, {
       source = encoderName,
       destination = destination

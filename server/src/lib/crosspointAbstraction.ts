@@ -494,33 +494,6 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         }catch(e){}
     }
 
-    // Check if a device is a multiview decoder by counting video receiver flows
-    private isDeviceMultiviewDecoder(device: CrosspointDevice): boolean {
-        try {
-            console.log(`[DEBUG] isDeviceMultiviewDecoder called for device:`, {
-                name: device.name,
-                alias: device.alias,
-                num: device.num
-            });
-            
-            // Simple and reliable approach: multiviewer devices typically have exactly 4 video receiver flows
-            const videoReceiverFlows = this.optimizedLookup.findReceiverFlows(device.id, 'video');
-            const flowCount = videoReceiverFlows.length;
-            
-            console.log(`[DEBUG] Device has ${flowCount} video receiver flows`);
-            
-            // If device has exactly 4 video receiver flows, it's likely a multiviewer
-            const isMultiviewer = flowCount === 4;
-            
-            console.log(`[DEBUG] Multiviewer detection result: ${isMultiviewer} (based on flow count)`);
-            return isMultiviewer;
-            
-        } catch (error) {
-            console.log(`[DEBUG] Error in isDeviceMultiviewDecoder:`, error);
-            return false;
-        }
-    }
-
     makeConnection(data:any){
         return new Promise(async(resolve, reject) => {
             // Debug logging to track makeConnection calls
@@ -565,6 +538,8 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
 
             let connections = [];
+            // Addresses that named a device or flow that does not exist; returned to the caller.
+            let unresolved: {address:string, reason:string}[] = [];
 
 
             list.forEach((c)=>{
@@ -579,245 +554,29 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                 console.log("[DEBUG] Processing connection:", {source, destination, disconnect});
 
                 let srcFlows:any[] = [];
-                let dstFlows:any[] = [];
-
-                // Select all source Flows
-                let sourceDevice = null;
-                let sourceDeviceOnly = false;
-                let sourceFlowType = "";
-                let sourceFlow = null;
-                let sourceParts = source.split(".");
-                let srcDev = null
-                sourceDevice = sourceParts[0]
-                if(sourceParts.length == 2){
-                    sourceFlow = sourceParts[1].slice(1);
-                    switch(sourceParts[1][0]){
-                        case "v":
-                            sourceFlowType = "video"
-                            break;
-                        case "a":
-                            sourceFlowType = "audio"
-                            break;
-                        case "d":
-                            sourceFlowType = "data"
-                            break;
-                        default:
-                            sourceFlowType = "unknown"
-                    }
-                }else{
-                    sourceDeviceOnly = true;
-                }
-
-                console.log("[DEBUG] Looking for source device:", {sourceDevice, sourceFlowType, sourceFlow, sourceDeviceOnly});
-                console.log("[DEBUG] Available devices:", this.crosspointState.devices.map(d => ({num: d.num, name: d.name, alias: d.alias})));
-                
-                // 1) Try direct NMOS flow-id addressing (e.g., 'nmos_<sender_id>') - OPTIMIZED
-                let matchedByNmosIdSrc = false;
-                if(source.startsWith("nmos_")){
-                    const flow = this.optimizedLookup.findFlow(source);
-                    if(flow){
-                        // Find the device that contains this flow
-                        for(const dev of this.crosspointState.devices){
-                            for(const type of Object.keys(dev.senders)){
-                                const arr:any[] = (dev.senders as any)[type] || [];
-                                if(arr.some(f => f.id === source)){
-                                    srcDev = dev;
-                                    srcFlows.push(flow);
-                                    matchedByNmosIdSrc = true;
-                                    console.log("[DEBUG] Matched source by NMOS id (OPTIMIZED):", {dev: {num: dev.num, name: dev.name, alias: dev.alias}, flowId: flow.id});
-                                    break;
-                                }
-                            }
-                            if(matchedByNmosIdSrc) break;
-                        }
+                let srcDev = null;
+                if(!disconnect){
+                    const src = this.optimizedLookup.resolveEndpoint(source, "senders");
+                    srcDev = src.device;
+                    srcFlows = src.flows;
+                    if(src.error){
+                        unresolved.push({address: source, reason: src.error});
+                        SyncLog.log("warning", "connect_crosspoint", `Source ${source}: ${src.error}; skipping`);
                     }
                 }
 
-                // 2) Fallback to name/alias/num based addressing - OPTIMIZED
-                if(!matchedByNmosIdSrc){
-                    // Use optimized O(1) device lookup instead of O(n) loop
-                    const dev = this.optimizedLookup.findDevice(sourceDevice);
-                    if(dev){
-                        console.log("[DEBUG] Found matching source device (OPTIMIZED):", {num: dev.num, name: dev.name, alias: dev.alias});
-                        srcDev = dev;
-                        
-                        if(sourceDeviceOnly){
-                            // Get only video sender flows for device-level patching (not audio)
-                            srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, "video"));
-                            console.log("[DEBUG] Added video sender flows for device-level patching (OPTIMIZED):", srcFlows.length);
-                        } else if(sourceFlowType && sourceFlow){
-                            // Get specific flow using optimized lookup
-                            // Handle stream indexing - check if device is a multiview decoder
-                            let hwStreamIndex = parseInt(sourceFlow);
-                            
-                            // For multiview decoders, UI sends 0-based stream numbers directly (0, 1, 2, 3)
-                            // For other devices, UI sends 1-based stream numbers (1, 2, 3) that need conversion to 0-based
-                            const isMultiviewDecoder = srcDev && this.isDeviceMultiviewDecoder(srcDev);
-                            if (!isMultiviewDecoder) {
-                                // Convert from 1-based UI numbering (v.1) to 0-based hardware indexing (stream 0)
-                                hwStreamIndex = hwStreamIndex - 1;
-                            }
-                            
-                            console.log("[DEBUG] Stream indexing for source:", {
-                                sourceFlow, 
-                                isMultiviewDecoder, 
-                                hwStreamIndex,
-                                deviceName: srcDev?.name,
-                                deviceAlias: srcDev?.alias
-                            });
-                            
-                            const flow = this.optimizedLookup.findFlowByDeviceAndNum(dev.id, hwStreamIndex);
-                            if(flow && (flow.type === sourceFlowType || sourceFlowType === "unknown")){
-                                srcFlows.push(flow);
-                                console.log("[DEBUG] Added specific source flow (OPTIMIZED):", {type: flow.type, flowNum: flow.num, flowId: flow.id});
-                            } else {
-                                // Fallback: get flows by type
-                                srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, sourceFlowType));
-                                console.log("[DEBUG] Added sender flows by type (OPTIMIZED):", {type: sourceFlowType, count: srcFlows.length});
-                            }
-                        } else if(sourceFlowType){
-                            // Get flows by type only
-                            srcFlows.push(...this.optimizedLookup.findSenderFlows(dev.id, sourceFlowType));
-                            console.log("[DEBUG] Added sender flows by type (OPTIMIZED):", {type: sourceFlowType, count: srcFlows.length});
-                        }
-                    }
+                // Device-level destinations only cover receivers the registry still has, so one stale
+                // receiver cannot fail the whole batch.
+                const nmosState = NmosRegistryConnector.instance.getNmosState();
+                const dst = this.optimizedLookup.resolveEndpoint(destination, "receivers", (flow) =>
+                    flow.id.startsWith("nmos_") && !!nmosState?.receivers?.hasOwnProperty(flow.id.substring(5)));
+                const dstDev = dst.device;
+                const dstFlows:any[] = dst.flows;
+                if(dst.error){
+                    unresolved.push({address: destination, reason: dst.error});
+                    SyncLog.log("warning", "connect_crosspoint", `Destination ${destination}: ${dst.error}; skipping`);
                 }
-                console.log("[DEBUG] Source device search complete:", {srcDev: srcDev ? {num: srcDev.num, name: srcDev.name} : null, srcFlowsCount: srcFlows.length});
-
-
-                // Select all destination Flows
-                let destinationDevice = null;
-                let destinationDeviceOnly = false;
-                let destinationFlowType = "";
-                let destinationFlow = null;
-                let destinationParts = destination.split(".");
-                let dstDev = null;
-                destinationDevice = destinationParts[0]
-                if(destinationParts.length == 2){
-                    destinationFlow = destinationParts[1].slice(1);
-                    switch(destinationParts[1][0]){
-                        case "v":
-                            destinationFlowType = "video"
-                            break;
-                        case "a":
-                            destinationFlowType = "audio"
-                            break;
-                        case "d":
-                            destinationFlowType = "data"
-                            break;
-                        default:
-                            destinationFlowType = "unknown"
-                    }
-                }else{
-                    destinationDeviceOnly = true;
-                }
-
-                console.log("[DEBUG] Looking for destination device:", {destinationDevice, destinationFlowType, destinationFlow, destinationDeviceOnly});
-                
-                // 1) Try direct NMOS flow-id addressing (e.g., 'nmos_<receiver_id>') - OPTIMIZED
-                let matchedByNmosIdDst = false;
-                if(destination.startsWith("nmos_")){
-                    const flow = this.optimizedLookup.findFlow(destination);
-                    if(flow){
-                        // Find the device that contains this flow
-                        for(const dev of this.crosspointState.devices){
-                            for(const type of Object.keys(dev.receivers)){
-                                const arr:any[] = (dev.receivers as any)[type] || [];
-                                if(arr.some(f => f.id === destination)){
-                                    dstDev = dev;
-                                    dstFlows.push(flow);
-                                    matchedByNmosIdDst = true;
-                                    console.log("[DEBUG] Matched destination by NMOS id (OPTIMIZED):", {dev: {num: dev.num, name: dev.name, alias: dev.alias}, flowId: flow.id});
-                                    break;
-                                }
-                            }
-                            if(matchedByNmosIdDst) break;
-                        }
-                    }
-                }
-
-                // 2) Fallback to name/alias/num based addressing - OPTIMIZED
-                if(!matchedByNmosIdDst){
-                    // Use optimized O(1) device lookup instead of O(n) loop
-                    const dev = this.optimizedLookup.findDevice(destinationDevice);
-                    if(dev){
-                        console.log("[DEBUG] Found matching destination device (OPTIMIZED):", {num: dev.num, name: dev.name, alias: dev.alias});
-                        dstDev = dev;
-                        
-                        if(destinationDeviceOnly){
-                            // Get only video receiver flows for device-level patching (not audio)
-                            const allReceiverFlows = this.optimizedLookup.findReceiverFlows(dev.id, "video");
-                            
-                            // Filter out flows that are not available in NMOS to prevent batch failures
-                            const nmosState = NmosRegistryConnector.instance.getNmosState();
-                            const availableFlows = allReceiverFlows.filter(flow => {
-                                if (!flow.id.startsWith("nmos_")) return false;
-                                const nmosId = flow.id.substring(5); // Remove "nmos_" prefix
-                                const isAvailable = nmosState && nmosState.receivers && nmosState.receivers.hasOwnProperty(nmosId);
-                                if (!isAvailable) {
-                                    console.log("[DEBUG] Filtering out unavailable NMOS receiver:", {flowId: flow.id, nmosId});
-                                }
-                                return isAvailable;
-                            });
-                            
-                            dstFlows.push(...availableFlows);
-                            console.log("[DEBUG] Added video receiver flows for device-level patching (OPTIMIZED):", {
-                                total: allReceiverFlows.length,
-                                available: availableFlows.length,
-                                filtered: allReceiverFlows.length - availableFlows.length
-                            });
-                        } else if(destinationFlowType && destinationFlow){
-                            // Get specific flow using optimized lookup
-                            // Handle stream indexing - check if device is a multiview decoder
-                            let hwStreamIndex = parseInt(destinationFlow);
-                            
-                            // For multiview decoders, UI sends 0-based stream numbers directly (0, 1, 2, 3)
-                            // For other devices, UI sends 1-based stream numbers (1, 2, 3, 4) that need conversion to 0-based
-                            const isMultiviewDecoder = dstDev && this.isDeviceMultiviewDecoder(dstDev);
-                            
-                            // For non-multiviewer devices, only allow .v1 connections
-                            if (!isMultiviewDecoder && parseInt(destinationFlow) > 1) {
-                                console.log("[DEBUG] Non-multiviewer device: ignoring flow request above v1:", {
-                                    deviceName: dstDev?.name,
-                                    deviceAlias: dstDev?.alias,
-                                    requestedFlow: destinationFlow,
-                                    message: 'Non-multiviewer devices only accept device-level connections or .v1'
-                                });
-                                // Skip processing this flow - effectively ignores .v2, .v3, .v4 for non-multiviewer devices
-                            } else {
-                                if (!isMultiviewDecoder) {
-                                    // Convert from 1-based UI numbering (v.1) to 0-based hardware indexing (stream 0)
-                                    hwStreamIndex = hwStreamIndex - 1;
-                                }
-                                
-                                console.log("[DEBUG] Stream indexing for destination:", {
-                                    destinationFlow, 
-                                    isMultiviewDecoder, 
-                                    hwStreamIndex,
-                                    deviceName: dstDev?.name,
-                                    deviceAlias: dstDev?.alias,
-                                    originalIndex: parseInt(destinationFlow),
-                                    indexConversion: isMultiviewDecoder ? 'none (multiviewer mode)' : '1-based to 0-based (regular mode)'
-                                });
-                                
-                                const flow = this.optimizedLookup.findFlowByDeviceAndNum(dev.id, hwStreamIndex);
-                                if(flow && (flow.type === destinationFlowType || destinationFlowType === "unknown")){
-                                    dstFlows.push(flow);
-                                    console.log("[DEBUG] Added specific destination flow (OPTIMIZED):", {type: flow.type, flowNum: flow.num, flowId: flow.id});
-                                } else {
-                                    // Fallback: get flows by type
-                                    dstFlows.push(...this.optimizedLookup.findReceiverFlows(dev.id, destinationFlowType));
-                                    console.log("[DEBUG] Added receiver flows by type (OPTIMIZED):", {type: destinationFlowType, count: dstFlows.length});
-                                }
-                            }
-                        } else if(destinationFlowType){
-                            // Get flows by type only
-                            dstFlows.push(...this.optimizedLookup.findReceiverFlows(dev.id, destinationFlowType));
-                            console.log("[DEBUG] Added receiver flows by type (OPTIMIZED):", {type: destinationFlowType, count: dstFlows.length});
-                        }
-                    }
-                }
-                console.log("[DEBUG] Destination device search complete:", {dstDev: dstDev ? {num: dstDev.num, name: dstDev.name} : null, dstFlowsCount: dstFlows.length});
+                console.log("[DEBUG] Resolved connection:", {source, destination, srcFlowsCount: srcFlows.length, dstFlowsCount: dstFlows.length});
 
 
                 console.log("[DEBUG] Flow matching results:", {
@@ -883,7 +642,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     latencyMeasurement.completeConnectionMeasurement(timingContext.connectionId, true);
                 }
                 
-                resolve({connections:connectionPreviews});
+                resolve({connections:connectionPreviews, unresolved});
             }else if(prepare){
                 let stagePromises:any[] = [];
                 let stageDisconnectPromises:any[] = [];
@@ -919,7 +678,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     latencyMeasurement.completeConnectionMeasurement(timingContext.connectionId, success);
                 }
 
-                resolve({connections:connectionResponses});
+                resolve({connections:connectionResponses, unresolved});
             }else{
                 let connectionPromises = [];
                 let disconnectPromises = [];
@@ -1005,7 +764,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     }
                 }
 
-                resolve({connections:connectionResponses});
+                resolve({connections:connectionResponses, unresolved});
             }
 
             // Further TODOs

@@ -2,6 +2,7 @@ import { SyncObject } from "../lib/SyncServer/syncObject";
 import { SyncLog } from "../lib/syncLog";
 
 import { NmosRegistryConnector } from "../lib/nmosConnector";
+import { findMatroxDeviceKey, matroxSerialFromNodeId } from "../lib/matroxDeviceMatch";
 import axios, { isAxiosError } from "axios";
 import { writeFileSync } from "fs";
 
@@ -773,12 +774,8 @@ export default class MediaDevMatroxConvertIp {
 
     nodeChange(id:string, data:any){
         try{
-            let idpart = id.split('-');
-            if(idpart[idpart.length-1].endsWith("0000000000")){
-                let sn = idpart[0];
-                if(sn[sn.length-1] == "0"){
-                    sn = sn.slice(0,sn.length-1);
-                } 
+            const sn = matroxSerialFromNodeId(id);
+            if(sn !== null){
 
                 let ips:string[] = [];
                 data.api.endpoints.forEach((ep)=>{
@@ -1277,127 +1274,97 @@ export default class MediaDevMatroxConvertIp {
         }, 2000);
     }
 
-    // Public method to query multiviewer enabled status by device serial number, name, or alias
+    // Resolve a serial number or Matrox device name (the NMOS device label) to the state key.
+    private resolveDeviceKey(identifier: string): string | null {
+        if(this.state.devices.hasOwnProperty(identifier)){
+            return identifier;
+        }
+        for(const key in this.state.devices){
+            if(this.state.devices[key].name === identifier){
+                return key;
+            }
+        }
+        return null;
+    }
+
+    // Public method to query multiviewer enabled status by device serial number or name
     isMultiviewerEnabled(deviceIdentifier: string): boolean {
-        try {
-            SyncLog.log("debug", "MatroxCIP", `Checking multiviewer status for: ${deviceIdentifier}`);
-            
-            // Try direct serial number lookup first
-            if (this.state.devices.hasOwnProperty(deviceIdentifier)) {
-                const result = this.state.devices[deviceIdentifier].isMultiviewEnabled || false;
-                SyncLog.log("debug", "MatroxCIP", `Found device by SN ${deviceIdentifier}: multiviewer=${result}`);
-                return result;
-            }
-            
-            // Try lookup by name or alias
-            for (const sn in this.state.devices) {
-                const device = this.state.devices[sn];
-                if (device.name === deviceIdentifier || device.alias === deviceIdentifier || device.num?.toString() === deviceIdentifier) {
-                    const result = device.isMultiviewEnabled || false;
-                    SyncLog.log("debug", "MatroxCIP", `Found device by name/alias ${deviceIdentifier} (SN: ${sn}): multiviewer=${result}`);
-                    return result;
-                }
-            }
-            
-            // Debug: show available devices
-            const availableDevices = Object.keys(this.state.devices).map(sn => ({
-                sn,
-                name: this.state.devices[sn].name,
-                alias: this.state.devices[sn].alias,
-                num: this.state.devices[sn].num
-            }));
-            SyncLog.log("debug", "MatroxCIP", `Device not found for multiviewer query: ${deviceIdentifier}. Available devices:`, availableDevices);
-            return false;
-        } catch (error) {
-            SyncLog.log("error", "MatroxCIP", `Error querying multiviewer state for ${deviceIdentifier}: ${error instanceof Error ? error.message : String(error)}`);
+        const key = this.resolveDeviceKey(deviceIdentifier);
+        return key !== null && this.state.devices[key].isMultiviewEnabled === true;
+    }
+
+    /**
+     * Whether an NMOS receiver belongs to a Matrox decoder with multiviewer enabled. Resolved
+     * through the receiver's NMOS device and node, so router aliases and labels do not matter.
+     */
+    static isMultiviewReceiver(receiverFlowId: string): boolean {
+        const instance = MediaDevMatroxConvertIp.instance;
+        if(!instance){ return false; }
+        const deviceId = NmosRegistryConnector.nmosDeviceIdFromFlowId(receiverFlowId);
+        if(!deviceId || !NmosRegistryConnector.isMatroxCipDevice(deviceId)){ return false; }
+
+        const nmosState = NmosRegistryConnector.instance?.getNmosState?.();
+        const nodeId = nmosState?.devices?.[deviceId]?.node_id;
+        const node = nodeId ? (nmosState?.nodes?.[nodeId] ?? { id: nodeId }) : null;
+        const key = node ? findMatroxDeviceKey(instance.state.devices, node) : null;
+        if(key === null){
+            SyncLog.log("debug", "MatroxCIP", `No Matrox device found for NMOS receiver ${receiverFlowId} (device ${deviceId})`);
             return false;
         }
+        return instance.state.devices[key].isMultiviewEnabled === true;
     }
 
     // Web Accessible
     async toggleMultiviewer(sn:string, enabled:boolean){
-        SyncLog.log("info", "MatroxCIP", `Toggling multiviewer for device ${sn}: ${enabled ? 'ENABLE' : 'DISABLE'}`);
-        
-        let ipList:string[] = [];
-        let cip;
-        
-        // Use flexible device resolution like makeConnection does
-        // Support numeric ID, device name, alias, or direct serial number lookup
-        let deviceFound = false;
-        let actualDeviceSerial = sn; // Track the actual device serial for reload
-        
-        // First try direct serial number lookup (existing behavior)
-        if(this.state.devices.hasOwnProperty(sn)){
-            ipList = this.state.devices[sn].ipList
-            cip = this.state.devices[sn]
-            deviceFound = true;
-            actualDeviceSerial = sn;
-            SyncLog.log("debug", "MatroxCIP", `Found device by serial number: ${sn}`);
-        } else {
-            // Try flexible name resolution like makeConnection
-            for(let deviceSerial in this.state.devices) {
-                let device = this.state.devices[deviceSerial];
-                // Check against device name, alias, or any identifier format
-                if(device.name === sn || device.alias === sn || deviceSerial === sn) {
-                    ipList = device.ipList;
-                    cip = device;
-                    deviceFound = true;
-                    actualDeviceSerial = deviceSerial; // Use the actual serial number for reload
-                    SyncLog.log("debug", "MatroxCIP", `Found device by name/alias resolution: ${sn} -> ${deviceSerial}`);
-                    break;
-                }
-            }
+        if(typeof enabled !== "boolean"){
+            throw new Error("'enabled' must be true or false.");
         }
-        
-        if(!deviceFound){
+        SyncLog.log("info", "MatroxCIP", `Toggling multiviewer for device ${sn}: ${enabled ? 'ENABLE' : 'DISABLE'}`);
+
+        // Accept a serial number or the device name, but talk to the device under its serial:
+        // apiRequest keys its login session on it.
+        const deviceSerial = this.resolveDeviceKey(sn);
+        if(deviceSerial === null){
             SyncLog.log("error", "MatroxCIP", `Device not found: ${sn}. Available devices: ${Object.keys(this.state.devices).join(', ')}`);
             throw new Error("Device not found.");
         }
+        const cip = this.state.devices[deviceSerial];
+        const ipList = cip.ipList;
 
-        // Use the working multiviewer endpoint we discovered
-        // Note: Official endpoint /device/settings/Multiview returns 404 on current firmware
-        // Reverting to working /device/settings/context endpoint
-        
-        // Get current context to ensure we have the right structure
-        let context = await this.apiRequest(ipList, sn, "GET", "/device/settings/context");
-        if(!context){
-            throw new Error("Can not get Context.");
-        }
-        
-        // Create the multiviewer settings payload (our working format)
-        let multiviewerData = {
+        // Note: the documented /device/settings/Multiview endpoint returns 404 on current firmware;
+        // a partial context POST works.
+        const multiviewerData = {
             MultiviewSettings: {
                 isMultiviewEnabled: enabled
             }
         };
-        
-        SyncLog.log("debug", "MatroxCIP", `Sending multiviewer command to ${sn} (working endpoint):`, multiviewerData);
-        
-        // Send the multiviewer toggle command using working endpoint
-        let result = await this.apiRequest(ipList, actualDeviceSerial, "POST", "/device/settings/context", multiviewerData);
-        
-        SyncLog.log("debug", "MatroxCIP", `Multiviewer API result for ${sn}:`, result);
-        if(result && result.status === "success") {
-            SyncLog.log("info", "MatroxCIP", `Multiviewer ${enabled ? 'enabled' : 'disabled'} successfully for device ${sn}`);
-        } else {
-            SyncLog.log("warning", "MatroxCIP", `Multiviewer toggle response for ${sn}:`, result);
-        }
 
-        // When enabling multiviewer, also enable master mode (required for correct operation)
-        if(enabled) {
-            try {
-                await this.ensureMasterEnabled(actualDeviceSerial, ipList);
-            } catch(masterError) {
-                SyncLog.log("warning", "MatroxCIP", `Failed to auto-enable master mode for ${sn}:`, masterError.message);
+        try{
+            // apiRequest throws on HTTP errors. The response body is not a reliable success signal,
+            // so read the setting back instead.
+            const result = await this.apiRequest(ipList, deviceSerial, "POST", "/device/settings/context", multiviewerData);
+            SyncLog.log("debug", "MatroxCIP", `Multiviewer API result for ${deviceSerial}:`, result);
+            const context = await this.apiRequest(ipList, deviceSerial, "GET", "/device/settings/context");
+            const actual = context?.MultiviewSettings?.isMultiviewEnabled;
+            if(typeof actual !== "boolean"){
+                throw new Error("Device does not report a multiviewer setting; is multiviewer supported?");
             }
-        }
+            if(actual !== enabled){
+                throw new Error(`Device kept multiviewer ${actual ? 'enabled' : 'disabled'}`);
+            }
+            cip.isMultiviewEnabled = actual;
+            SyncLog.log("info", "MatroxCIP", `Multiviewer ${enabled ? 'enabled' : 'disabled'} for device ${deviceSerial}`);
 
-        // Reload device data after a delay to reflect the changes
-        // Use the actual device serial number, not the search term
-        setTimeout(()=>{
-            SyncLog.log("debug", "MatroxCIP", `Reloading device data: original sn='${sn}', actualDeviceSerial='${actualDeviceSerial}', available devices: ${Object.keys(this.state.devices).join(', ')}`);
-            this.reloadData(ipList,actualDeviceSerial,cip)
-        },2000)
+            // Multiviewer only works with master mode on.
+            if(enabled) {
+                await this.ensureMasterEnabled(deviceSerial, ipList);
+            }
+        } finally {
+            // Reflect whatever state the device ended up in, including after a failure.
+            setTimeout(()=>{
+                this.reloadData(ipList,deviceSerial,cip)
+            },2000)
+        }
     }
 
     // Auto-configure NMOS registry for discovered devices

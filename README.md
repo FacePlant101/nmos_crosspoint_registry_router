@@ -52,7 +52,7 @@ Tested with 2000+ flows in production-style environments.
 
 ### Device support
 
-- Matrox Convert IP support (multiviewer toggle, PTP control, device grouping)
+- Matrox Convert IP support (multiviewer toggle via the API and Q-SYS, PTP control, device grouping)
 - Network switch integration for topology data (Arista DCS, Netgear M4350)
 - Pluggable device driver framework for vendor-specific extensions
 

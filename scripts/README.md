@@ -260,7 +260,7 @@ The script provides comprehensive multiviewer control for Matrox Convert IP devi
 **Core Features**:
 - **Per-Decoder Toggles**: Each decoder has its own multiviewer toggle (`Controls.Multiviewer[n]`)
 - **Automatic Master Mode**: When multiviewer is enabled, master mode is automatically activated
-- **Device Identification**: Supports device lookup by serial number, device name, or alias
+- **Device Identification**: Supports device lookup by serial number or device name (the router alias is not known to the Matrox module)
 - **WebSocket API Integration**: Uses crosspoint router API instead of direct device HTTP calls
 - **Multiple Connection Methods**: Supports both postfix channel and flow type notation
 - **Batch Operations**: Enable multiviewer and connect multiple encoders in single operations
