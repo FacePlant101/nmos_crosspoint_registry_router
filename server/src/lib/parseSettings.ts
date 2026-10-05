@@ -209,6 +209,28 @@ export function parseSettings(settings:any){
         }
     }
 
+    // DDNS: publish each node's name as an A record via RFC 2136 dynamic
+    // updates. Off by default — it writes to someone else's DNS server.
+    //
+    // keySecret is a credential: it is normalised here but must never be sent
+    // to a client, which is why getSetupConfigState reports only keySecretSet.
+    if(!settings.hasOwnProperty("ddns") || typeof settings.ddns !== "object" || settings.ddns === null){
+        settings.ddns = {};
+    }
+    {
+        const d = settings.ddns;
+        const ALGORITHMS = ["hmac-sha256", "hmac-sha512", "hmac-sha1", "hmac-md5", "none"];
+        if(typeof d.enabled !== "boolean"){ d.enabled = false; }
+        if(typeof d.server !== "string"){ d.server = ""; }
+        if(typeof d.zone !== "string"){ d.zone = ""; }
+        if(typeof d.keyName !== "string"){ d.keyName = ""; }
+        if(typeof d.keySecret !== "string"){ d.keySecret = ""; }
+        if(typeof d.port !== "number" || d.port < 1 || d.port > 65535){ d.port = 53; }
+        if(typeof d.ttl !== "number" || d.ttl < 1 || d.ttl > 604800){ d.ttl = 300; }
+        // "none" means unsigned, for a server that authorises by source IP.
+        if(ALGORITHMS.indexOf(d.keyAlgorithm) === -1){ d.keyAlgorithm = "hmac-sha256"; }
+    }
+
     // BCP-008 status monitoring. Read-only IS-12 client, on by default.
     if(!settings.hasOwnProperty("bcp008") || typeof settings.bcp008 !== "object" || settings.bcp008 === null){
         settings.bcp008 = { enabled: true };

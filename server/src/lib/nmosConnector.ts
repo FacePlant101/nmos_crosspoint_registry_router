@@ -26,6 +26,7 @@ import { AtomicNmosStateManager } from "./atomicNmosStateManager";
 import { AdvancedNmosCompatibility } from "./advancedNmosCompatibility";
 import { PrometheusMetrics } from "./prometheusMetrics";
 import { MulticastLeaseManager } from "./multicastLeaseManager";
+import { DdnsService } from "./ddnsService";
 
 const fs = require("fs");
 
@@ -762,7 +763,14 @@ export class NmosRegistryConnector {
 
                                 // Maintain legacy state for compatibility
                                 this.nmosState[type][g.path] = postData;
-                                
+
+                                // A node's name or address changed, so its DNS
+                                // record may be stale. The service debounces,
+                                // so a burst of updates costs one UPDATE.
+                                if(type === "nodes"){
+                                    this.scheduleDnsPush(g.path, postData);
+                                }
+
                             } catch (atomicError) {
                                 SyncLog.log("error", "atomic_nmos", 
                                     `Atomic state update failed for ${type}/${g.path}: ${atomicError.message}`);
@@ -778,6 +786,11 @@ export class NmosRegistryConnector {
                                 changes = true;
                                 SyncLog.log("debug", "atomic_nmos", 
                                     `Removed ${type} resource: ${g.path}`);
+                                // A node that has left the registry must not
+                                // keep a record pointing at it.
+                                if(type === "nodes"){
+                                    try{ DdnsService.instance?.removeNode(g.path).catch(()=>{}); }catch(e){}
+                                }
                             }
                         } catch (e) {}
                     }
@@ -1149,6 +1162,102 @@ export class NmosRegistryConnector {
     private stripSdpAddress(ip:any): string{
         if(typeof ip != "string"){ return ""; }
         return ip.split("/")[0].trim();
+    }
+
+    // ----- DNS record pushing -----
+
+    /**
+     * Queue a node's A record, taking the address from its advertised href.
+     *
+     * Operators rename devices in the crosspoint far more often than they
+     * rename them on the device itself, so a user alias wins over the NMOS
+     * label — the whole point is that `Camera1.media.example.net` resolves to
+     * what the operators actually call it.
+     */
+    private scheduleDnsPush(nodeId: string, node: any) {
+        try {
+            const svc = DdnsService.instance;
+            if (!svc || !svc.isEnabled()) return;
+
+            let ip = "";
+            try {
+                if (typeof node?.href === "string" && node.href) {
+                    ip = new URL(node.href).hostname;
+                }
+            } catch (e) {}
+            // href can carry a hostname; only an address is useful as an A record.
+            if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) { return; }
+
+            const displayName = this.resolveDnsDisplayName(nodeId, node?.label || "");
+            if (!displayName) return;
+            svc.scheduleNodePush(nodeId, displayName, ip);
+        } catch (e) {}
+    }
+
+    /**
+     * The name to publish for a node: a user-set alias if there is one,
+     * otherwise the NMOS label.
+     *
+     * A crosspoint device maps to a node either directly (nmos_<deviceId>) or
+     * through a grouphint group (nmosgrp_...), whose id is a hash and cannot be
+     * reversed — so for those the node is found via any sender in the group.
+     */
+    public resolveDnsDisplayName(nodeId: string, fallback: string): string {
+        try {
+            const xp = CrosspointAbstraction.instance;
+            if (!xp || !xp.crosspointState || !Array.isArray(xp.crosspointState.devices)) {
+                return fallback || "";
+            }
+            for (const xd of xp.crosspointState.devices as any[]) {
+                if (!xd || typeof xd.id !== "string") continue;
+                const alias = (typeof xd.alias === "string") ? xd.alias : "";
+                const name = (typeof xd.name === "string") ? xd.name : "";
+                // Only a genuinely customised alias should override the label.
+                if (!alias || alias === name) continue;
+
+                let xdNodeId = "";
+                if (xd.id.startsWith("nmos_")) {
+                    const dev: any = this.nmosState.devices[xd.id.slice(5)];
+                    if (dev) xdNodeId = dev.node_id || "";
+                } else {
+                    // Grouped device: every sender in the group belongs to one
+                    // device, so the first resolvable one settles it.
+                    outer:
+                    for (const t of Object.keys(xd.senders || {})) {
+                        for (const sndr of (xd.senders[t] || [])) {
+                            if (!sndr || typeof sndr.id !== "string" || !sndr.id.startsWith("nmos_")) continue;
+                            const sender: any = this.nmosState.senders[sndr.id.slice(5)];
+                            if (sender && sender.device_id) {
+                                const dev: any = this.nmosState.devices[sender.device_id];
+                                if (dev) { xdNodeId = dev.node_id || ""; }
+                                break outer;
+                            }
+                        }
+                    }
+                }
+                if (xdNodeId && xdNodeId === nodeId) { return alias; }
+            }
+        } catch (e) {}
+        return fallback || "";
+    }
+
+    /** Every node currently known, for a full DDNS re-sync. */
+    public collectDnsPushNodes(): Array<{nodeId:string, displayName:string, ip:string}> {
+        const out: Array<{nodeId:string, displayName:string, ip:string}> = [];
+        try {
+            for (const nodeId in (this.nmosState.nodes || {})) {
+                const node: any = this.nmosState.nodes[nodeId];
+                let ip = "";
+                try {
+                    if (typeof node?.href === "string" && node.href) { ip = new URL(node.href).hostname; }
+                } catch (e) {}
+                if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
+                const displayName = this.resolveDnsDisplayName(nodeId, node?.label || "");
+                if (!displayName) continue;
+                out.push({ nodeId, displayName, ip });
+            }
+        } catch (e) {}
+        return out;
     }
 
     // ----- Multicast leases -----
