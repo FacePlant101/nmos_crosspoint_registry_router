@@ -40,7 +40,35 @@ export function parseSettings(settings:any){
         settings.multicastRanges = {};
     }
     {
-        const CIDR = /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/;
+        /**
+         * Validate a CIDR properly rather than by shape.
+         *
+         * A shape-only regex accepted "2399.120.0.0/16" and "239.1.1.1/99",
+         * and the lease manager's address parser answered 0 for anything it
+         * could not read — so a typo became a pool at 0.0.0.0 whose addresses
+         * were then PATCHed onto real devices as multicast destinations.
+         *
+         * Also requires the range to sit inside the multicast space. These
+         * values become destination_ip for multicast streams, so a unicast
+         * range here is a configuration error however well-formed it looks.
+         */
+        const parseCidr = (value:string): { ok:boolean, reason?:string } => {
+            const m = ("" + value).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+            if(!m){ return { ok:false, reason:"not in a.b.c.d/len form" }; }
+            const octets = [m[1], m[2], m[3], m[4]].map((o) => parseInt(o, 10));
+            if(octets.some((o) => !Number.isFinite(o) || o < 0 || o > 255)){
+                return { ok:false, reason:"an octet is outside 0-255" };
+            }
+            const bits = parseInt(m[5], 10);
+            if(!Number.isFinite(bits) || bits < 4 || bits > 32){
+                return { ok:false, reason:"prefix length must be between 4 and 32" };
+            }
+            // 224.0.0.0/4 is the multicast space.
+            if(octets[0] < 224 || octets[0] > 239){
+                return { ok:false, reason:"not a multicast address (expected 224-239 in the first octet)" };
+            }
+            return { ok:true };
+        };
         const defaults:any = {
             video:    "239.120.0.0/16",
             videoUhd: "239.121.0.0/16",
@@ -54,13 +82,23 @@ export function parseSettings(settings:any){
                 e = {};
                 settings.multicastRanges[cat] = e;
             }
-            if(typeof e.primary !== "string" || !CIDR.test(e.primary)){
+            if(typeof e.primary !== "string"){
                 e.primary = defaults[cat];
+            }else{
+                const check = parseCidr(e.primary);
+                if(!check.ok){
+                    // Say so loudly: falling back silently would leave the
+                    // operator looking at a range in settings.json that the
+                    // allocator is not using.
+                    console.warn("[settings] multicastRanges." + cat + ".primary '" + e.primary +
+                        "' is not a usable multicast CIDR (" + check.reason + "); using " + defaults[cat] + " instead.");
+                    e.primary = defaults[cat];
+                }
             }
             // `secondary` is retained for backwards compatibility but no longer
             // consulted: a lease's two legs must be adjacent for ST 2022-7, and
             // two independent ranges cannot express that.
-            if(typeof e.secondary !== "string" || !CIDR.test(e.secondary)){
+            if(typeof e.secondary !== "string" || !parseCidr(e.secondary).ok){
                 e.secondary = e.primary;
             }
         }

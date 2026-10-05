@@ -878,10 +878,23 @@ export class MulticastLeaseManager {
 
     // ----- Internal: IP helpers -----
 
-    private parseCidr(cidr: string): { start: number; end: number } {
-        const [ipStr, bitsStr] = cidr.split("/");
-        const bits = parseInt(bitsStr, 10);
-        const base = this.ipToUint32(ipStr);
+    /**
+     * Parse a CIDR, or return null if it is not one.
+     *
+     * Previously this trusted its input and ipToUint32 answered 0 for anything
+     * it could not read, so a malformed range silently became a pool at
+     * 0.0.0.0 and the allocator handed those addresses to real devices.
+     * Refusing to parse means the category simply has no capacity, which the
+     * Setup page shows and the allocator treats as "cannot allocate" — wrong
+     * addresses on the wire are far worse than none.
+     */
+    private parseCidr(cidr: string): { start: number; end: number } | null {
+        const parts = ("" + cidr).split("/");
+        if (parts.length !== 2) return null;
+        const bits = parseInt(parts[1], 10);
+        if (!Number.isFinite(bits) || bits < 0 || bits > 32) return null;
+        if (!this.ipIsValid(parts[0])) return null;
+        const base = this.ipToUint32(parts[0]);
         const mask = bits === 0 ? 0 : ((0xFFFFFFFF << (32 - bits)) >>> 0);
         const start = (base & mask) >>> 0;
         const end = (start | ((~mask) >>> 0)) >>> 0;
