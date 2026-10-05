@@ -334,6 +334,14 @@ const probeGateway = new ProbeGateway(
     (settings.probe && typeof settings.probe.token === "string") ? settings.probe.token : "");
 server.addSyncObject("probeState","global",probeGateway.syncProbes);
 
+// POST, not GET: the sync server checks write permission for non-GET routes,
+// so only users who may change setup can read the probe's shared secret.
+server.addRoute("POST", "probeToken","global", (client: WebsocketClient, query:string[], postData: any) => {
+    return new Promise((resolve) => {
+        resolve({message:200, data:{ token: probeGateway.getToken() }});
+    });
+});
+
 // Audio monitor. When a probe is connected the monitor uses it, so the
 // crosspoint container itself needs no multicast access.
 const audioMonitor = new AudioMonitorService();
@@ -853,11 +861,9 @@ server.addRoute("POST", "audioMonitorSetChannels","global", (client: WebsocketCl
         let a = parseInt("" + postData.channels[0]);
         let b = parseInt("" + postData.channels[1]);
         if(isNaN(a) || isNaN(b) || a < 0 || b < 0){ reject({message:"invalid channel pair"}); return; }
-        if(audioMonitor.setChannels(listenerId, [a, b])){
-            resolve({message:200, data:{ok:true}});
-        }else{
-            reject({message:"no such listener"});
-        }
+        audioMonitor.setChannels(listenerId, [a, b])
+            .then((ok)=>{ ok ? resolve({message:200, data:{ok:true}}) : reject({message:"no such listener"}); })
+            .catch((e:any)=>reject({message:"channel switch failed: " + (e?.message || e)}));
     });
 });
 

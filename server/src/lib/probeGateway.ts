@@ -64,6 +64,10 @@ export class ProbeGateway {
         this.publishState();
     }
 
+    getToken(): string {
+        return this.token;
+    }
+
     /** True when at least one authenticated probe is connected. */
     hasProbe(): boolean {
         return this.probes.size > 0;
@@ -168,8 +172,9 @@ export class ProbeGateway {
     }
 
     private buildState() {
+        // No token here: this state goes to every reader, the token only
+        // through the write-gated probeToken route.
         return {
-            token: this.token,
             probes: Array.from(this.probes).map((p) => ({
                 name: p.name,
                 address: p.address,

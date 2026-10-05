@@ -18,8 +18,8 @@
  *                                                                      ▼
  *                            werift MediaStreamTrack → DTLS/SRTP → browser
  *
- * One Producer per `senderId`. Multiple Consumers per Producer (SFU
- * style — encoder runs once, RTP packets are fan-outed). When the last
+ * One Producer per sender and channel pair. Multiple Consumers per Producer
+ * (SFU style — encoder runs once, RTP packets are fan-outed). When the last
  * Consumer leaves, the Producer drops IGMP membership and closes.
  *
  * The implementation uses two optional native dependencies. They are
@@ -82,7 +82,10 @@ interface ParsedSdp {
 }
 
 interface ProducerEntry {
+    key:        string;          // producerKey(senderId, channel pair)
     senderId:   string;
+    sdpText:    string;          // kept so a listener can be moved to another pair
+    iface:      string;
     sdpParams:  ParsedSdp;
     // Packet source: EITHER a local IGMP-joined UDP socket OR a stream
     // forwarded by a crosspoint_probe on the media network. Exactly one
@@ -110,8 +113,6 @@ interface ProducerEntry {
     pcmAvail:     number;        // frames buffered
 
     // ----- Outgoing RTP state -----
-    rtpSeq:  number;
-    rtpTs:   number;
     rtpSsrc: number;
     payloadType: number;         // dynamic — picked from the answer SDP
 
@@ -125,6 +126,11 @@ interface ConsumerEntry {
     pc:         any;             // werift RTCPeerConnection
     track:      any;             // werift MediaStreamTrack (audio sendonly)
     payloadType?: number;        // negotiated Opus PT (from the answer)
+    producerKey: string;         // key of the producer this consumer listens on
+    // Per consumer, so moving a consumer to another producer keeps its RTP
+    // sequence and timestamp continuous.
+    rtpSeq:     number;
+    rtpTs:      number;
     // Trickled-out ICE candidates buffer. The browser polls via the
     // `audioMonitorIceServer` route — we accumulate here and drain.
     pendingServerIce: any[];
@@ -145,6 +151,9 @@ export class AudioMonitorService {
     public static get instance(): AudioMonitorService | null { return this._instance; }
 
     private producers: Map<string, ProducerEntry> = new Map();
+    // Producers being opened, so concurrent subscribes for the same sender and
+    // pair share one open instead of each opening (and leaking) a producer.
+    private opening: Map<string, Promise<ProducerEntry>> = new Map();
     private consumers: Map<string, ConsumerEntry> = new Map();
     // WS-Client → Set seiner aktiven listenerIds. Damit kann der Server
     // bei WS-Disconnect (Browser-Tab geschlossen, Netzwerkabbruch)
@@ -310,13 +319,12 @@ export class AudioMonitorService {
         //      answerer keeps the offerer's PT, 96 is the safe default;
         //      we still honour cons.payloadType if the answer happened
         //      to renumber it.
-        prod.rtpSeq = (prod.rtpSeq + 1) & 0xFFFF;
-        prod.rtpTs  = (prod.rtpTs + FRAME_SAMPLES) >>> 0;
-
         const { RtpPacket, RtpHeader } = _werift;
         for (const lid of prod.listeners) {
             const cons = this.consumers.get(lid);
             if (!cons || !cons.track) continue;
+            cons.rtpSeq = (cons.rtpSeq + 1) & 0xFFFF;
+            cons.rtpTs  = (cons.rtpTs + FRAME_SAMPLES) >>> 0;
             try {
                 const ssrc = (typeof cons.track.ssrc === "number") ? cons.track.ssrc : 0;
                 const header = new RtpHeader({
@@ -325,8 +333,8 @@ export class AudioMonitorService {
                     extension:      false,
                     marker:         false,
                     payloadType:    cons.payloadType ?? 96,
-                    sequenceNumber: prod.rtpSeq,
-                    timestamp:      prod.rtpTs,
+                    sequenceNumber: cons.rtpSeq,
+                    timestamp:      cons.rtpTs,
                     ssrc:           ssrc
                 });
                 const pkt = new RtpPacket(header, opusFrame);
@@ -350,7 +358,11 @@ export class AudioMonitorService {
         } else {
             sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
             await new Promise<void>((resolve, reject) => {
-                sock.bind(params.port, () => {
+                // Bind to the group, not 0.0.0.0: on Linux a wildcard socket
+                // receives every group joined on this port, so two senders
+                // on 5004 would mix. Windows cannot bind a multicast address.
+                const bindAddr = process.platform === "win32" ? undefined : params.multicast;
+                sock.bind(params.port, bindAddr, () => {
                     try {
                         sock.addMembership(params.multicast, iface || "0.0.0.0");
                         resolve();
@@ -361,7 +373,8 @@ export class AudioMonitorService {
         }
 
         const prod: ProducerEntry = {
-            senderId, sdpParams: params, udpSocket: sock,
+            key: AudioMonitorService.producerKey(senderId, ch),
+            senderId, sdpText: sdp, iface, sdpParams: params, udpSocket: sock,
             probeStream: null,
             sourceLabel,
             listeners: new Set(),
@@ -376,8 +389,6 @@ export class AudioMonitorService {
             pcmRead:  0,
             pcmAvail: 0,
 
-            rtpSeq:      Math.floor(Math.random() * 0xFFFF),
-            rtpTs:       Math.floor(Math.random() * 0xFFFFFFFF) >>> 0,
             rtpSsrc:     Math.floor(Math.random() * 0xFFFFFFFF) >>> 0,
             payloadType: 96,
 
@@ -441,6 +452,38 @@ export class AudioMonitorService {
     }
 
 
+    static producerKey(senderId: string, ch: [number, number]): string {
+        return senderId + "|" + (ch[0] | 0) + "|" + (ch[1] | 0);
+    }
+
+    /** Add a listener to the producer for this sender and pair, opening it if needed. */
+    private async acquireProducer(senderId: string, sdp: string, ch: [number, number], iface: string, listenerId: string): Promise<ProducerEntry> {
+        const key = AudioMonitorService.producerKey(senderId, ch);
+        let prod = this.producers.get(key);
+        if (!prod) {
+            let opening = this.opening.get(key);
+            if (!opening) {
+                opening = this.openProducer(senderId, sdp, ch, iface)
+                    .then((p) => { this.producers.set(key, p); return p; })
+                    .finally(() => { this.opening.delete(key); });
+                this.opening.set(key, opening);
+            }
+            prod = await opening;
+        }
+        prod.listeners.add(listenerId);
+        return prod;
+    }
+
+    /** Remove a listener; the producer closes with its last listener. */
+    private releaseListener(prod: ProducerEntry, listenerId: string) {
+        prod.listeners.delete(listenerId);
+        if (prod.listeners.size === 0) {
+            this.closeProducer(prod);
+            if (this.producers.get(prod.key) === prod) this.producers.delete(prod.key);
+        }
+    }
+
+
     // ===== Subscribe / signaling API =====
 
     async subscribe(args: SubscribeArgs): Promise<{ ok: true; offer: any } | { ok: false; error: string }> {
@@ -449,16 +492,12 @@ export class AudioMonitorService {
         }
 
         // ----- Producer -----
-        let prod = this.producers.get(args.senderId);
-        if (!prod) {
-            try {
-                prod = await this.openProducer(args.senderId, args.sdp, args.channels || [0, 1], args.iface || "0.0.0.0");
-                this.producers.set(args.senderId, prod);
-            } catch (e: any) {
-                return { ok: false, error: "Could not join multicast: " + (e?.message || e) };
-            }
+        let prod: ProducerEntry;
+        try {
+            prod = await this.acquireProducer(args.senderId, args.sdp, args.channels || [0, 1], args.iface || "0.0.0.0", args.listenerId);
+        } catch (e: any) {
+            return { ok: false, error: "Could not join multicast: " + (e?.message || e) };
         }
-        prod.listeners.add(args.listenerId);
 
         // ----- Consumer / WebRTC -----
         const { RTCPeerConnection, MediaStreamTrack } = _werift;
@@ -540,11 +579,7 @@ export class AudioMonitorService {
         } catch (e: any) {
             // Drop the listener ref so the producer can shut down if it's
             // the only one.
-            prod.listeners.delete(args.listenerId);
-            if (prod.listeners.size === 0) {
-                this.closeProducer(prod);
-                this.producers.delete(args.senderId);
-            }
+            this.releaseListener(prod, args.listenerId);
             return { ok: false, error: "WebRTC offer failed: " + (e?.message || e) };
         }
 
@@ -552,6 +587,9 @@ export class AudioMonitorService {
             listenerId: args.listenerId,
             senderId:   args.senderId,
             pc, track,
+            producerKey: prod.key,
+            rtpSeq:     Math.floor(Math.random() * 0xFFFF),
+            rtpTs:      Math.floor(Math.random() * 0xFFFFFFFF) >>> 0,
             pendingServerIce: []
         });
         return { ok: true, offer: { type: offer.type, sdp: offer.sdp } };
@@ -595,25 +633,50 @@ export class AudioMonitorService {
     }
 
     /**
-     * Live channel-pair switch — updates the producer's pickL / pickR in
-     * place without tearing the multicast / encoder / PeerConnection
-     * down. Avoids the IGMP-leave/join churn (and the resulting audio
+     * Live channel-pair switch for one listener. As the producer's only
+     * listener it updates pickL / pickR in place without tearing the
+     * multicast / encoder / PeerConnection down; otherwise it moves just
+     * this listener to a producer for the new pair, so the others keep
+     * theirs. The in-place path Avoids the IGMP-leave/join churn (and the resulting audio
      * gap or worse: a `bind` race on the same UDP port that broke the
      * stream a few seconds after a switch).
      */
-    setChannels(listenerId: string, channels: [number, number]): boolean {
+    async setChannels(listenerId: string, channels: [number, number]): Promise<boolean> {
         const c = this.consumers.get(listenerId);
         if (!c) return false;
-        const prod = this.producers.get(c.senderId);
+        const prod = this.producers.get(c.producerKey);
         if (!prod) return false;
-        const ch = prod.sdpParams.channels;
-        prod.pickL = Math.max(0, Math.min(channels[0] | 0, ch - 1));
-        prod.pickR = Math.max(0, Math.min(channels[1] | 0, ch - 1));
-        // Wipe the jitter buffer — anything queued was the previous pair.
-        prod.pcmRead = 0;
-        prod.pcmWrite = 0;
-        prod.pcmAvail = 0;
-        SyncLog.log("info", "AudioMonitor", "Switched channel pair for " + c.senderId + " → " + prod.pickL + "/" + prod.pickR);
+        const key = AudioMonitorService.producerKey(c.senderId, channels);
+        if (key === prod.key) return true;
+
+        if (prod.listeners.size === 1 && !this.producers.has(key) && !this.opening.has(key)) {
+            // Sole listener: switch the pick in place.
+            const ch = prod.sdpParams.channels;
+            prod.pickL = Math.max(0, Math.min(channels[0] | 0, ch - 1));
+            prod.pickR = Math.max(0, Math.min(channels[1] | 0, ch - 1));
+            // Wipe the jitter buffer — anything queued was the previous pair.
+            prod.pcmRead = 0;
+            prod.pcmWrite = 0;
+            prod.pcmAvail = 0;
+            this.producers.delete(prod.key);
+            prod.key = key;
+            this.producers.set(key, prod);
+            c.producerKey = key;
+            SyncLog.log("info", "AudioMonitor", "Switched channel pair for " + c.senderId + " → " + prod.pickL + "/" + prod.pickR);
+            return true;
+        }
+
+        // Other listeners share this producer and keep their pair: move only
+        // this listener to the producer for the new pair.
+        const next = await this.acquireProducer(c.senderId, prod.sdpText, channels, prod.iface, listenerId);
+        if (this.consumers.get(listenerId) !== c) {
+            // Unsubscribed while the new producer was opening.
+            this.releaseListener(next, listenerId);
+            return false;
+        }
+        c.producerKey = next.key;
+        this.releaseListener(prod, listenerId);
+        SyncLog.log("info", "AudioMonitor", "Moved listener " + listenerId + " of " + c.senderId + " to pair " + next.pickL + "/" + next.pickR);
         return true;
     }
 
@@ -623,13 +686,9 @@ export class AudioMonitorService {
         try { await c.pc.close(); } catch (e) {}
         this.consumers.delete(listenerId);
 
-        const prod = this.producers.get(c.senderId);
+        const prod = this.producers.get(c.producerKey);
         if (!prod) return;
-        prod.listeners.delete(listenerId);
-        if (prod.listeners.size === 0) {
-            this.closeProducer(prod);
-            this.producers.delete(c.senderId);
-        }
+        this.releaseListener(prod, listenerId);
     }
 
     /**

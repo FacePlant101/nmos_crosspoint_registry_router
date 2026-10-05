@@ -69,7 +69,10 @@ function joinStream(ws: any, id: number, multicast: string, port: number) {
         try { socket.close(); } catch (err) {}
         streams.delete(id);
     });
-    socket.bind(port, () => {
+    // Bind to the group, not 0.0.0.0: on Linux a wildcard socket receives
+    // every group joined on this port, so two streams on 5004 would mix.
+    // Windows cannot bind a multicast address.
+    socket.bind(port, process.platform === "win32" ? undefined : multicast, () => {
         try {
             socket.addMembership(multicast, iface || undefined);
             log("joined " + multicast + ":" + port + " (stream " + id + ")");
