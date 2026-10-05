@@ -219,7 +219,11 @@ function New_ProcessMessage(json_string)
     if reconnectTimer then reconnectTimer:Stop() end
 
   elseif response.type == "response" then
-    print("DEBUG: Response to request ID " .. tostring(response.id) .. ": " .. response.message)
+    print("DEBUG: Response to request ID " .. tostring(response.id) .. ": " .. tostring(response.message))
+    local multiviewerRequest = pending_multiviewer[tostring(response.id)]
+    if multiviewerRequest then
+      HandleMultiviewerResponse(tostring(response.id), multiviewerRequest, response)
+    end
 
   elseif response.type == "permissionDenied" then
     print("ERROR: Permission denied for '" .. tostring(response.data and response.data.name) .. "'. Reason: " .. tostring(response.data and response.data.reason))
@@ -382,43 +386,133 @@ function toHex(str)
   end))
 end
 
--- Function to send multiviewer command via crosspoint router API
-function SendMultiviewerCommand(deviceSN, enabled)
-  if not deviceSN or deviceSN == "" then
-    print("ERROR: Cannot send multiviewer command - device serial number not provided")
-    return
+-- Multiviewer buttons and the decoder name control each one belongs to; filled in by Initialize()
+multiviewer_bindings = {}
+-- Multiviewer toggle requests awaiting the router's answer, by request id
+pending_multiviewer = {}
+-- Enabling multiviewer also enables master mode, which the router retries for several seconds
+local MULTIVIEWER_PENDING_TIMEOUT = 30
+
+-- Strip a flow suffix (.1, .v2, .a1, .u3, .v) the way the router parses addresses;
+-- other dots belong to the device name and are kept
+function BaseDeviceName(name)
+  return name:match("^(.*)%.[vadu]%d*$") or name:match("^(.*)%.%d+$") or name
+end
+
+-- Find a decoder in the synced Matrox state by serial number (the state key) or device name.
+-- Returns the serial and the device table, or nil.
+function FindMatroxDevice(name)
+  if not name or name == "" or not stored_device_data or not stored_device_data.devices then
+    return nil
   end
-  
+  local base = BaseDeviceName(name)
+  local lower = base:lower()
+  for sn, device in pairs(stored_device_data.devices) do
+    if type(sn) == "string" and sn:lower() == lower then return sn, device end
+  end
+  for sn, device in pairs(stored_device_data.devices) do
+    if type(device) == "table" and type(device.name) == "string" and device.name:lower() == lower then
+      return sn, device
+    end
+  end
+  return nil
+end
+
+-- Mirror each decoder's multiviewer state onto its button. A button with a toggle in flight
+-- keeps the operator's value until the router answers.
+function UpdateMultiviewerFeedback()
+  local now = os.time()
+  local busy = {}
+  for id, request in pairs(pending_multiviewer) do
+    if now - request.sent_at > MULTIVIEWER_PENDING_TIMEOUT then
+      print("WARNING: No answer to multiviewer request " .. id .. " for " .. request.device .. "; showing the device state")
+      pending_multiviewer[id] = nil
+    elseif request.control then
+      busy[request.control] = true
+    end
+  end
+
+  for _, binding in ipairs(multiviewer_bindings) do
+    if not busy[binding.control] then
+      local _, device = FindMatroxDevice(binding.decoder.String)
+      if device and type(device.isMultiviewEnabled) == "boolean"
+         and binding.control.Boolean ~= device.isMultiviewEnabled then
+        binding.control.Boolean = device.isMultiviewEnabled
+      end
+    end
+  end
+end
+
+-- Settle a multiviewer toggle once the router has answered it
+function HandleMultiviewerResponse(id, request, response)
+  pending_multiviewer[id] = nil
+  local action = request.enabled and "enable" or "disable"
+  local sn, device = FindMatroxDevice(request.device)
+
+  if response.status == 200 then
+    -- The router read the setting back from the decoder before answering, so record it now
+    -- rather than wait for the next state sync.
+    if device then device.isMultiviewEnabled = request.enabled end
+    print("Multiviewer " .. action .. "d on " .. request.device)
+    if request.on_success then request.on_success() end
+  else
+    print("ERROR: Multiviewer " .. action .. " failed on " .. request.device .. ": " .. tostring(response.message))
+    -- Show what the decoder reports; without a report, assume nothing changed.
+    if request.control and not (device and type(device.isMultiviewEnabled) == "boolean") then
+      request.control.Boolean = not request.enabled
+    end
+  end
+  UpdateMultiviewerFeedback()
+end
+
+-- Send a multiviewer toggle via the crosspoint router API. `control` (optional) is the button that
+-- asked for it; `on_success` (optional) runs once the router confirms the change.
+-- Returns the request id, or nil if nothing was sent.
+function SendMultiviewerCommand(deviceName, enabled, control, on_success)
+  if not deviceName or deviceName == "" then
+    print("ERROR: Cannot send multiviewer command - device name not provided")
+    return nil
+  end
+
   if not ws or not isSocketConnected or not isAuthenticated then
     print("ERROR: Cannot send multiviewer command - not connected to crosspoint router")
-    return
+    return nil
   end
-  
-  -- Strip a flow suffix (.1, .v2, .a1, .u3, .v) the way the router parses addresses;
-  -- other dots belong to the device name and are kept
-  local baseDeviceSN = deviceSN:match("^(.*)%.[vadu]%d*$") or deviceSN:match("^(.*)%.%d+$") or deviceSN
-  
-  print("Sending multiviewer command via crosspoint router for device " .. deviceSN .. " (base: " .. baseDeviceSN .. "): " .. (enabled and "ENABLE" or "DISABLE"))
-  
+
+  -- Address the decoder by its serial when the synced state knows it; the router accepts a
+  -- serial or the exact device name.
+  local target = FindMatroxDevice(deviceName) or BaseDeviceName(deviceName)
+  local id = tostring(request_id)
+  request_id = request_id + 1
+
+  print("Sending multiviewer command for " .. deviceName .. " (" .. target .. "): " .. (enabled and "ENABLE" or "DISABLE"))
+
   local command = {
     type = "request",
     method = "POST",
     route = "matroxcip_togglemultiviewer",
-    id = tostring(request_id),
+    id = id,
     data = {
-      sn = baseDeviceSN,
+      sn = target,
       enabled = enabled
     }
   }
-  request_id = request_id + 1
 
   local json_command, err = rapidjson.encode(command)
-  if json_command then
-    print("Sending multiviewer command: " .. json_command)
-    ws:Write(json_command)
-  else
+  if not json_command then
     print(format("Failed to encode multiviewer JSON command: %s", err))
+    return nil
   end
+
+  pending_multiviewer[id] = {
+    device = target,
+    enabled = enabled,
+    control = control,
+    on_success = on_success,
+    sent_at = os.time()
+  }
+  ws:Write(json_command)
+  return id
 end
 
 -- Enhanced multiviewer functions supporting both postfix and flow type notation
@@ -502,17 +596,18 @@ function SetupMultiviewer(decoderName, encoderList, options)
   -- Step 1: Enable multiviewer mode if requested
   if enableFirst then
     print("Step 1: Enabling multiviewer mode for " .. decoderName)
-    SendMultiviewerCommand(decoderName, true)
-    
-    -- Add a small delay to allow multiviewer to initialize
-    Timer.CallAfter(function()
+    -- Patch only once the router confirms the decoder is in multiviewer mode
+    local id = SendMultiviewerCommand(decoderName, true, nil, function()
       print("Step 2: Connecting encoders to multiviewer channels")
       if useFlowType then
         ConnectToMultiviewerFlows(encoderList, decoderName, flowType, startChannel)
       else
         ConnectToMultiviewer(encoderList, decoderName, startChannel)
       end
-    end, 2)
+    end)
+    if not id then
+      print("ERROR: Multiviewer setup for " .. decoderName .. " aborted; encoders not connected")
+    end
   else
     -- Connect immediately without enabling multiviewer first
     if useFlowType then
@@ -571,7 +666,10 @@ function OnIndividualMultiviewerChanged(control, decoderControl)
   end
   
   print("✅ Sending multiviewer command for single decoder: " .. deviceSN)
-  SendMultiviewerCommand(deviceSN, enabled)
+  if not SendMultiviewerCommand(deviceSN, enabled, control) then
+    -- Nothing was sent, so the decoder did not change
+    control.Boolean = not enabled
+  end
 end
 
 -- Function to handle multiviewer control events (legacy/global version - kept for compatibility)
@@ -715,11 +813,6 @@ end
 
 -- Processes mediadevmatroxcip data and updates the CIP-Status control
 function UpdateCipStatus(data, action)
-  if not Controls["CIP-Status"] then 
-    debug_print("CIP-Status control not found")
-    return 
-  end
-  
   if DEBUG_ENABLED and data then
     if type(data) == "table" and #data > 0 then
       debug_print("UpdateCipStatus received array with " .. #data .. " items")
@@ -755,7 +848,13 @@ function UpdateCipStatus(data, action)
       end
       
       -- Handle different operations
-      if patch.op == "replace" then
+      if (patch.op == "add" or patch.op == "replace") and #path_parts == 2 and path_parts[1] == "devices" then
+        -- A whole device, e.g. a decoder discovered after we subscribed
+        if type(patch.value) == "table" then
+          stored_device_data.devices[path_parts[2]] = patch.value
+          debug_print("Stored device " .. path_parts[2])
+        end
+      elseif patch.op == "replace" then
         if #path_parts >= 3 and path_parts[1] == "devices" then
           local device_id = path_parts[2]
           local property = path_parts[3]
@@ -845,6 +944,14 @@ function UpdateCipStatus(data, action)
     end
   else
     debug_print("Unhandled action or data format")
+  end
+
+  -- Multiviewer buttons follow the device state on every update, not just throttled ones
+  UpdateMultiviewerFeedback()
+
+  if not Controls["CIP-Status"] then
+    debug_print("CIP-Status control not found")
+    return
   end
   
   -- Check if we should update the UI (throttling to prevent excessive updates)
@@ -1295,6 +1402,11 @@ function Initialize()
         -- Create a closure that captures the specific decoder information
         multiviewerControl.EventHandler = function(control)
           OnIndividualMultiviewerChanged(control, decoderControl)
+        end
+        table.insert(multiviewer_bindings, { control = multiviewerControl, decoder = decoderControl })
+        -- Pointing the slot at another decoder shows that decoder's state
+        decoderControl.EventHandler = function()
+          UpdateMultiviewerFeedback()
         end
       else
         print("WARNING: No corresponding decoder found for multiviewer control at index " .. i)
