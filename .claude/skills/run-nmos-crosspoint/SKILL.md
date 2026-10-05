@@ -118,13 +118,6 @@ local work, prefer the driver.
 - **Both devices are labelled "This is the device"**, in the UI and in `ls`.
   Tell them apart by `num` (1000/1001) or by the id suffix `…0001`/`…0002`
   (node1/node2).
-- **Node ≥ 24 does not load media-device drivers.** `server/src/lib/mediaDevices.ts`
-  does `require("../../" + f.path + f.name)`, and `Dirent.path` was removed in
-  Node 24 (`parentPath` remains). Under Node 26 the log shows
-  `Can not load from: matroxConvertIp.js … MODULE_NOT_FOUND`, and the same for
-  Riedel. `up` prints a note about this. NMOS routing is unaffected. The
-  Docker images use Node 20, where it works. To test the Matrox Convert IP
-  driver locally, use Node 20.
 - **Senders are idle.** Their `master_enable` is false and `destination_ip` is
   `0.0.0.0`, so a successful route gives `multicast_ip: null` and
   `destination_port: 22000` on the receiver. PEP keys (`ext_privacy_*`) do

@@ -205,9 +205,6 @@ const cmds = {
         for (const [n, p] of Object.entries(PROCS)) {
             if (!pidOf(n) && await portBusy(p.port)) die(`port ${p.port} (${n}) is already in use by another process — stop it${n === "crosspoint" ? " or set CP_PORT" : ""}`);
         }
-        if (+process.versions.node.split(".")[0] >= 24) {
-            console.log(`note: Node ${process.versions.node} — media device drivers (Matrox Convert IP, Riedel) will fail to load (Dirent.path removed in Node 24); NMOS routing is unaffected`);
-        }
         startProc("registry");
         if (!(await waitHttp(`${QUERY}/nodes`, 20000))) die("registry did not come up — see .rig/logs/registry.log");
         startProc("node1"); startProc("node2");
