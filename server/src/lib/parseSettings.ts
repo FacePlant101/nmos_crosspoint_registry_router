@@ -209,6 +209,54 @@ export function parseSettings(settings:any){
         }
     }
 
+    // ----- Virtual NMOS node -----
+    // Serves an IS-04 Node API carrying operator-supplied SDPs, so devices
+    // with no NMOS support of their own still appear to the rest of the plant.
+    // Off by default: it registers resources in someone else's registry, so it
+    // has to be an explicit choice.
+    //
+    // The identifiers below are MINTED and must survive a restart, or every
+    // boot would register a new node and orphan the previous one in the
+    // registry. This is the main reason settings.json is written back.
+    {
+        const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const mkUuid = () => require("crypto").randomUUID();
+
+        if(!settings.virtualNode || typeof settings.virtualNode !== "object"){
+            settings.virtualNode = {};
+        }
+        const vn = settings.virtualNode;
+        if(typeof vn.enabled !== "boolean"){ vn.enabled = false; }
+        if(typeof vn.nodeId !== "string" || !uuidRe.test(vn.nodeId)){ vn.nodeId = mkUuid(); }
+        if(typeof vn.deviceId !== "string" || !uuidRe.test(vn.deviceId)){ vn.deviceId = mkUuid(); }
+        if(typeof vn.label !== "string" || !vn.label){ vn.label = "NMOS Crosspoint Virtual Node"; }
+        // Empty means "work the advertised address out from the interfaces".
+        if(typeof vn.advertiseHost !== "string"){ vn.advertiseHost = ""; }
+
+        if(!Array.isArray(settings.virtualSenders)){
+            settings.virtualSenders = [];
+        }else{
+            settings.virtualSenders = settings.virtualSenders
+                .filter((v:any) => v && typeof v === "object")
+                .map((v:any) => ({
+                    id:   (typeof v.id === "string" && v.id) ? v.id : ("vs_" + Math.random().toString(36).slice(2,10)),
+                    name: (typeof v.name === "string") ? v.name : "",
+                    sdp:  (typeof v.sdp === "string") ? v.sdp : "",
+                    // Published as sender_id / source_id / flow_id in IS-04,
+                    // so they must be stable across restarts too.
+                    senderId: (typeof v.senderId === "string" && uuidRe.test(v.senderId)) ? v.senderId : mkUuid(),
+                    sourceId: (typeof v.sourceId === "string" && uuidRe.test(v.sourceId)) ? v.sourceId : mkUuid(),
+                    flowId:   (typeof v.flowId   === "string" && uuidRe.test(v.flowId))   ? v.flowId   : mkUuid(),
+                }));
+        }
+    }
+
+    // The PTP grandmaster the plant is supposed to be locked to; the virtual
+    // node publishes it as its clock reference.
+    if(!settings.hasOwnProperty("acceptableGmid") || typeof settings.acceptableGmid !== "string"){
+        settings.acceptableGmid = "";
+    }
+
     // DDNS: publish each node's name as an A record via RFC 2136 dynamic
     // updates. Off by default — it writes to someone else's DNS server.
     //

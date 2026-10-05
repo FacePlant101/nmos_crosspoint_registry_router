@@ -202,3 +202,23 @@
 
     li { margin-bottom: 0.5rem; }
 }
+
+// ----- Virtual senders -----
+.vs-row {
+    padding: 0.4rem 0;
+    border-bottom: 1px solid hsl(var(--b3));
+
+    &:last-child { border-bottom: none; }
+
+    .vs-name { flex: 1 1 auto; max-width: none; }
+}
+
+.vs-sdp {
+    width: 100%;
+    font-family: monospace;
+    font-size: 0.75rem;
+    line-height: 1.35;
+    // An SDP is wide; let it scroll rather than wrap into nonsense.
+    white-space: pre;
+    overflow-x: auto;
+}

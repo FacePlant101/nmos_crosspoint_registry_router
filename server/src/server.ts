@@ -32,6 +32,8 @@ import { ProbeGateway } from "./lib/probeGateway";
 import { AudioMonitorService } from "./lib/audioMonitor";
 import { MulticastLeaseManager } from "./lib/multicastLeaseManager";
 import { DdnsService } from "./lib/ddnsService";
+import { NmosNodeApi } from "./lib/NmosNode/NmosNodeApi";
+import { NmosNodeRegistration } from "./lib/NmosNode/NmosNodeRegistration";
 
 
 
@@ -330,6 +332,13 @@ server.addRoute("POST", "importLeases","global", (client: WebsocketClient, query
     });
 });
 
+// ----- Virtual NMOS node -----
+// Serves an IS-04 Node API carrying operator-supplied SDPs, so a device with
+// no NMOS support of its own still appears to every other controller on the
+// network. The crosspoint's own matrix does not show these senders; that needs
+// the virtual-sender integration, which is not ported.
+const nmosNodeApi = new NmosNodeApi(settings);
+
 // ----- DDNS -----
 // Publishes each node's name as an A record. Constructed before the connector
 // so the first node events already find it.
@@ -423,6 +432,22 @@ function getSetupConfigState() {
         // Read-only IS-12 status monitoring; absent means on.
         bcp008: { enabled: !(settings.bcp008 && settings.bcp008.enabled === false) },
         audioMonitor: { enabled: !!(settings.audioMonitor && settings.audioMonitor.enabled) },
+        virtualNode: (()=>{
+            const v:any = (settings.virtualNode && typeof settings.virtualNode === "object") ? settings.virtualNode : {};
+            return {
+                enabled: !!v.enabled,
+                label: (typeof v.label === "string") ? v.label : "",
+                advertiseHost: (typeof v.advertiseHost === "string") ? v.advertiseHost : "",
+                // Read-only: minted once and stable, shown so an operator can
+                // find this node in their registry.
+                nodeId: (typeof v.nodeId === "string") ? v.nodeId : "",
+                deviceId: (typeof v.deviceId === "string") ? v.deviceId : "",
+            };
+        })(),
+        virtualSenders: Array.isArray(settings.virtualSenders)
+            ? settings.virtualSenders.map((v:any)=>({ id:v.id, name:v.name || "", sdp:v.sdp || "", senderId:v.senderId }))
+            : [],
+        acceptableGmid: (typeof settings.acceptableGmid === "string") ? settings.acceptableGmid : "",
         // The TSIG secret is a credential and never leaves the server.
         // keySecretSet lets the UI show that one is configured without it.
         ddns: (()=>{
@@ -657,6 +682,76 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         }
                     });
                 }
+            }
+
+            // --- Virtual node. Toggling it or editing the senders re-POSTs
+            // the resource set to the registry, so it applies without a restart.
+            if(postData.hasOwnProperty("virtualNode") && typeof postData.virtualNode === "object" && postData.virtualNode){
+                const v = postData.virtualNode;
+                const next:any = {};
+                if(v.hasOwnProperty("enabled")){
+                    if(typeof v.enabled !== "boolean"){ reject({message:"virtualNode.enabled must be a boolean."}); return; }
+                    next.enabled = v.enabled;
+                }
+                if(v.hasOwnProperty("label")){
+                    const l = ("" + v.label).trim();
+                    if(l.length > 128){ reject({message:"Virtual node label must be 128 characters or fewer."}); return; }
+                    next.label = l || "NMOS Crosspoint Virtual Node";
+                }
+                if(v.hasOwnProperty("advertiseHost")){
+                    const h = ("" + v.advertiseHost).trim();
+                    if(h !== "" && !/^[0-9a-zA-Z.:_-]+$/.test(h)){
+                        reject({message:"Advertise host contains invalid characters."}); return;
+                    }
+                    next.advertiseHost = h;
+                }
+                mutations.push(()=>{
+                    if(!settings.virtualNode || typeof settings.virtualNode !== "object"){ settings.virtualNode = {}; }
+                    Object.assign(settings.virtualNode, next);
+                });
+            }
+
+            if(postData.hasOwnProperty("virtualSenders")){
+                if(!Array.isArray(postData.virtualSenders)){
+                    reject({message:"virtualSenders must be an array."});
+                    return;
+                }
+                if(postData.virtualSenders.length > 200){
+                    reject({message:"Too many virtual senders (limit 200)."});
+                    return;
+                }
+                for(const v of postData.virtualSenders){
+                    if(!v || typeof v !== "object"){
+                        reject({message:"Each virtual sender must be an object."}); return;
+                    }
+                    if(typeof v.sdp !== "string" || v.sdp.trim() === ""){
+                        reject({message:"Each virtual sender needs an SDP."}); return;
+                    }
+                    if(v.sdp.length > 65536){
+                        reject({message:"That SDP is too large (limit 64 KB)."}); return;
+                    }
+                    // Cheap sanity check so an obviously wrong paste is caught
+                    // here rather than producing an empty IS-04 record.
+                    if(!/^\s*v=0/.test(v.sdp) || !/^m=/m.test(v.sdp)){
+                        reject({message:"That does not look like an SDP (expected a v=0 line and an m= line)."}); return;
+                    }
+                }
+                const senders = postData.virtualSenders;
+                mutations.push(()=>{
+                    settings.virtualSenders = senders;
+                    // Re-normalise so each sender keeps or gains its stable ids.
+                    settings = parseSettings(settings);
+                });
+            }
+
+            if(postData.hasOwnProperty("virtualNode") || postData.hasOwnProperty("virtualSenders")){
+                sideEffects.push(()=>{
+                    try{
+                        NmosNodeApi.instance?.setSettings(settings);
+                        NmosNodeRegistration.instance?.setSettings(settings);
+                        NmosNodeRegistration.instance?.syncResources().catch(()=>{});
+                    }catch(e){}
+                });
             }
 
             // --- DDNS. An empty keySecret from the client means "leave the
@@ -939,11 +1034,33 @@ server.addExpressMiddleware('/api/metrics', async (req, res) => {
     }
 });
 
+// The IS-04 / IS-05 routes must be registered BEFORE the SPA catch-all, which
+// would otherwise answer /x-nmos/... with index.html.
+try{
+    nmosNodeApi.mount(server.getExpressApp());
+    SyncLog.info("nmos_node", "Virtual node API mounted at /x-nmos/node/v1.3/");
+}catch(e){
+    SyncLog.log("error", "nmos_node", "Could not mount the virtual node API", e);
+}
+
 // Register SPA catch-all route after all middleware
 server.registerSpaRoute();
 
 // Start the server after all routes are registered
 server.startServer(serverAddress, serverPort);
+
+// Registering with the registry has to wait for the listener: the address the
+// node advertises is probed from a live socket, and the registry will fetch
+// the resources straight back from us.
+const nmosNodeRegistration = new NmosNodeRegistration(settings);
+setTimeout(async () => {
+    try{
+        await nmosNodeApi.detectAdvertiseHostAsync();
+        await nmosNodeRegistration.start();
+    }catch(e){
+        SyncLog.log("error", "nmos_node", "Virtual node registration failed to start", e);
+    }
+}, 2000);
 
 
 
