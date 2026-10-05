@@ -252,6 +252,9 @@ export class NmosRegistryConnector {
                                 priority: (typeof srv.priority === "number") ? srv.priority : 100,
                                 source: "dnssd",
                                 domain,
+                                // The SRV target, not the resolved address:
+                                // see NmosRegistry.discoveryKey.
+                                discoveryKey: target + ":" + srv.port,
                             });
                         }
                     } catch (e) { /* instance without SRV - skip */ }
@@ -274,16 +277,37 @@ export class NmosRegistryConnector {
     private addRegistry(registry: NmosRegistry) {
         const rank = NmosRegistryConnector.sourceRank(registry.source);
 
-        // Already known endpoint: keep the existing connection and only
-        // relabel it when a higher-ranked source confirms the same address.
-        // The old code relabelled whenever the entry was not "static", so a
-        // periodic mDNS answer could downgrade a manual entry's source.
+        // Already known: keep the existing connection and only relabel it when
+        // a higher-ranked source confirms it. The old code relabelled whenever
+        // the entry was not "static", so a periodic mDNS answer could downgrade
+        // a manual entry's source.
+        //
+        // "Already known" means the same endpoint OR the same discovered
+        // service instance. The second test is what stops one registry being
+        // added twice when its A lookup succeeds on one pass and fails on
+        // another, since the address we store differs between the two.
         for (let i = 0; i < this.nmosRegistryList.length; i++) {
             const el = this.nmosRegistryList[i];
-            if (el.ip + ":" + el.port == registry.ip + ":" + registry.port) {
+            const sameEndpoint = (el.ip + ":" + el.port) === (registry.ip + ":" + registry.port);
+            const sameInstance = !!registry.discoveryKey && el.discoveryKey === registry.discoveryKey;
+            if (sameEndpoint || sameInstance) {
                 if (rank > NmosRegistryConnector.sourceRank(el.source)) {
-                    this.nmosRegistryList[i] = registry;
+                    // Upgrade the metadata only. The address stays as it is,
+                    // because that is the one we actually hold subscriptions
+                    // to — replacing the whole entry would make the Setup page
+                    // show an endpoint the connector is not talking to.
+                    // Re-pointing a live registry needs the generation counter
+                    // noted below, which is not here yet.
+                    el.source = registry.source;
+                    el.priority = registry.priority;
+                    el.domain = registry.domain;
+                    if (registry.discoveryKey) { el.discoveryKey = registry.discoveryKey; }
                     this.updateSyncConnectionState();
+                } else if (registry.discoveryKey && !el.discoveryKey) {
+                    // Same endpoint, now also seen via DNS-SD. Remember the
+                    // instance identity so a later pass that resolves the name
+                    // differently still recognises this entry.
+                    el.discoveryKey = registry.discoveryKey;
                 }
                 return;
             }
@@ -2350,6 +2374,17 @@ interface NmosRegistry {
     domain: string;
     priority: number;
     source: "mdns" | "dnssd" | "static" | "manual";
+    /**
+     * Stable identity of a DISCOVERED service instance: the SRV target and
+     * port, independent of whatever address that name currently resolves to.
+     *
+     * Deduplication cannot rely on ip:port for these. The A lookup is allowed
+     * to fail — we then fall back to using the hostname as the address, since
+     * it still works in a URL — so the same registry appears under its name on
+     * one pass and under its numeric address on the next, and would otherwise
+     * be added twice with two full sets of subscriptions.
+     */
+    discoveryKey?: string;
 }
 
 interface ConnectionList {
