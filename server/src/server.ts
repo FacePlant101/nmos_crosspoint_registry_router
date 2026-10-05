@@ -322,7 +322,9 @@ server.addRoute("POST", "importLeases","global", (client: WebsocketClient, query
             SyncLog.log("info", "Multicast Lease", "Imported leases by " + client.user + ".", r);
             resolve({message:200, data:r});
         }catch(e:any){
-            reject({message:"import failed: " + (e?.message || e)});
+            // The UI already prefixes "Import failed:", so pass the reason
+            // through rather than stuttering it back at the operator.
+            reject({message: (e?.message || "" + e)});
         }
     });
 });

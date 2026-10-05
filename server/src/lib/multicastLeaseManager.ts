@@ -458,14 +458,25 @@ export class MulticastLeaseManager {
         const newLeases: { [id: string]: MulticastLease } = {};
         const newIndex: Map<string, string> = new Map();
         let dropped = 0;
+        const offered = Object.keys(data.leases).length;
 
         for (const id in data.leases) {
             const raw = data.leases[id];
             if (!raw || !MULTICAST_CATEGORIES.includes(raw.category)) { dropped++; continue; }
-            // Same check as load(): an invalid IP drives the reconcile loop forever.
-            if (!this.ipIsValid(raw.primaryIp) || !this.ipIsValid(raw.secondaryIp)) { dropped++; continue; }
+            // Same bar as load(): a lease is only usable if BOTH addresses
+            // parse. A type check alone let "" or "239.120.0" through, and the
+            // reconcile would then keep trying to put that value on a device
+            // that can never report it back — exactly the loop load() warns
+            // about and refuses to create.
+            if (!this.ipIsValid(raw.primaryIp) || !this.ipIsValid(raw.secondaryIp)) {
+                SyncLog.log("warning", "Multicast Lease",
+                    "Import dropping lease with invalid IPs for " + id +
+                    " (primary='" + raw.primaryIp + "', secondary='" + raw.secondaryIp + "')");
+                dropped++;
+                continue;
+            }
             if (newIndex.has(raw.primaryIp) || newIndex.has(raw.secondaryIp)) {
-                SyncLog.log("warn", "Multicast Lease", "Import dropping duplicate lease for " + id + " — IP already claimed.");
+                SyncLog.log("warning", "Multicast Lease", "Import dropping duplicate lease for " + id + " — IP already claimed.");
                 dropped++;
                 continue;
             }
@@ -501,6 +512,16 @@ export class MulticastLeaseManager {
                 }
             }
         }
+        // An import REPLACES the inventory, so committing an empty result is
+        // destructive: every sender loses its reservation and the next sweep
+        // re-addresses the whole plant. A file that offered leases and had
+        // every one rejected is malformed, not an intentional clear, so refuse
+        // it and leave the current inventory alone. Importing a genuinely
+        // empty file still clears, because that asks for nothing to be kept.
+        if (offered > 0 && Object.keys(newLeases).length === 0) {
+            throw new Error("All " + offered + " lease(s) in the file were rejected as invalid; the existing inventory was left unchanged.");
+        }
+
         this.leases = newLeases;
         this.ipToSender = newIndex;
         this.persist();
