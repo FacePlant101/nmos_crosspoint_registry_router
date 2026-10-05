@@ -54,11 +54,24 @@ for (const [name, bad] of [
     check("rejects a primaryIp that is " + name,
         res.imported === 1 && res.dropped === 1 && !m.getLease("bad"), JSON.stringify(res));
 }
+// A MALFORMED secondary is still rejected...
 const res2 = m.importLeases({
-    leases: { good: lease("239.120.0.1", "239.120.0.2"), bad: lease("239.120.0.3", "") },
+    leases: { good: lease("239.120.0.1", "239.120.0.2"), bad: lease("239.120.0.3", "239.120.0") },
 });
-check("rejects an invalid secondaryIp too",
+check("rejects a malformed secondaryIp",
     res2.imported === 1 && res2.dropped === 1 && !m.getLease("bad"), JSON.stringify(res2));
+
+// ...but an ABSENT one is legitimate: it means leg 2 carries no reservation,
+// which the reconcile reads as "leave that leg alone". The alternative the
+// code used to take — copying the primary — put both 2022-7 legs on one group.
+const res3 = m.importLeases({
+    leases: { solo: lease("239.120.0.5", "") },
+});
+check("accepts an absent secondaryIp as an unmanaged leg 2",
+    res3.imported === 1 && res3.dropped === 0, JSON.stringify(res3));
+check("an absent secondary is never backfilled with the primary",
+    m.getLease("solo") && m.getLease("solo").secondaryIp !== m.getLease("solo").primaryIp,
+    JSON.stringify(m.getLease("solo")));
 
 // --- nothing invalid can reach the reconcile
 m.importLeases({ leases: { good: lease("239.120.0.1", "239.120.0.2"), bad: lease("", "") } });
