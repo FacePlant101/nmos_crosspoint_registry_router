@@ -88,7 +88,7 @@ a temp dir that has a `state/` subdir, then call it:
 
 ```bash
 cd server && npm run build && cd ..
-sh test/unit/run-all.sh
+sh test/run-all.sh
 cd server && ./node_modules/.bin/tsc --noEmit && cd ..
 ```
 
