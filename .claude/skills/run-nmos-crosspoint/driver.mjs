@@ -218,13 +218,12 @@ const cmds = {
         startProc("crosspoint");
         if (!(await waitHttp(`http://127.0.0.1:${CP_PORT}/`, 20000))) die("crosspoint did not come up — see .rig/logs/crosspoint.log");
         // Ready means the crosspoint model has both nodes' senders, not just that the port is open.
-        // 8, not 10: the crosspoint has no "mux" category, so each node's AM824 mux sender is dropped.
         const end2 = Date.now() + 90000;
         while (Date.now() < end2) {
             try {
                 const cp = await withWs((a) => a.sync("crosspoint"));
                 const n = cp.devices.flatMap((d) => flatSenders(d)).length;
-                if (cp.devices.length >= 2 && n >= 8) { console.log(`ready: ${cp.devices.length} devices, ${n} senders — UI http://127.0.0.1:${CP_PORT}/ (admin/admin)`); return; }
+                if (cp.devices.length >= 2 && n >= 10) { console.log(`ready: ${cp.devices.length} devices, ${n} senders — UI http://127.0.0.1:${CP_PORT}/ (admin/admin)`); return; }
             } catch {}
             await sleep(1000);
         }

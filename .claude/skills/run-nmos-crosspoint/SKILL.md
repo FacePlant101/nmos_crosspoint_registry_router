@@ -102,19 +102,9 @@ local work, prefer the driver.
 
 ## Gotchas
 
-- **USB routing fails against IPMX nodes.** NMOS-Reference publishes USB as
-  `urn:x-nmos:transport:usb` (its canonical namespace). The MatroxOnly spec says
-  `urn:x-matrox:transport:usb`, and `transportShortCode()` in
-  `server/src/lib/functions.ts` only knows the Matrox URN. In `ls` the USB
-  resources show `transport=""`, and `connect` on the USB pair
-  (`…2030…0002` → `…3030…0001`) fails with `Transport Type missing.`. That is
-  current behaviour, not a rig fault.
-- **Mux senders are dropped.** Each node registers 5 senders, but the
-  crosspoint shows 4. The `urn:x-nmos:format:mux` AM824 sender has no category
-  in the crosspoint model. `up` therefore waits for 8 senders, not 10.
-- **Format strings from MatroxOnly flows are partly broken.** The USB data
-  flow renders as the literal `flow.media.type`. AM824 audio renders as
-  `2Ch undefinedbit 48kHz`. Use `ls` to see this.
+- **Mux senders are listed as audio.** Each node's AM824 mux sender
+  (`…2020…`) and mux receiver (`…3000…`) show as type `audio` with format
+  `AM824 mux 2 audio`, so `up` waits for all 10 senders.
 - **Both devices are labelled "This is the device"**, in the UI and in `ls`.
   Tell them apart by `num` (1000/1001) or by the id suffix `…0001`/`…0002`
   (node1/node2).
