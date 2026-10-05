@@ -2217,27 +2217,51 @@ export class NmosRegistryConnector {
                 }
             }
 
+            const requested: any[] = Array.isArray(data?.legs) ? data.legs : [];
+            if(requested.length === 0){
+                // Nothing to set. Falling through would send an all-"auto"
+                // patch, which tells the device to reassign every leg — the
+                // opposite of a no-op.
+                SyncLog.log("verbose", "nmos", "setFlowMulticast called with no legs for " + senderId + " - nothing to do.");
+                return;
+            }
+
+            // Size the array to the sender's REAL leg count. IS-05 expects
+            // transport_params to match the sender, and this always sent two
+            // entries, so a single-leg (non-2022-7) sender got a two-element
+            // patch that a conforming device rejects outright.
+            const activeParams: any[] = Array.isArray(this.nmosState.senderActiveData?.[senderId]?.transport_params)
+                ? this.nmosState.senderActiveData[senderId].transport_params : [];
+            // Never fewer slots than the highest leg we were asked to write.
+            const highestRequested = requested.reduce((m: number, l: any) => Math.max(m, Number(l?.index) + 1), 1);
+            const legCount = Math.max(activeParams.length, highestRequested);
+
             let patch:any = {
                 "receiver_id": null,
                 "activation": {
                     "mode": "activate_immediate",
                     "requested_time": null,
                 },
-                // Initialize legs with minimal valid sender-side params to avoid empty objects
-                "transport_params": [
-                    {
-                        destination_ip: "auto",
+                // A leg we are NOT changing is seeded from what the device is
+                // currently transmitting, not from "auto". In IS-05 "auto"
+                // means "device picks its own address", so the old code told
+                // the device to reassign every leg it was not explicitly
+                // given — on a 2022-7 sender, changing leg 0 silently moved
+                // leg 1 as well, and the next reconcile then saw that drift.
+                "transport_params": Array.from({ length: legCount }, (_unused, i) => {
+                    const cur = activeParams[i];
+                    const dst = this.stripSdpAddress(cur?.destination_ip);
+                    return {
+                        destination_ip: (dst && dst !== "auto") ? dst : "auto",
                         source_ip: "auto",
-                    },
-                    {
-                        destination_ip: "auto",
-                        source_ip: "auto",
-                    }
-                ]
+                    };
+                })
             };
 
-            data.legs.forEach((l)=>{
-                patch.transport_params[l.index] = {destination_ip:l.multicast, source_ip:"auto"}
+            requested.forEach((l:any)=>{
+                const index = Number(l?.index);
+                if(!Number.isFinite(index) || index < 0 || index >= legCount){ return; }
+                patch.transport_params[index] = {destination_ip:l.multicast, source_ip:"auto"}
             });
 
             
