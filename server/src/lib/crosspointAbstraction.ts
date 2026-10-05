@@ -496,9 +496,6 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 
     makeConnection(data:any){
         return new Promise(async(resolve, reject) => {
-            // Debug logging to track makeConnection calls
-            console.log("[DEBUG] makeConnection called with:", JSON.stringify(data, null, 2));
-
             // Start latency measurement
             const latencyMeasurement = ConnectionLatencyMeasurement.getInstance();
             let timingContext: LatencyTimingContext | null = null;
@@ -550,8 +547,6 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     // Disconnect
                     disconnect = true
                 }
-                
-                console.log("[DEBUG] Processing connection:", {source, destination, disconnect});
 
                 let srcFlows:any[] = [];
                 let srcDev = null;
@@ -576,16 +571,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     unresolved.push({address: destination, reason: dst.error});
                     SyncLog.log("warning", "connect_crosspoint", `Destination ${destination}: ${dst.error}; skipping`);
                 }
-                console.log("[DEBUG] Resolved connection:", {source, destination, srcFlowsCount: srcFlows.length, dstFlowsCount: dstFlows.length});
 
-
-                console.log("[DEBUG] Flow matching results:", {
-                    srcFlowsCount: srcFlows.length,
-                    dstFlowsCount: dstFlows.length,
-                    disconnect,
-                    willProcessConnection: (srcFlows.length > 0 || disconnect) && dstFlows.length > 0
-                });
-                
                 if((srcFlows.length > 0 || disconnect) && dstFlows.length > 0){
                     
                         // Connection Matcher
