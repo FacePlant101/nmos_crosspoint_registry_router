@@ -64,11 +64,14 @@ export function ComplexCompare(a:string,b:string){
 
 
 // Transport URNs used by NMOS resources, mapped to the short codes used internally
-// (see CrosspointConnectionSenderInfo.transport). Matrox USB is TCP based, not RTP.
+// (see CrosspointConnectionSenderInfo.transport). USB is TCP based, not RTP. The MatroxOnly
+// spec names it urn:x-matrox:transport:usb; IPMX nodes (e.g. alabou/NMOS-Reference) publish
+// urn:x-nmos:transport:usb as the canonical form and accept both, so both must map to "usb".
 const transportShortCodes: {[urn:string]: "rtp" | "rtp.mcast" | "usb"} = {
     "urn:x-nmos:transport:rtp": "rtp",
     "urn:x-nmos:transport:rtp.mcast": "rtp.mcast",
     "urn:x-matrox:transport:usb": "usb",
+    "urn:x-nmos:transport:usb": "usb",
 }
 
 export function transportShortCode(urn:string): "rtp" | "rtp.mcast" | "usb" | ""{
