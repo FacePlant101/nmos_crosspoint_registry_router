@@ -1,5 +1,5 @@
 import { CrosspointDevice, CrosspointFlow, CrosspointShadowState, CrosspointState, CrosspointShadowDevice } from "./crosspointAbstraction";
-import { ComplexCompare, ShortenNames } from "./functions";
+import { ComplexCompare, ShortenNames, transportShortCode } from "./functions";
 
 import { BitrateCalculator } from "./bitrateHelper/BitrateCalculator"
 import { parseSettings } from "./parseSettings";
@@ -11,6 +11,38 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
 const fs = require("fs");
 const {  parentPort } = require('worker_threads');
 
+// CrosspointFlow.capabilities.transport: "rtp" for both RTP flavours, "usb" for either USB URN,
+// "" for transports the crosspoint cannot route (MXL, websocket, MQTT).
+function capabilityTransport(urn:string): string {
+    let code = transportShortCode(urn);
+    return code == "rtp.mcast" ? "rtp" : code;
+}
+
+// The crosspoint has no mux category, so a urn:x-nmos:format:mux flow (MatroxOnly/IPMX) is filed
+// by what it carries: video if any video layer, else audio, else data. A mux is still only
+// routable to a mux receiver; validateStreamCompatibility rejects mux <-> plain audio/video.
+function muxClass(videoLayers:number, audioLayers:number, mediaType:string): "video" | "audio" | "data" {
+    mediaType = "" + (mediaType || "");
+    if(videoLayers > 0 || mediaType.startsWith("video/")){ return "video"; }
+    if(audioLayers > 0 || mediaType.startsWith("audio/") || mediaType == "application/AM824"){ return "audio"; }
+    return "data";
+}
+
+// Largest value a receiver's enabled constraint sets allow for a capability, e.g.
+// urn:x-matrox:cap:format:audio_layers given as {minimum, maximum} or {enum:[...]}.
+function capsMaximum(caps:any, cap:string): number {
+    let max = 0;
+    try{
+        for(let set of (caps?.constraint_sets || [])){
+            if(set["urn:x-nmos:cap:meta:enabled"] === false){ continue; }
+            let c = set[cap];
+            if(!c){ continue; }
+            if(typeof c.maximum == "number"){ max = Math.max(max, c.maximum); }
+            if(Array.isArray(c.enum)){ c.enum.forEach((v)=>{ if(typeof v == "number"){ max = Math.max(max, v); } }); }
+        }
+    }catch(e){}
+    return max;
+}
 
 
 
@@ -547,6 +579,13 @@ class CrosspointUpdateThread{
 
                 let type = this.getNmosSenderClass(send.id);
 
+                // A flow filed as unknown by an older build (e.g. a mux) and now classified must not
+                // linger in the shadow under both types.
+                if(type != "unknown" && this.crosspointShadow.devices[groupId].senders.unknown?.hasOwnProperty("nmos_"+send.id)){
+                    delete this.crosspointShadow.devices[groupId].senders.unknown["nmos_"+send.id];
+                    changed = true;
+                }
+
                     if(!this.crosspointShadow.devices[groupId].senders[type].hasOwnProperty("nmos_"+send.id)){
                         //create
                         let num = 1;
@@ -623,6 +662,13 @@ class CrosspointUpdateThread{
                 this.crosspointShadow.devices[groupId]["available"] = true;
 
                 let type = this.getNmosReceiverClass(recv.id);
+
+                // A flow filed as unknown by an older build (e.g. a mux) and now classified must not
+                // linger in the shadow under both types.
+                if(type != "unknown" && this.crosspointShadow.devices[groupId].receivers.unknown?.hasOwnProperty("nmos_"+recv.id)){
+                    delete this.crosspointShadow.devices[groupId].receivers.unknown["nmos_"+recv.id];
+                    changed = true;
+                }
 
                     if(!this.crosspointShadow.devices[groupId].receivers[type].hasOwnProperty("nmos_"+recv.id)){
                         //create
@@ -756,12 +802,7 @@ class CrosspointUpdateThread{
                                     if(this.nmosState.senders[nmosId].interface_bindings?.length > 1){
                                         source.capabilities.dash7 = true;
                                     }
-                                    if(
-                                        this.nmosState.senders[nmosId].transport == "urn:x-nmos:transport:rtp" ||
-                                        this.nmosState.senders[nmosId].transport == "urn:x-nmos:transport:rtp.mcast"
-                                    ){
-                                        source.capabilities.transport = "rtp";
-                                    }
+                                    source.capabilities.transport = capabilityTransport(this.nmosState.senders[nmosId].transport);
                                     source.capabilities.mediaTypes.push(this.nmosState.flows[this.nmosState.senders[nmosId].flow_id].media_type);
                                     source.active = this.nmosState.senders[nmosId].subscription.active
                                     try{
@@ -816,12 +857,7 @@ class CrosspointUpdateThread{
                                     
                                 ){
                                     receiver.available = true;
-                                    if(
-                                        this.nmosState.receivers[nmosId].transport == "urn:x-nmos:transport:rtp" ||
-                                        this.nmosState.receivers[nmosId].transport == "urn:x-nmos:transport:rtp.mcast"
-                                    ){
-                                        receiver.capabilities.transport = "rtp";
-                                    }
+                                    receiver.capabilities.transport = capabilityTransport(this.nmosState.receivers[nmosId].transport);
                                     receiver.active = this.nmosState.receivers[nmosId].subscription.active
                                     receiver.capabilities.mediaTypes = this.nmosState.receivers[nmosId].caps.media_types;
                                     if( this.nmosState.receivers[nmosId].subscription.active && this.nmosState.receivers[nmosId].subscription.sender_id){
@@ -985,12 +1021,16 @@ class CrosspointUpdateThread{
               if(flow.sample_rate.denominator){
                 denom = flow.sample_rate.denominator;
               }
+              // AM824 flows carry no bit_depth (the sample sits in an AES3 subframe), so name the
+              // encoding instead of printing "undefinedbit".
+              let sampleInfo = (typeof flow.bit_depth == "number")
+                ? flow.bit_depth + 'bit'
+                : ("" + (flow.media_type || "")).split('/').pop();
               info +=
                 '' +
                 source.channels.length +
                 'Ch ' +
-                flow.bit_depth +
-                'bit ' +
+                (sampleInfo ? sampleInfo + ' ' : '') +
                 Math.floor(
                   flow.sample_rate.numerator / denom / 1000
                 ) +
@@ -1035,13 +1075,29 @@ class CrosspointUpdateThread{
               if (flow.media_type == 'video/smpte291') {
                 info += 'smpte291';
               }
-              if (flow.media_type == 'application/json') {
+              else if (flow.media_type == 'application/json') {
                 info += 'websocket';
               }
+              else if (flow.media_type == 'application/usb') {
+                info += 'USB';
+              }
               else{
-                info += 'flow.media.type';
+                info += flow.media_type || '';
               }
               break;
+            case 'urn:x-nmos:format:mux': {
+              // e.g. "AM824 mux 2 audio"
+              let layers = [];
+              let video = flow['urn:x-matrox:video_layers'];
+              let audio = flow['urn:x-matrox:audio_layers'];
+              let data = flow['urn:x-matrox:data_layers'];
+              if(video > 0){ layers.push(video + ' video'); }
+              if(audio > 0){ layers.push(audio + ' audio'); }
+              if(data > 0){ layers.push(data + ' data'); }
+              info += ("" + (flow.media_type || "")).split('/').pop() + ' mux';
+              if(layers.length > 0){ info += ' ' + layers.join(' '); }
+              break;
+            }
           }
         } catch (e) {
             // TODO Logging
@@ -1063,6 +1119,12 @@ class CrosspointUpdateThread{
               return 'video';
             case 'urn:x-nmos:format:data':
               return 'data';
+            case 'urn:x-nmos:format:mux':
+              return muxClass(
+                capsMaximum(receiver.caps, 'urn:x-matrox:cap:format:video_layers'),
+                capsMaximum(receiver.caps, 'urn:x-matrox:cap:format:audio_layers'),
+                (receiver.caps?.media_types || [])[0]
+              );
           }
         } catch (e) {}
         return 'unknown';
@@ -1079,6 +1141,8 @@ class CrosspointUpdateThread{
               return 'video';
             case 'urn:x-nmos:format:data':
               return 'data';
+            case 'urn:x-nmos:format:mux':
+              return muxClass(flow['urn:x-matrox:video_layers'], flow['urn:x-matrox:audio_layers'], flow.media_type);
           }
         } catch (e) {}
         return 'unknown';

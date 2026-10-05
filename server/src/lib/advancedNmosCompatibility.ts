@@ -29,10 +29,14 @@ export interface StreamCapabilities {
     maxBitrate: number;
     transports: string[];
     constraints: any;
+    // Concrete media types (sender: the flow's media_type, receiver: caps.media_types). An exact
+    // match here is compatible on its own; it is what lets a urn:x-nmos:format:mux sender reach a
+    // mux receiver, since neither the format URN nor "application/AM824" names a category.
+    mediaTypes?: string[];
 }
 
 export interface OptimizedTransportParams {
-    // RTP specific, absent for non-RTP transports such as urn:x-matrox:transport:usb
+    // RTP specific, absent for non-RTP transports such as USB (see isUsbTransport)
     rtp_enabled?: boolean;
     rtcp_enabled?: boolean;
     destination_ip?: string;
@@ -131,7 +135,7 @@ export class AdvancedNmosCompatibility {
                 throw new Error("Required NMOS resources not found");
             }
 
-            // Everything below is RTP specific. Non-RTP transports (urn:x-matrox:transport:usb)
+            // Everything below is RTP specific. Non-RTP transports (USB, see isUsbTransport)
             // have no optimizable parameters here, so return an empty set rather than RTP defaults.
             if (isUsbTransport(sender.transport)) {
                 return {};
@@ -259,7 +263,7 @@ export class AdvancedNmosCompatibility {
             const trimmedManifest = typeof manifestFile === 'string' ? manifestFile.trim() : '';
             if (trimmedManifest && (receiver.transport === "urn:x-nmos:transport:rtp" || 
                                    receiver.transport === "urn:x-nmos:transport:rtp.mcast" ||
-                                   receiver.transport === "urn:x-matrox:transport:usb")) {
+                                   isUsbTransport(receiver.transport))) {
                 reconfigPatch.transport_file = {
                     type: "application/sdp",
                     data: trimmedManifest,
@@ -395,6 +399,7 @@ export class AdvancedNmosCompatibility {
 
             if (flow) {
                 capabilities.formats.push(flow.format || 'unknown');
+                capabilities.mediaTypes = flow.media_type ? [flow.media_type] : [];
                 
                 if (flow.media_type === 'video' && flow.frame_width && flow.frame_height) {
                     capabilities.resolutions.push(`${flow.frame_width}x${flow.frame_height}`);
@@ -454,6 +459,7 @@ export class AdvancedNmosCompatibility {
                 if (receiver.caps) {
                     if (receiver.caps.media_types) {
                         capabilities.formats = receiver.caps.media_types;
+                        capabilities.mediaTypes = receiver.caps.media_types;
                     }
                     if (receiver.caps.constraint_sets) {
                         receiver.caps.constraint_sets.forEach((constraint: any) => {
@@ -499,7 +505,9 @@ export class AdvancedNmosCompatibility {
 
         // Check transport compatibility
         if (senderCaps.transports.length > 0 && receiverCaps.transports.length > 0) {
-            const transportMatch = senderCaps.transports.some(st => receiverCaps.transports.includes(st));
+            // Both USB URNs (urn:x-matrox:transport:usb, urn:x-nmos:transport:usb) are the same transport.
+            const sameTransport = (a: string, b: string) => a === b || (isUsbTransport(a) && isUsbTransport(b));
+            const transportMatch = senderCaps.transports.some(st => receiverCaps.transports.some(rt => sameTransport(st, rt)));
             if (!transportMatch) {
                 compatible = false;
                 reason = `Transport incompatible: sender ${senderCaps.transports} vs receiver ${receiverCaps.transports}`;
@@ -508,7 +516,10 @@ export class AdvancedNmosCompatibility {
 
         // Check format compatibility with intelligent format mapping
         if (compatible && senderCaps.formats.length > 0 && receiverCaps.formats.length > 0) {
-            const formatCompatible = this.checkFormatCompatibility(senderCaps.formats, receiverCaps.formats);
+            const mediaTypeMatch = (senderCaps.mediaTypes || []).some(m => (receiverCaps.mediaTypes || []).includes(m));
+            const formatCompatible = mediaTypeMatch
+                ? { compatible: true, requiresTranslation: false, translationInfo: undefined }
+                : this.checkFormatCompatibility(senderCaps.formats, receiverCaps.formats);
             if (!formatCompatible.compatible) {
                 compatible = false;
                 reason = `Format incompatible: sender ${senderCaps.formats} vs receiver ${receiverCaps.formats}`;
