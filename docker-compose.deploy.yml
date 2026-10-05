@@ -12,6 +12,14 @@
 # The config and state mounts may start empty: the entrypoint seeds
 # settings.json and users.json from the image on first boot and never
 # overwrites files that already exist.
+#
+# UPGRADING an existing deployment: bring your server/config across with you.
+# It is gitignored, so it is absent from a fresh clone, and an empty config
+# mount beside a populated state directory would otherwise start you on the
+# shipped defaults — no registry address, login back to admin/admin. The
+# entrypoint refuses to start in that situation rather than doing it silently;
+# set ALLOW_CONFIG_RESEED=true if resetting the configuration is what you
+# actually want.
 
 services:
   nmos-crosspoint:
