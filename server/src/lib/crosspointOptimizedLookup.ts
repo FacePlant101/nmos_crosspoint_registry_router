@@ -1,5 +1,15 @@
 import { CrosspointDevice, CrosspointFlow, CrosspointState } from "./crosspointAbstraction";
 import { SyncLog } from "./syncLog";
+import { OTHER_FLOW_TYPES, parseFlowAddress } from "./flowAddress";
+
+export type FlowDirection = "senders" | "receivers";
+
+export interface ResolvedEndpoint {
+    device: CrosspointDevice | null;
+    flows: CrosspointFlow[];
+    /** Set when the address names something that does not exist; `flows` is then empty. */
+    error: string | null;
+}
 
 /**
  * Optimized lookup service for crosspoint devices and flows
@@ -16,7 +26,10 @@ export class CrosspointOptimizedLookup {
     
     // Flow lookup maps for O(1) performance
     private flowsById: Map<string, CrosspointFlow> = new Map();
-    private flowsByDeviceAndNum: Map<string, CrosspointFlow> = new Map(); // key: "deviceId:flowNum"
+    // key: "deviceId:direction:type:num". Flow numbers restart at 1 for every direction and type,
+    // so all four parts are needed to make a key unique.
+    private flowsByDeviceAndNum: Map<string, CrosspointFlow> = new Map();
+    private deviceByFlowId: Map<string, CrosspointDevice> = new Map();
     private senderFlowsByType: Map<string, CrosspointFlow[]> = new Map(); // key: "deviceId:type"
     private receiverFlowsByType: Map<string, CrosspointFlow[]> = new Map(); // key: "deviceId:type"
     
@@ -70,8 +83,8 @@ export class CrosspointOptimizedLookup {
                 
                 for (const flow of flows as CrosspointFlow[]) {
                     this.flowsById.set(flow.id, flow);
-                    const deviceFlowKey = `${device.id}:${flow.num}`;
-                    this.flowsByDeviceAndNum.set(deviceFlowKey, flow);
+                    this.flowsByDeviceAndNum.set(`${device.id}:senders:${type}:${flow.num}`, flow);
+                    this.deviceByFlowId.set(flow.id, device);
                 }
             }
             
@@ -82,8 +95,8 @@ export class CrosspointOptimizedLookup {
                 
                 for (const flow of flows as CrosspointFlow[]) {
                     this.flowsById.set(flow.id, flow);
-                    const deviceFlowKey = `${device.id}:${flow.num}`;
-                    this.flowsByDeviceAndNum.set(deviceFlowKey, flow);
+                    this.flowsByDeviceAndNum.set(`${device.id}:receivers:${type}:${flow.num}`, flow);
+                    this.deviceByFlowId.set(flow.id, device);
                 }
             }
         }
@@ -139,13 +152,68 @@ export class CrosspointOptimizedLookup {
     }
     
     /**
-     * Fast flow lookup by device and flow number
+     * Fast flow lookup by device, direction, type and (1-based) flow number
      */
-    findFlowByDeviceAndNum(deviceId: string, flowNum: number): CrosspointFlow | null {
-        const key = `${deviceId}:${flowNum}`;
-        return this.flowsByDeviceAndNum.get(key) || null;
+    findFlowByDeviceAndNum(deviceId: string, direction: "senders" | "receivers", type: string, flowNum: number): CrosspointFlow | null {
+        return this.flowsByDeviceAndNum.get(`${deviceId}:${direction}:${type}:${flowNum}`) || null;
     }
     
+    /**
+     * Resolve one side of a connection request ("nmos_<id>", "Dev", "Dev.v2", "Dev.2", "Dev.v")
+     * to its device and flows. A specific flow that does not exist resolves to no flows and an
+     * error - never to every flow of its type, which would patch a source onto every receiver
+     * (e.g. all four quadrants of a multiviewer).
+     *
+     * `isAvailable` filters device-level receiver addresses down to flows that can be patched.
+     */
+    resolveEndpoint(address: string, direction: FlowDirection, isAvailable?: (flow: CrosspointFlow) => boolean): ResolvedEndpoint {
+        if (address.startsWith("nmos_")) {
+            const flow = this.flowsById.get(address);
+            const device = this.deviceByFlowId.get(address);
+            if (flow && device && Object.values(device[direction]).some(flows => flows.some(f => f.id === address))) {
+                return { device, flows: [flow], error: null };
+            }
+        }
+
+        let target = parseFlowAddress(address);
+        let device = this.findDevice(target.device);
+        if (!device && target.type) {
+            // A device name that merely ends in something flow-like, e.g. "Studio.2".
+            device = this.findDevice(address);
+            if (device) {
+                target = { device: address, type: null, num: null };
+            }
+        }
+        if (!device) {
+            return { device: null, flows: [], error: `Unknown device "${target.device}"` };
+        }
+
+        const byType = direction === "senders" ? this.senderFlowsByType : this.receiverFlowsByType;
+        if (!target.type) {
+            // Device-level patching covers video only, not audio.
+            let flows = byType.get(`${device.id}:video`) || [];
+            if (isAvailable) {
+                flows = flows.filter(isAvailable);
+            }
+            return { device, flows, error: null };
+        }
+        const types = target.type === "other" ? OTHER_FLOW_TYPES : [target.type];
+        if (target.num === null) {
+            return { device, flows: types.flatMap(type => byType.get(`${device.id}:${type}`) || []), error: null };
+        }
+        const matches = types
+            .map(type => this.findFlowByDeviceAndNum(device.id, direction, type, target.num!))
+            .filter((flow): flow is CrosspointFlow => flow !== null);
+        const kind = direction === "senders" ? "sender" : "receiver";
+        if (matches.length === 0) {
+            return { device, flows: [], error: `${device.name} has no ${target.type} ${kind} ${target.num}` };
+        }
+        if (matches.length > 1) {
+            return { device, flows: [], error: `${device.name} has several ${kind}s numbered ${target.num} (${matches.map(f => f.type).join(", ")}); address one by id` };
+        }
+        return { device, flows: matches, error: null };
+    }
+
     /**
      * Fast sender flows lookup by device and type
      */
@@ -255,7 +323,15 @@ export class CrosspointOptimizedLookup {
             const senderCount = Object.values(device.senders).reduce((sum, flows) => sum + flows.length, 0);
             const receiverCount = Object.values(device.receivers).reduce((sum, flows) => sum + flows.length, 0);
             // Include device name and alias in hash to detect changes from "UNKNOWN" to proper names
-            hash += `:${device.id}:${device.name || ''}:${device.alias || ''}:${senderCount}:${receiverCount}`;
+            hash += `:${device.id}:${device.num}:${device.name || ''}:${device.alias || ''}:${senderCount}:${receiverCount}`;
+            // Flow numbers are addressable ("Dev.v2") and can be renumbered without the counts changing.
+            for (const groups of [device.senders, device.receivers]) {
+                for (const flows of Object.values(groups)) {
+                    for (const flow of flows) {
+                        hash += `,${flow.id}=${flow.num}`;
+                    }
+                }
+            }
         }
         return hash;
     }
@@ -270,6 +346,7 @@ export class CrosspointOptimizedLookup {
         this.devicesByNmosId.clear();
         this.flowsById.clear();
         this.flowsByDeviceAndNum.clear();
+        this.deviceByFlowId.clear();
         this.senderFlowsByType.clear();
         this.receiverFlowsByType.clear();
     }

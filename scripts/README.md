@@ -259,11 +259,12 @@ The script provides comprehensive multiviewer control for Matrox Convert IP devi
 
 **Core Features**:
 - **Per-Decoder Toggles**: Each decoder has its own multiviewer toggle (`Controls.Multiviewer[n]`)
+- **State Feedback**: Each toggle shows the decoder's actual multiviewer state from the `mediadevmatroxcip` channel, so changes made elsewhere appear and a failed or unsent toggle reverts. While a toggle is waiting for the router's answer (up to 30 seconds) the button keeps the value you pressed
 - **Automatic Master Mode**: When multiviewer is enabled, master mode is automatically activated
-- **Device Identification**: Supports device lookup by serial number, device name, or alias
+- **Device Identification**: Supports device lookup by serial number or device name (the router alias is not known to the Matrox module)
 - **WebSocket API Integration**: Uses crosspoint router API instead of direct device HTTP calls
 - **Multiple Connection Methods**: Supports both postfix channel and flow type notation
-- **Batch Operations**: Enable multiviewer and connect multiple encoders in single operations
+- **Batch Operations**: Enable multiviewer and connect multiple encoders in single operations. `SetupMultiviewer` connects the encoders only after the router confirms the decoder is in multiviewer mode, and skips them if enabling fails
 
 ##### Multiviewer Connection Methods
 
@@ -363,6 +364,7 @@ This will provide verbose output in Q-SYS logs for troubleshooting.
 ### Matrox Convert IP Multiviewer Issues
 
 1. **Multiviewer toggle not working**: Verify `Controls.Multiviewer` array exists and matches decoder count
+   - **Toggle springs back**: The router or decoder rejected the change; the reason is printed as `ERROR: Multiviewer enable failed on ...`
 2. **Device not found errors**: Check device serial number formats and ensure device is discoverable
 3. **Master mode not activating**: Verify automatic master mode enable is working (check debug logs)
 4. **API authentication failures**: Confirm Matrox device credentials are correct in backend

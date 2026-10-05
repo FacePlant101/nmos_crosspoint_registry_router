@@ -186,44 +186,17 @@ export class EnhancedPredictiveStaging {
                         return false;
                     }
                     
-                    // Skip ALL receivers on Matrox CIP decoder devices when multiviewer is enabled
-                    // This prevents decoder overload when already handling 4 simultaneous streams
-                    if (this.optimizedLookup) {
-                        const receiverFlow = this.optimizedLookup.findFlow(id);
-                        if (receiverFlow) {
-                            // Find device that contains this receiver flow by searching through all devices
-                            const CrosspointAbstraction = require('./crosspointAbstraction').CrosspointAbstraction;
-                            if (CrosspointAbstraction.instance && CrosspointAbstraction.instance.crosspointState) {
-                                for (const device of CrosspointAbstraction.instance.crosspointState.devices) {
-                                    // Check if this device contains the receiver flow
-                                    for (const [type, flows] of Object.entries(device.receivers)) {
-                                        const flowArray = flows as any[];
-                                        if (flowArray.some(f => f.id === id)) {
-                                            // Found the device, check if it's a Matrox ConvertIP decoder with multiviewer
-                                            // enabled. Resolve via the receiver flow: legacy "nmosgrp_" device ids are
-                                            // md5 hashes and cannot be mapped back to an NMOS device id.
-                                            const deviceId = NmosRegistryConnector.nmosDeviceIdFromFlowId(id);
-                                            if (NmosRegistryConnector.isMatroxCipDevice(deviceId)) {
-                                                try {
-                                                    const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
-                                                    const matroxInstance = MediaDevMatroxConvertIp.instance;
-                                                    if (matroxInstance && matroxInstance.isMultiviewerEnabled(device.alias || device.name || device.num.toString())) {
-                                                        // Skip ALL receivers on multiviewer-enabled Matrox decoders to prevent overload
-                                                        SyncLog.log("debug", "predictive_staging", 
-                                                            `Skipping receiver ${id} on Matrox decoder ${device.name}: multiviewer enabled (prevents overload from 4+ concurrent streams)`);
-                                                        return false;
-                                                    }
-                                                } catch (error) {
-                                                    SyncLog.log("warning", "predictive_staging", 
-                                                        `Failed to query multiviewer state for device ${device.name}: ${error instanceof Error ? error.message : String(error)}`);
-                                                }
-                                            }
-                                            break; // Found the device, no need to continue searching
-                                        }
-                                    }
-                                }
-                            }
+                    // Skip receivers on Matrox decoders with multiviewer enabled: they are already
+                    // decoding four streams and staging more would overload them.
+                    try {
+                        const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
+                        if (MediaDevMatroxConvertIp.isMultiviewReceiver(id)) {
+                            SyncLog.log("debug", "predictive_staging", `Skipping receiver ${id}: Matrox multiviewer enabled`);
+                            return false;
                         }
+                    } catch (error) {
+                        SyncLog.log("warning", "predictive_staging",
+                            `Failed to query multiviewer state for receiver ${id}: ${error instanceof Error ? error.message : String(error)}`);
                     }
                     
                     return true;
@@ -231,7 +204,7 @@ export class EnhancedPredictiveStaging {
                 
                 if (prioritizedReceivers.length === 0) {
                     SyncLog.log("warning", "predictive_staging", 
-                        `Skipped sender ${prediction.senderId}: all ${prediction.receiverIds.length} receivers unhealthy`);
+                        `Skipped sender ${prediction.senderId}: all ${prediction.receiverIds.length} receivers unhealthy or on a multiviewer`);
                     return;
                 }
                 

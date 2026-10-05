@@ -197,6 +197,18 @@ Creates, prepares, or previews a connection between one or more senders and rece
 }
 ```
 
+`source` and `destination` take any of these forms:
+
+| Address | Resolves to |
+|---------|-------------|
+| `nmos_<id>` | That NMOS sender or receiver |
+| `Dev` | Every video flow of the device (device number, name or alias) |
+| `Dev.v2` | Video flow 2 (`a` audio, `d` data, `u` any other type) |
+| `Dev.v` | Every video flow |
+| `Dev.2` | Video flow 2, the channel-number shorthand (e.g. multiviewer quadrants) |
+
+Flow numbers are the 1-based numbers shown in the crosspoint, for every kind of device; a Matrox multiviewer's quadrants are `.v1` to `.v4`. An address naming a device or flow that does not exist is skipped and reported in `unresolved` rather than widened to every flow of its type. Set `source` to `""` or `"__disconnect"` to disconnect.
+
 **Example (request envelope)**:
 
 ```json
@@ -223,7 +235,10 @@ Creates, prepares, or previews a connection between one or more senders and rece
   "method": "POST",
   "status": 200,
   "message": "ok",
-  "data": { "...": "..." }
+  "data": {
+    "connections": [ { "...": "..." } ],
+    "unresolved": [ { "address": "Dec.v5", "reason": "Dec has no video receiver 5" } ]
+  }
 }
 ```
 
@@ -327,6 +342,8 @@ These routes are specific to Matrox Convert IP device control and are available 
 #### `POST /matroxcip_togglemultiviewer`
 
 Enables or disables multiviewer mode on a Matrox Convert IP device. When enabling multiviewer, master mode is automatically enabled as well.
+
+`sn` is the device serial number or its device name. The request fails (status 400) if `enabled` is not a boolean, the device is unknown, the device does not report the new setting back, or master mode cannot be enabled.
 
 - **Method**: `POST`
 - **Permissions**: `global`

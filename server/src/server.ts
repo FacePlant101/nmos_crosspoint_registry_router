@@ -925,11 +925,6 @@ server.addRoute("GET", "flowInfo","global" , (client: WebsocketClient, query:str
 
 server.addRoute("POST", "makeconnection","global", (client: WebsocketClient, query:string[], postData: any) => {
     return new Promise((resolve, reject) => {
-        // Debug logging for route handler
-        console.log("[DEBUG] makeconnection route handler called with:", JSON.stringify(postData, null, 2));
-        console.log("[DEBUG] crosspoint object exists:", !!crosspoint);
-        console.log("[DEBUG] crosspoint.makeConnection exists:", !!(crosspoint && crosspoint.makeConnection));
-        
         crosspoint
             .makeConnection(postData)
             .then((data) => resolve({message:200, data:data}))

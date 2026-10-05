@@ -1,5 +1,4 @@
 import { CrosspointAbstraction, CrosspointFlow, CrosspointState } from "./crosspointAbstraction";
-import { NmosRegistryConnector } from "./nmosConnector";
 import { SyncLog } from "./syncLog";
 
 export interface PredictiveStagerOptions {
@@ -81,7 +80,7 @@ export default class PredictiveStager {
     const cooldown = cfg ? cfg.cooldownMs : this.cooldownMs;
     if(!enabled){ return; }
 
-    const multiviewerStatus = this.getMultiviewerStatus(receiverId, state);
+    const multiviewerStatus = this.getMultiviewerStatus(receiverId);
     if (multiviewerStatus.changed) {
       this.lastStageAt.delete(receiverId);
       this.lastStagedSender.delete(receiverId);
@@ -141,52 +140,24 @@ export default class PredictiveStager {
     return out;
   }
 
-  private getMultiviewerStatus(receiverId: string, state: CrosspointState): { skip: boolean; changed: boolean } {
+  private getMultiviewerStatus(receiverId: string): { skip: boolean; changed: boolean } {
+    let skip = false;
     try {
-      // Find device that contains this receiver flow
-      for (const device of state.devices) {
-        // Check if this device contains the receiver flow
-        for (const [type, flows] of Object.entries(device.receivers)) {
-          const flowArray = flows as any[];
-          if (flowArray.some(f => f.id === receiverId)) {
-            // Found the device, check if it's a Matrox ConvertIP decoder with multiviewer enabled.
-            // Resolve via the receiver flow: legacy "nmosgrp_" device ids are md5 hashes and
-            // cannot be mapped back to an NMOS device id.
-            const deviceId = NmosRegistryConnector.nmosDeviceIdFromFlowId(receiverId);
-            if (NmosRegistryConnector.isMatroxCipDevice(deviceId)) {
-              try {
-                const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
-                const matroxInstance = MediaDevMatroxConvertIp.instance;
-                if (matroxInstance && matroxInstance.isMultiviewerEnabled(device.alias || device.name || device.num.toString())) {
-                  // Skip ALL receivers on multiviewer-enabled Matrox decoders to prevent overload
-                  SyncLog.log("debug", "predictive", 
-                    `Skipping receiver ${receiverId} on Matrox decoder ${device.name}: multiviewer enabled (prevents overload from 4+ concurrent streams)`);
-                  const previous = this.lastMultiviewerState.get(device.id);
-                  const changed = previous !== undefined && previous !== true;
-                  this.lastMultiviewerState.set(device.id, true);
-                  return { skip: true, changed };
-                }
-
-                const previous = this.lastMultiviewerState.get(device.id);
-                const changed = previous !== undefined && previous !== false;
-                this.lastMultiviewerState.set(device.id, false);
-                return { skip: false, changed };
-              } catch (error) {
-                SyncLog.log("warning", "predictive", 
-                  `Failed to query multiviewer state for device ${device.name}: ${error instanceof Error ? error.message : String(error)}`);
-                return { skip: false, changed: false };
-              }
-            }
-            break; // Found the device, no need to continue searching
-          }
-        }
-      }
+      // Lazy require: matroxConvertIp imports the crosspoint modules.
+      const MediaDevMatroxConvertIp = require('../mediaDevices/matroxConvertIp').default;
+      skip = MediaDevMatroxConvertIp.isMultiviewReceiver(receiverId);
     } catch (error) {
-      SyncLog.log("warning", "predictive", 
+      SyncLog.log("warning", "predictive",
         `Error checking multiviewer state for receiver ${receiverId}: ${error instanceof Error ? error.message : String(error)}`);
+      return { skip: false, changed: false };
     }
-
-    return { skip: false, changed: false }; // Default to allow staging if no multiviewer conflict detected
+    if (skip) {
+      // A multiviewer decoder is already decoding four streams; staging more would overload it.
+      SyncLog.log("debug", "predictive", `Skipping receiver ${receiverId}: Matrox multiviewer enabled`);
+    }
+    const previous = this.lastMultiviewerState.get(receiverId);
+    this.lastMultiviewerState.set(receiverId, skip);
+    return { skip, changed: previous !== undefined && previous !== skip };
   }
 
   private findFlowById(state: CrosspointState, id: string, isSender: boolean): CrosspointFlow | null{
