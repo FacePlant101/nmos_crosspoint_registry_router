@@ -129,6 +129,10 @@ export default class MediaDevMatroxConvertIp {
 
     private lastNodeState:any = {};
 
+    private dedupReloadCooldownMs = 10000;
+    private lastDedupReloadAt: Record<string, number> = {};
+    private lastDedupFingerprint: Record<string, string> = {};
+
     
     private authState ={};
 
@@ -794,6 +798,7 @@ export default class MediaDevMatroxConvertIp {
                 let existingDevice: MatroxCipDevice | null = null;
                 let useNewSerialAsKey = false;
                 let matchReason = "";
+                let pendingMatchLog: { key: string; sn: string; score: number; reason: string } | null = null;
 
                 // First check if we already have this exact serial number
                 if(this.state.devices.hasOwnProperty(sn)){
@@ -880,12 +885,18 @@ export default class MediaDevMatroxConvertIp {
                             useNewSerialAsKey = true;
                         }
                         
-                        SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Matched device '${bestMatch.key}' to new serial '${sn}' (score: ${bestMatch.score}, reasons: ${matchReason})`);
+                        pendingMatchLog = {
+                            key: bestMatch.key,
+                            sn,
+                            score: bestMatch.score,
+                            reason: matchReason
+                        };
                     }
                 }
 
                 let cip: MatroxCipDevice;
                 let finalDeviceKey: string;
+                const wasUnhealthy = !!existingDevice && (existingDevice.failed || existingDevice.unreachable || existingDevice.error || existingDevice.outdated);
                 
                 if(existingDevice) {
                     cip = existingDevice;
@@ -897,6 +908,14 @@ export default class MediaDevMatroxConvertIp {
                         this.state.devices[sn] = cip;
                         finalDeviceKey = sn;
                         SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Migrated device '${existingDeviceKey}' to alphanumeric key '${sn}' (${matchReason})`);
+                        if (existingDeviceKey && this.lastDedupFingerprint[existingDeviceKey]) {
+                            this.lastDedupFingerprint[sn] = this.lastDedupFingerprint[existingDeviceKey];
+                            delete this.lastDedupFingerprint[existingDeviceKey];
+                        }
+                        if (existingDeviceKey && this.lastDedupReloadAt[existingDeviceKey]) {
+                            this.lastDedupReloadAt[sn] = this.lastDedupReloadAt[existingDeviceKey];
+                            delete this.lastDedupReloadAt[existingDeviceKey];
+                        }
                     } else {
                         finalDeviceKey = existingDeviceKey!;
                     }
@@ -916,7 +935,41 @@ export default class MediaDevMatroxConvertIp {
                         cip.name = deviceName;
                     }
                     
-                    SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Reactivated existing device '${finalDeviceKey}' with IPs: ${mergedIps.join(', ')} (${matchReason})`);
+                    const deviceNameForFingerprint = deviceName || cip.name || "";
+                    const fingerprint = `${deviceNameForFingerprint}|${mergedIps.join(',')}`;
+                    const previousFingerprint = this.lastDedupFingerprint[finalDeviceKey];
+                    const fingerprintUnchanged = previousFingerprint === fingerprint;
+                    const shouldLogDedup = !fingerprintUnchanged || wasUnhealthy || useNewSerialAsKey;
+                    const now = Date.now();
+                    const lastReloadAt = this.lastDedupReloadAt[finalDeviceKey] ?? 0;
+                    const shouldReload = !fingerprintUnchanged || wasUnhealthy || (now - lastReloadAt) > this.dedupReloadCooldownMs;
+
+                    if (pendingMatchLog && shouldLogDedup) {
+                        SyncLog.log(
+                            "info",
+                            "MatroxCIP",
+                            `Enhanced deduplication: Matched device '${pendingMatchLog.key}' to new serial '${pendingMatchLog.sn}' (score: ${pendingMatchLog.score}, reasons: ${pendingMatchLog.reason})`
+                        );
+                    }
+
+                    if (shouldLogDedup) {
+                        SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Reactivated existing device '${finalDeviceKey}' with IPs: ${mergedIps.join(', ')} (${matchReason})`);
+                    }
+
+                    this.lastDedupFingerprint[finalDeviceKey] = fingerprint;
+
+                    // Cleanup: Remove any obvious stale duplicates after successful match
+                    this.cleanupStaleDevices(finalDeviceKey, mergedIps);
+
+                    if (shouldReload) {
+                        this.lastDedupReloadAt[finalDeviceKey] = now;
+                        this.reloadData(cip.ipList, finalDeviceKey, cip);
+                        if (wasUnhealthy || !fingerprintUnchanged) {
+                            setTimeout(() => {
+                                this.reloadData(cip.ipList, finalDeviceKey, cip);
+                            }, 5000);
+                        }
+                    }
                 } else {
                     // Create new device
                     cip = new MatroxCipDevice();
@@ -929,15 +982,20 @@ export default class MediaDevMatroxConvertIp {
                     this.state.devices[sn] = cip;
                     finalDeviceKey = sn;
                     SyncLog.log("info", "MatroxCIP", `Enhanced deduplication: Created new device '${sn}' with IPs: ${ips.join(', ')}`);
-                }
-                
-                // Cleanup: Remove any obvious stale duplicates after successful match
-                this.cleanupStaleDevices(finalDeviceKey, ips);
 
-                this.reloadData(cip.ipList, finalDeviceKey, cip);
-                setTimeout(()=>{
+                    const deviceNameForFingerprint = deviceName || cip.name || "";
+                    const fingerprint = `${deviceNameForFingerprint}|${ips.join(',')}`;
+                    this.lastDedupFingerprint[finalDeviceKey] = fingerprint;
+
+                    this.cleanupStaleDevices(finalDeviceKey, ips);
+
+                    const now = Date.now();
+                    this.lastDedupReloadAt[finalDeviceKey] = now;
                     this.reloadData(cip.ipList, finalDeviceKey, cip);
-                },5000);
+                    setTimeout(() => {
+                        this.reloadData(cip.ipList, finalDeviceKey, cip);
+                    }, 5000);
+                }
 
                 // Auto-configure NMOS registry if enabled
                 if (this.isAutoConfigEnabled() && 
@@ -1066,6 +1124,52 @@ export default class MediaDevMatroxConvertIp {
         setTimeout(()=>{
             this.reloadData(ipList,sn,cip)
         },2000)
+    }
+
+    private async isMasterEnabled(sn: string, ipList: string[]): Promise<boolean> {
+        try {
+            const masterSettings = await this.apiRequest(ipList, sn, "GET", "/device/settings/streams/master");
+            if (masterSettings && typeof masterSettings.enable === "boolean") {
+                return masterSettings.enable;
+            }
+        } catch (error) {
+            SyncLog.log("debug", "MatroxCIP", `Master settings GET failed for ${sn}, falling back to context check.`);
+        }
+
+        try {
+            const context = await this.apiRequest(ipList, sn, "GET", "/device/settings/context");
+            return !!context?.StreamsEnableSettings?.enable;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    private async ensureMasterEnabled(sn: string, ipList: string[], options?: { attempts?: number; delayMs?: number }) {
+        const attempts = options?.attempts ?? 3;
+        const delayMs = options?.delayMs ?? 2000;
+
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            const alreadyEnabled = await this.isMasterEnabled(sn, ipList);
+            if (alreadyEnabled) {
+                SyncLog.log("info", "MatroxCIP", `Master mode already enabled for ${sn} (attempt ${attempt}/${attempts})`);
+                return;
+            }
+
+            try {
+                SyncLog.log("info", "MatroxCIP", `Enabling master mode for ${sn} (attempt ${attempt}/${attempts})`);
+                await this.masterEnable(sn);
+            } catch (error) {
+                SyncLog.log("warning", "MatroxCIP", `Master enable attempt ${attempt} failed for ${sn}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+
+            if (attempt < attempts) {
+                await sleep(delayMs);
+            }
+        }
+
+        if (!(await this.isMasterEnabled(sn, ipList))) {
+            throw new Error(`Master mode not enabled after ${attempts} attempts`);
+        }
     }
 
     // Web Accessible
@@ -1282,9 +1386,7 @@ export default class MediaDevMatroxConvertIp {
         // When enabling multiviewer, also enable master mode (required for correct operation)
         if(enabled) {
             try {
-                SyncLog.log("info", "MatroxCIP", `Auto-enabling master mode for ${sn} after multiviewer enable`);
-                await this.masterEnable(actualDeviceSerial);
-                SyncLog.log("info", "MatroxCIP", `Master mode enabled successfully for ${sn}`);
+                await this.ensureMasterEnabled(actualDeviceSerial, ipList);
             } catch(masterError) {
                 SyncLog.log("warning", "MatroxCIP", `Failed to auto-enable master mode for ${sn}:`, masterError.message);
             }

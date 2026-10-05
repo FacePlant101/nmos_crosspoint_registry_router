@@ -5,7 +5,12 @@
         "outDir": "./dist",
         "rootDir": "./src",
         "sourceMap": true,
-        "lib": ["esnext"]
+        "lib": ["esnext"],
+        // werift depends on @types/dom-webcodecs, which references DOM types
+        // this server build has no reason to pull in. We never typecheck
+        // against those declarations ourselves, so skip lib checking rather
+        // than adding the whole DOM lib to a Node-only project.
+        "skipLibCheck": true
     },
     "exclude": [
         "src/lib/WebsocketClient.ts"

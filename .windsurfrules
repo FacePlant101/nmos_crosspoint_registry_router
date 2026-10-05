@@ -1,0 +1,180 @@
+NMOS Crosspoint — project rules
+
+This is a Node + Svelte application for routing NMOS (IS-04/IS-05) media streams.
+Match the conventions below; they describe the code as it actually is, not an ideal.
+
+## Stack (do not assume otherwise)
+
+- UI: Svelte 4 (`^4.2.8`) + Vite 5 + TypeScript, client-side only.
+- There is NO SvelteKit. No SSR, no SSG, no file-based routing, no load functions,
+  no form actions, no `+page`/`+error` files, no `$lib` alias, no adapters.
+- There are NO Svelte 5 runes. Do not write `$state`, `$derived`, `$props`,
+  `$effect`, or `$bindable`. Svelte 4 has none of them.
+- Styling is Tailwind 3 + daisyUI 4. There is no Shadcn.
+- No i18n library. No Paraglide.
+- Server: TypeScript compiled to CommonJS, run as plain Node.
+
+## Repo layout
+
+- `ui/` — Vite app. `npm run build` outputs into `../server/public` with
+  `emptyOutDir: true`, so the UI build writes into the server tree.
+- `server/` — TypeScript service. Entry `server/src/server.ts`, compiled to
+  `server/dist/server.js`.
+- `docs/` — protocol and setup docs. `monitoring/` — Prometheus/Grafana provisioning.
+- Config lives in `server/config/*.json`, seeded by copying `server/config_example/`.
+  Runtime state is separate, under `server/state/`.
+
+## UI conventions
+
+- `<script lang="ts">` in every `.svelte` file.
+- Props are Svelte 4 `export let`, with a default and usually an explicit type:
+  `export let deviceId:string="";`
+- Reactivity is `$:` statements. Force list re-render by reassigning:
+  `uiList = [...uiList]`.
+- Component communication: `createEventDispatcher` + `on:someEvent={(e)=>...}`
+  reading `e.detail`; parents reach into children with `bind:this` and call methods.
+- Svelte stores are effectively unused — only `topology.svelte` imports `writable`,
+  and only because `@xyflow/svelte` requires it. Shared state lives on singleton
+  services exposing RxJS `Subject`s. Follow that, not stores.
+- No `<style>` blocks. There are none in the codebase. All CSS is global SCSS under
+  `ui/src/scss/`, imported from `ui/src/app.scss`. Add page styles as a new file there.
+- Markup mixes daisyUI/Tailwind utility classes with project class names.
+  `tailwind.config.cjs` only scans `./src/routes/**` plus `safelist.txt` — a utility
+  class used solely inside `ui/src/lib/` will be purged unless it is safelisted.
+- Theming: `document.documentElement.setAttribute('data-theme', 'dark'|'light')`,
+  persisted to `localStorage` under `nmos_crosspoint_dark_mode`.
+
+### Routing
+
+`svelte-routing`, declared inline in `ui/src/App.svelte`:
+
+```svelte
+<Router>
+  <Route path="/details" component={Details}/>
+  <Route path="/crosspoint"><Crosspoint bind:this={c} autoTake={autoTake}/></Route>
+  <Route><h2>404 : Not found</h2></Route>
+</Router>
+```
+
+Use the slot form when the route component needs props or bindings. Nav entries come
+from a `let routes = [{label, icon, link}]` array rendered with `{#each}` + `<Link>`.
+
+### File naming (differs per directory — preserve it)
+
+- `ui/src/routes/` — all lowercase: `crosspoint.svelte`, `mediadevices/matroxcip.svelte`.
+- `ui/src/lib/` — PascalCase components and services: `SetupDevice.svelte`,
+  `ServerConnector/ServerConnectorService.ts`. Plain helpers stay lowercase (`functions.ts`).
+- Imports alias to PascalCase regardless: `import Matroxcip from './routes/mediadevices/matroxcip.svelte'`.
+- Paths are always relative. There is no path alias.
+
+### Talking to the server
+
+One websocket client: `ui/src/lib/ServerConnector/ServerConnectorService.ts`, a
+module-scope singleton (`class _ServerConnector`, exported as a default instance).
+State channels are patched with rfc6902. API: `sync(channel, id = 0): Subject<any>`,
+`unsync(channel, id = 0)`, `get(route)`, `post(route, data)`, `addFeedback({level, message})`,
+`startLoad()`/`endLoad()`.
+
+Subscribe in `onMount`, and in `onDestroy` both unsubscribe AND `unsync` — missing the
+`unsync` leaks a server-side ref count:
+
+```ts
+let sync:Subject<any>;
+onMount(async () => {
+  sync = ServerConnector.sync("crosspoint");
+  sync.subscribe((obj:any)=>{ sourceState = obj; doFilter(); });
+});
+onDestroy(() => {
+  sync.unsubscribe();
+  ServerConnector.unsync("crosspoint");
+});
+```
+
+Channels: `uiconfig`, `crosspoint`, `nmos`, `topology`, `log`, `connectionState`,
+`mediadevices`, `mediadevmatroxcip`, `mediadevriedelembrionix`.
+
+## Server conventions
+
+- Singletons: a `static instance` assigned in the constructor
+  (`NmosRegistryConnector.instance = this`). Some newer classes use
+  `private static instance` + `static getInstance()`. Follow whichever the file uses.
+- Filenames are camelCase, exported classes PascalCase: `nmosConnector.ts` →
+  `NmosRegistryConnector`. Directories are camelCase except `lib/SyncServer/`.
+- Expose state to the UI as a `SyncObject` field registered by route and permission:
+  `server.addSyncObject("mediadevices","global",this.syncDeviceList)`.
+  Register request handlers with `server.addRoute("POST","makeconnection","global",(client,query,postData)=>{...})`.
+- Logging is `SyncLog` (streams to the UI `log` channel). All static, all
+  `(topic, text, raw = null)`, returning a numeric log id:
+  `SyncLog.error/warning/info/debug/verbose(topic, text, raw?)`, or the explicit
+  `SyncLog.log(severity, topic, text, raw?)` with severity
+  `"error" | "warning" | "info" | "debug" | "verbose"`. `debug`/`verbose` are dropped
+  unless debug logging is enabled. Both call styles are in use; drivers favour `log()`.
+- Config: synchronous `fs.readFileSync` + `JSON.parse` in a try/catch, then
+  `parseSettings()` (`lib/parseSettings.ts`) applies defaults by mutating the object.
+  There is no schema library and no typed Settings interface; settings are `any`.
+  New options belong in `parseSettings` with a default, plus `config_example`.
+
+### Plugin drivers
+
+- `server/src/mediaDevices/` is auto-discovered: `lib/mediaDevices.ts` reads
+  `./dist/mediaDevices/` and loads every `.js`. Adding a file registers a driver.
+  Modules can be disabled via `settings.disabledModules.mediadevices`.
+- `server/src/networkDevices/` is loaded by config `type` and each module must export
+  a class named exactly `NIC_MOD` — see `networkDevice.ts`.
+
+### Worker thread constraint
+
+`lib/crosspointUpdateThread.ts` runs in a `worker_threads` Worker spawned from
+`lib/crosspointAbstraction.ts` as the compiled `dist/.../crosspointUpdateThread.js`.
+
+In that file, and anything it imports:
+- `SyncLog` is unavailable (no instance, no websocket server). Log by posting a message
+  for the host to re-log:
+  `parentPort.postMessage(JSON.stringify({log:{severity:"warning",topic:"...",text:"...",raw:null}}))`
+- Do not import `nmosConnector` or other singleton-dependent modules. Keep to pure
+  helpers (`functions.ts`, `parseSettings`, types). Shared helpers used by the worker
+  must stay dependency-free.
+- All host/worker messages are JSON strings, not structure-cloned objects.
+
+## Code style
+
+Match the surrounding file rather than reformatting it.
+
+- 4 spaces in `server/src` and in `.svelte` `<script>` blocks; 2 in `ui/src/main.ts`
+  and Vite config.
+- Double quotes dominate in server code; some newer UI files use single.
+- `let` is used almost everywhere, including for values never reassigned. `const` mostly
+  for module-level `require`s and newer code.
+- `any` is used liberally at boundaries. `server/tsconfig.json` is NOT strict — no
+  `strict`, no `strictNullChecks`, implicit `any` allowed. `ui/tsconfig.json` extends
+  `@tsconfig/svelte` and IS strict.
+- Server files mix ES `import` with CommonJS `const fs = require("fs")`.
+- Errors are usually caught and reported via `SyncLog`, not rethrown; `LoggedError`
+  carries a `logId` for the throw-with-log case. Retries are `setTimeout`/`setInterval`.
+- Several files carry the header `/* NMOS Crosspoint / Copyright (C) 2021 Johannes Grieb */`.
+  Preserve it.
+
+## Build and verification
+
+```
+cd ui     && npm install && npm run build   # writes into ../server/public
+cd server && npm install && npm run build   # tsc
+cd server && npm run dev                    # tsc-watch + node --inspect
+docker-compose up nmos-crosspoint-dev
+```
+
+There is no test framework, no linter, and no CI — `npm test` in `server/` fails by
+design. Do not claim a change is verified by tests. The available checks are:
+
+- `cd server && ./node_modules/.bin/tsc --noEmit`
+- `cd ui && npm run check` (svelte-check)
+
+For anything touching NMOS connection behaviour, note explicitly what still needs real
+hardware to confirm; the device error bodies logged by `nmosConnector` are the oracle.
+
+## Reference
+
+- Svelte 4 docs: https://v4.svelte.dev/docs
+- svelte-routing: https://github.com/EmilTholin/svelte-routing
+- daisyUI: https://daisyui.com/docs
+- NMOS specs: https://specs.amwa.tv/nmos/

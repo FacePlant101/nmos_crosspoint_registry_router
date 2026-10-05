@@ -55,6 +55,14 @@ export class SyncObject {
         });
     }
 
+    /** Drop every subscription of this client, across all objectIds — used on
+     *  disconnect. Without it a dead client stayed subscribed forever and each
+     *  browser reload left one entry per channel that every subsequent
+     *  setState kept serialising and "sending" to. */
+    unsubscribeAll(client: WebsocketClient) {
+        this.clientList = this.clientList.filter((c) => c.client !== client);
+    }
+
     private send(action: string, data, objectId: string | number = 0) {
         objectId = "" + objectId;
         this.clientList.forEach((c) => {

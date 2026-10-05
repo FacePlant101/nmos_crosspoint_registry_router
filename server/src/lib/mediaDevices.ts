@@ -3,6 +3,7 @@ import { WebsocketSyncServer } from "./SyncServer/websocketSyncServer";
 import { SyncLog } from "./syncLog";
 
 const fs = require("fs");
+const nodePath = require("path");
 
  export class MediaDevices {
     public syncDeviceList: SyncObject;
@@ -42,7 +43,7 @@ const fs = require("fs");
                             SyncLog.log("info", "MediaDevices", "Disabled MediaDevice from: "+f.name)
                         }else{
                             try{
-                                let mediaDevClass = require("../../"+f.path + f.name).default;
+                                let mediaDevClass = require(nodePath.join(__dirname, "..", "mediaDevices", f.name)).default;
                                 this.deviceHandlers.push(new mediaDevClass(settings));
                                 SyncLog.log("info", "MediaDevices", "Load MediaDevice from: "+f.name)
                             }catch(e){

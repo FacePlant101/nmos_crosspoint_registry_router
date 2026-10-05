@@ -799,7 +799,100 @@
 
 
     
-  </script>
+  
+  // ----- BCP-008 status monitoring -----
+  // NcOverallStatus: 0 inactive, 1 healthy, 2 partially healthy, 3 unhealthy.
+  // The essence-type glyph doubles as the status indicator, so a degraded flow
+  // is visible without adding another column to an already wide matrix.
+  let bcp008On = false;
+  $: bcp008On = !!(sourceState && sourceState.bcp008Enabled);
+
+  function monitorClass(flow: any): string {
+    if (!bcp008On) return "";
+    const st = flow && flow.monitor;
+    if (!st) return "";
+    switch (st.status) {
+      case 1: return "mon-ok";
+      case 2: return "mon-warn";
+      case 3: return "mon-bad";
+      default: return "mon-inactive";
+    }
+  }
+
+  function deviceMonitorClass(dev: any, dir: "tx" | "rx"): string {
+    if (!bcp008On) return "";
+    const worst = dir === "tx" ? dev.monitorSummaryTx : dev.monitorSummaryRx;
+    switch (worst) {
+      case 2: return "mon-warn";
+      case 3: return "mon-bad";
+      default: return "";
+    }
+  }
+
+  const MON_LABEL: any = { 0: "Inactive", 1: "Healthy", 2: "Partially healthy", 3: "Unhealthy" };
+  const DOMAIN_LABEL: any = { link: "Link", path: "Connection / Transmission", sync: "Synchronisation", payload: "Stream / Essence" };
+
+  function monitorTooltip(flow: any): string {
+    const st = flow && flow.monitor;
+    if (!st) return "";
+    let out = "BCP-008: " + (MON_LABEL[st.status] ?? st.status);
+    if (st.message) out += " — " + st.message;
+    return out;
+  }
+
+  let monitorModal: any;
+  let monModalFlow: any = null;
+  let monModalCounters: any[] = [];
+  let monModalBusy = false;
+
+  function openMonitor(flow: any) {
+    if (!bcp008On || !flow || !flow.monitor) return;
+    monModalFlow = flow;
+    monModalCounters = [];
+    monitorModal.showModal();
+    loadCounters();
+  }
+
+  async function loadCounters() {
+    if (!monModalFlow) return;
+    monModalBusy = true;
+    try {
+      const res: any = await ServerConnector.post("bcp008Counters", { flowId: monModalFlow.id });
+      monModalCounters = res?.data?.counters ?? [];
+    } catch (e: any) {
+      monModalCounters = [];
+      ServerConnector.addFeedback({ level: "error", message: "Could not read counters: " + (e?.message ?? e) });
+    } finally {
+      monModalBusy = false;
+    }
+  }
+
+  async function resetCounters() {
+    if (!monModalFlow) return;
+    monModalBusy = true;
+    try {
+      await ServerConnector.post("bcp008Reset", { flowId: monModalFlow.id });
+      ServerConnector.addFeedback({ level: "success", message: "Counters reset." });
+      await loadCounters();
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not reset counters: " + (e?.message ?? e) });
+    } finally {
+      monModalBusy = false;
+    }
+  }
+
+  // Keep the open panel in step with live status pushes.
+  $: if (monModalFlow && sourceState) {
+    for (const d of (sourceState.devices || [])) {
+      for (const dir of ["senders", "receivers"]) {
+        for (const t of flowTypes) {
+          const f = ((d as any)[dir]?.[t] || []).find((x: any) => x.id === monModalFlow.id);
+          if (f) { monModalFlow = f; }
+        }
+      }
+    }
+  }
+</script>
   <div class="content-container crosspoint">
     <ul class="menu bg-base-200 menu-horizontal rounded-box filter-nav">
       <li>
@@ -843,7 +936,7 @@
                 <tr>
                     <th class=""></th>
                     {#each senders as dev}
-                      <th class="cp-device" class:expanded={isSenderExpanded(dev.id)} on:click={()=>toggleExpandSender(dev.id)}><!--
+                      <th class="cp-device {deviceMonitorClass(dev,'tx')}" class:expanded={isSenderExpanded(dev.id)} on:click={()=>toggleExpandSender(dev.id)}><!--
                         --><span class="cp-expand"><Icon src={ChevronRight}></Icon></span><!--
                         --><span class="cp-label {(dev.hidden?"hidden":"")}">{dev.alias}<!--
                         --><span class="cp-edit">
@@ -865,7 +958,10 @@
                                   <span role="button" tabindex="0" on:click={()=>activate(dev,flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){activate(dev,flow);}}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip data-tooltip="toggle activate"><Icon src={Link}></Icon></span>
                                 </span><!--
                                 --></span><!--
-                              --><span class={"cp-type cp-type-"+flow.type + " " + (flow.active ? "active" : "") + " " + (flow.staged ? "staged" : "")}><Icon src={getFlowTypeIcon(flow.type)}></Icon><!--
+                              --><span role="button" tabindex="0" class={"cp-type cp-type-"+flow.type + " " + (flow.active ? "active" : "") + " " + (flow.staged ? "staged" : "") + " " + monitorClass(flow)}
+                                on:click={(e)=>{if(flow.monitor){e.stopPropagation(); openMonitor(flow);}}}
+                                on:keydown={(e)=>{if((e.key==='Enter'||e.key===' ')&&flow.monitor){e.stopPropagation(); openMonitor(flow);}}}
+                                use:OverlayMenuService.tooltip data-tooltip={monitorTooltip(flow)}><Icon src={getFlowTypeIcon(flow.type)}></Icon><!--
                                 --><span class="cp-detail">{flow.format ? shortFormat(flow.format) : (flow.available ? "Unknown format": "Unavailable")}</span><!--
                               --></span><!--
                               
@@ -879,7 +975,7 @@
             <tbody>
               {#each receivers as dev}
                 <tr class="cp-device" class:expanded={isReceiverExpanded(dev.id)}>
-                  <td class="cp-line-stick" on:click={()=>toggleExpandReceiver(dev.id)}><!--
+                  <td class="cp-line-stick {deviceMonitorClass(dev,'rx')}" on:click={()=>toggleExpandReceiver(dev.id)}><!--
                     --><span class="cp-expand"><Icon src={ChevronRight}></Icon></span><!--
                     --><span class="cp-label {(dev.hidden?"hidden":"")}">{dev.alias}<!--
                         --><span class="cp-edit">
@@ -927,7 +1023,10 @@
                           <span role="button" tabindex="0" on:click={()=>connect(null, null, dev,flow)} on:keydown={(e)=>{if(e.key==='Enter'||e.key===' '){connect(null, null, dev,flow);}}} class="cp-button cp-button-disconnect" use:OverlayMenuService.tooltip  data-tooltip="disconnect"><Icon src={Link}></Icon></span>
                         </span><!--
                         --></span><!--
-                        --><span class={"cp-type cp-type-"+flow.type + " " + getDisconnectClass(dev,flow) + " " + (flow.active ? "active" : "")}><Icon src={getFlowTypeIcon(flow.type, false)}></Icon><!--
+                        --><span role="button" tabindex="0" class={"cp-type cp-type-"+flow.type + " " + getDisconnectClass(dev,flow) + " " + (flow.active ? "active" : "") + " " + monitorClass(flow)}
+                          on:click={(e)=>{if(flow.monitor){e.stopPropagation(); openMonitor(flow);}}}
+                          on:keydown={(e)=>{if((e.key==='Enter'||e.key===' ')&&flow.monitor){e.stopPropagation(); openMonitor(flow);}}}
+                          use:OverlayMenuService.tooltip data-tooltip={monitorTooltip(flow)}><Icon src={getFlowTypeIcon(flow.type, false)}></Icon><!--
                           --><span class="cp-detail">{shortCaps(flow.capLimits)}</span><!--
                         --></span><!--
                       --></td>
@@ -971,6 +1070,65 @@
 
     </div>
 
+
+    <dialog bind:this={monitorModal} class="modal">
+      <div class="modal-box" style="max-width:44rem;">
+        <form method="dialog">
+          <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+        </form>
+        <h3 class="font-bold text-lg">BCP-008 status</h3>
+        {#if monModalFlow}
+          <p class="mon-flow-name">{monModalFlow.alias} <span class="mon-kind">({monModalFlow.monitor?.kind})</span></p>
+          <p class="mon-overall {monitorClass(monModalFlow)}">
+            {MON_LABEL[monModalFlow.monitor?.status] ?? "Unknown"}
+            {#if monModalFlow.monitor?.message}— {monModalFlow.monitor.message}{/if}
+          </p>
+
+          <table class="mon-table">
+            <thead><tr><th>Domain</th><th>State</th><th>Transitions</th><th>Message</th></tr></thead>
+            <tbody>
+              {#each Object.keys(DOMAIN_LABEL) as key}
+                {#if monModalFlow.monitor?.domains?.[key]}
+                  <tr>
+                    <td>{DOMAIN_LABEL[key]}</td>
+                    <td class={"mon-cell mon-s"+monModalFlow.monitor.domains[key].s}>{monModalFlow.monitor.domains[key].s}</td>
+                    <td>{monModalFlow.monitor.domains[key].c}</td>
+                    <td>{monModalFlow.monitor.domains[key].m ?? ""}</td>
+                  </tr>
+                {/if}
+              {/each}
+            </tbody>
+          </table>
+          <p class="setup-hint">
+            A non-zero transition count means the domain degraded at some point since
+            the last reset — it does not mean the current state is bad.
+          </p>
+
+          <h4 class="mon-subhead">Packet counters</h4>
+          {#if monModalBusy}
+            <p>Reading…</p>
+          {:else if monModalCounters.length === 0}
+            <p class="setup-hint">This device exposes no packet counters.</p>
+          {:else}
+            {#each monModalCounters as group}
+              <p class="mon-group">{group.label}</p>
+              <table class="mon-table">
+                <tbody>
+                  {#each group.counters as c}
+                    <tr><td>{c.name}</td><td class="mon-num">{c.value}</td></tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/each}
+          {/if}
+        {/if}
+        <div class="modal-action">
+          <button class="btn btn-sm" disabled={monModalBusy} on:click={loadCounters}>Refresh</button>
+          <button class="btn btn-sm" disabled={monModalBusy} on:click={resetCounters}>Reset counters</button>
+          <form method="dialog"><button class="btn btn-sm">Close</button></form>
+        </div>
+      </div>
+    </dialog>
 
     <dialog bind:this={labelModal} class="modal">
       <div class="modal-box">

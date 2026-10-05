@@ -1,157 +1,94 @@
-# NMOS Crosspoint
+# NMOS Crosspoint Router
 
-This tool is intended as a simple Orchestration layer for NMOS and ST2110 based Media Networks. 
+High-performance NMOS registry companion and crosspoint router for ST 2110 media networks. The system discovers NMOS devices, maintains a real-time model of senders/receivers/flows, and provides a Web UI + WebSocket API to make connections, manage multicast, and control supported devices.
 
 ![preview.jpg](preview.jpg)
 
-This tool is tested against a lot of devices and now stable and performant with more than 2000 Flows.
+Tested with 2000+ flows in production-style environments.
+
+## Contents
+
+- [NMOS Crosspoint Router](#nmos-crosspoint-router)
+  - [Contents](#contents)
+  - [Features](#features)
+    - [Core NMOS functionality](#core-nmos-functionality)
+    - [Device support](#device-support)
+    - [Performance and observability](#performance-and-observability)
+    - [External integrations](#external-integrations)
+  - [Architecture](#architecture)
+    - [Backend](#backend)
+    - [Frontend](#frontend)
+    - [Device modules](#device-modules)
+    - [How it works](#how-it-works)
+  - [Getting started](#getting-started)
+    - [Deployment (BalenaOS)](#deployment-balenaos)
+    - [Local quick start (Docker Compose)](#local-quick-start-docker-compose)
+  - [Configuration](#configuration)
+    - [Settings](#settings)
+    - [Authentication](#authentication)
+  - [Web UI routes](#web-ui-routes)
+  - [Integrations](#integrations)
+    - [Matrox Convert IP](#matrox-convert-ip)
+    - [Network switch topology](#network-switch-topology)
+    - [Q-SYS](#q-sys)
+    - [Bitfocus Companion](#bitfocus-companion)
+  - [Monitoring](#monitoring)
+  - [Development](#development)
+    - [Docker development](#docker-development)
+    - [Local development](#local-development)
+  - [Troubleshooting](#troubleshooting)
+  - [Documentation](#documentation)
+  - [License](#license)
 
 ## Features
 
-### Core NMOS Functionality
-- **Complete NMOS Device Discovery**: Automatic discovery and real-time monitoring of all NMOS devices, senders, receivers, and flows
-- **Crosspoint Switching**: Intuitive crosspoint-style interface for connecting flows to receivers
-- **Multi-Registry Support**: Connect to multiple NMOS registries across different network segments
-- **Real-time Updates**: WebSocket-based live updates for device status and connection changes
-- **Flow Management**: Enable/disable flows, manage multicast addresses, and handle connection states
-- **Automatic Reconnection**: Smart reconnection logic on flow changes and network disruptions
+### Core NMOS functionality
 
-### Device Integration & Control
-- **Matrox Convert IP Integration**: 
-  - Per-device multiviewer mode control
-  - PTP (Precision Time Protocol) enable/disable functionality
-  - Flexible device identification (serial numbers, names, aliases)
-  - Device grouping to consolidate all video/audio channels per physical device
-- **Device Deduplication**: Intelligent merging of devices with different identifier formats
-- **Proprietary Device Abstractions**: Extensible framework for device-specific control and monitoring
+- Automatic discovery and real-time monitoring of NMOS nodes, devices, senders, receivers, and flows
+- Crosspoint-style switching UI with prepare/preview support
+- Multi-registry support across multiple network segments
+- Flow management (enable/disable, multicast settings, connection state)
+- Automatic reconnection on SDP/flow changes
 
-### External System Integration
-- **Q-SYS Integration**: Comprehensive Lua script for Q-SYS control systems with WebSocket API
-- **Companion Integration**: Connection to Bitfocus Companion for advanced control workflows
-- **WebSocket API**: Full-featured API for third-party integrations and custom applications
+### Device support
 
-### Network & Performance
-- **High Performance**: Tested stable with 2000+ flows in production environments
-- **Multi-Network Support**: Operates across multiple network segments (OOB, production, backup)
-- **Advanced Routing**: Intelligent path selection and failover capabilities
-- **Network Topology Awareness**: Understanding of network structure for optimal routing decisions
+- Matrox Convert IP support (multiviewer toggle, PTP control, device grouping)
+- Network switch integration for topology data (Arista DCS, Netgear M4350)
+- Pluggable device driver framework for vendor-specific extensions
 
-## Planned Features
+### Performance and observability
 
-- **Virtual Senders and Receivers**: Software-based endpoints for flexible routing
-- **Network Topology Visualization**: Interactive network mapping and visualization
-- **SDN-style Intelligent Routing**: Network-aware, active routing with path optimization
-- **NMOS IS-07 Events**: Enhanced event and tally integration (WebSocket streams already supported)
-- **NMOS IS-08 Channel Mapping**: Advanced audio channel mapping and control
-- **Enhanced Device Abstractions**: Support for additional manufacturer-specific device types
-- **Advanced Analytics**: Connection statistics, network performance monitoring, and usage analytics
+- O(1) device/flow lookup maps for fast switching
+- Predictive staging and latency measurement tooling
+- Prometheus + Grafana stack (docker-compose)
 
-## Recent Enhancements
+### External integrations
 
-- ✅ **Matrox Convert IP Integration**: Complete multiviewer and device control functionality
-- ✅ **Device Grouping**: All video/audio channels consolidated per physical device
-- ✅ **Q-SYS Integration**: Comprehensive Lua script with WebSocket API control
-- ✅ **Enhanced Documentation**: Complete API documentation and usage guides
-- ✅ **Device Deduplication**: Intelligent handling of multiple device identifier formats
-- ✅ **WebSocket API**: Full-featured API for external integrations
+- WebSocket API for automation and custom UIs
+- Q-SYS integration (Lua script)
+- Bitfocus Companion workflows
 
-## Changes from Version 1.0
+## Architecture
 
-- Complete redesign of the server core for supporting more features
-- Multithreaded Server
-- Complete redesign of the UI. (Switched from Angular to Svelte due to performance)
-- Added basics for implementation of device abstractions
-- Lot of Bug fixing
+### Backend
 
-## System Integrations
+`/server`: Node.js + TypeScript.
 
-### Q-SYS Control Systems
-Comprehensive integration with QSC Q-SYS platforms via Lua scripting:
-- **Real-time WebSocket Communication**: Direct connection to NMOS Crosspoint Router
-- **Crosspoint Control**: Make/break connections between encoders and decoders
-- **Matrox Multiviewer Control**: Per-decoder multiviewer toggles with automatic master mode
-- **Device Discovery**: Automatic discovery and control of NMOS devices
-- **JSON Preset Support**: Load and save connection configurations
-- **Debug Logging**: Comprehensive troubleshooting capabilities
+- Core modules: NMOS connector, crosspoint abstraction, sync server, topology, media device manager
+- Real-time sync via WebSocket SyncObjects
 
-**Files**: `scripts/q-sys-crosspoint-control.lua`, `scripts/README.md`
+### Frontend
 
-### Matrox Convert IP Devices
-Native integration for Matrox Convert IP encoder/decoder control:
-- **Multiviewer Mode**: Enable/disable multiviewer with automatic master mode activation
-- **PTP Control**: Precision Time Protocol enable/disable functionality
-- **Device Management**: Flexible device identification and status monitoring
-- **Device Grouping**: Consolidate all video/audio channels per physical device
-- **REST API Integration**: Direct integration with Matrox device APIs
+`/ui`: Svelte + TypeScript + Tailwind/DaisyUI.
 
-**Backend Module**: `server/src/mediaDevices/matroxConvertIp.ts`
+- Real-time updates from SyncObjects and WebSocket API routes
 
-### WebSocket API
-Full-featured API for custom integrations and third-party applications:
-- **Real-time Synchronized Objects**: Live device and flow state updates
-- **Device Control Routes**: Connection management, flow control, device-specific commands
-- **Matrox-specific Routes**: `matroxcip_togglemultiviewer`, `matroxcip_toggleptp`
-- **Authentication Support**: Secure access with user management
+### Device modules
 
-**Documentation**: `docs/WEBSOCKET_API.md`
+- Media device drivers in `server/src/mediaDevices/`
+- Network device drivers in `server/src/networkDevices/`
 
-### Bitfocus Companion
-Integration with Companion for advanced control workflows and panel interfaces.
-
-## Dependencies
-
-### NMOS Registry
-This tool requires a working NMOS Registry running in the network. We test against [nmos-cpp](https://github.com/sony/nmos-cpp) in a docker container.
-
-To get one up and running, you can use the one provided by rhastie: [https://github.com/rhastie/build-nmos-cpp](https://github.com/rhastie/build-nmos-cpp)
-
-### Runtime Requirements
-- **Node.js**: Version 20 or higher
-- **Network Access**: Connectivity to NMOS registries and target devices
-- **WebSocket Support**: For real-time communication and external integrations
-
-## Configuration
-
-You can simply rename the `server/config_example` folder to `server/config` please see the config files for possible Settings, documentation has to be done.
-
-At startup on some installations there are some warnings about missing files, the System will create these files as soon as there is something to store.
-As there is no `state` folder on some installations these fiels are not created. Just create a state folder and the subfolders named in the warnings and you are fine. You do not need to create the files.
-
-There is a Bug with Authentification which does not allow unauthentificated access. Will be fixed soon, but for now you have to crete a password (SHA256 in the `users.json` file)
-
-## Installation
-
-The simplest way to get NMOS Crosspoint up and running is to use Docker Compose.
-
-Make sure to change `docker-compose.yml` for your environment.
-```shell
-docker-compose up
-```
-This will create and start one Docker Container with a node express server.
-Just point your Browser to the IP of the created Docker Container at port 80
-
-## Just run it !
-
-If you have a NMOS Registry in the network (Easy-NMOS for example) you can just start this tool on any computer.
-You will need an Installation of Node.js Version 20, change to the `server`folder and just run: `node ./dist/server.js`.
-
-## Network
-
-NMOS Crosspoint can find and use multiple Registries, over all attached networks. Usually I test in an environment with the following networks:
-- OOB (Out of Band Management network)
-- Amber (Main Media network)
-- Blue (Backup Media network)
-
-NMOS Crosspoint can be connected to even more networks and will try to reach devices over multiple interfaces if they provide multiple endpoints to the registry.
-In theory, one should be able to get a complete failover. 
-
-At this time, NMOS Crosspoint does not handle the multiple "Legs" (network interfaces) presented by NMOS in a inteligent way. So there is no mapping for subnets or any desicion which Legs can connect.
-Leg 1 of a sender is always connected to Leg 1 of a receiver, the SDP Manifest files are not modified in any way. 
-There are plans to see the whole network topology and handle lots of these things.
-
-Unfortunately, some devices do not present their NMOS API on all interfaces. So for best compatibility, NMOS Crosspoint and the API should be present in all networks. If the NMOS Registry is configured manually in the devices, one can also use routing.
-
-## How it works
+### How it works
 
 ```mermaid
 flowchart TD
@@ -163,47 +100,176 @@ flowchart TD
     node1 -- Updates --> registry
     node2 -- Updates --> registry
 
-    server -- "Rest\nGET SDP File\nConnect (PATCH, activate_immediate)" --> node1
-    server -- "Rest\nGET SDP File\nConnect (PATCH, activate_immediate)" --> node2
-
-
+    server -- "REST\nGET SDP\nPATCH activate_immediate" --> node1
+    server -- "REST\nGET SDP\nPATCH activate_immediate" --> node2
 ```
 
+## Getting started
+
+### Deployment (BalenaOS)
+
+Production deployments target BalenaOS. The root `docker-compose.yml` is the Balena service definition, so keep `network_mode: host` enabled for reliable mDNS discovery. Copy `server/config_example` to `server/config`, commit your configuration, and deploy using your normal Balena workflow (CLI or dashboard).
+
+### Local quick start (Docker Compose)
+
+For local testing (non-Balena), you can run the compose stack directly.
+
+1. Copy the example configuration:
+
+```shell
+cp -R server/config_example server/config
+```
+
+1. Edit the config files in `server/config/` (see [Configuration](#configuration)).
+1. Start services:
+
+```shell
+docker-compose up
+```
+
+1. Open the UI at `http://<host>:80` (or the port configured in `server/config/settings.json`).
+
+Notes:
+
+- The compose file uses `network_mode: host` for reliable mDNS discovery.
+- The compose file also starts an NMOS registry, ZeroTier, Prometheus, and Grafana by default. Adjust services as needed.
+
+## Configuration
+
+### Settings
+
+Configuration lives in `server/config/` (copied from `server/config_example`). Key files:
+
+- `server/config/settings.json` — server ports, NMOS registry versions, multicast ranges, debug flags
+- `server/config/users.json` — authentication and permissions
+- `server/config/topology.json` — network switch definitions (optional)
+- `server/config/mediadev_matroxcip/matroxcip.json` — Matrox Convert IP settings
+
+Example (settings.json):
+
+```json
+{
+  "server": {"port": 80, "address": "0.0.0.0"},
+  "staticNmosRegistries": [{"ip": "10.1.0.211", "port": 80, "priority": 10, "domain": ""}],
+  "nmos": {"registryVersions": ["v1.3", "v1.2"], "connectVersions": ["v1.1", "v1.0"]}
+}
+```
+
+### Authentication
+
+Authentication is configured in `server/config/users.json` using SHA256 password hashes. Example:
+
+```json
+{
+  "users": {"admin": {"password": "<sha256>", "groups": ["user", "admin"]}},
+  "permissions": {"global": {"allowRead": {"users": ["__noAuth"], "groups": ["user"]}}}
+}
+```
+
+Known issue: unauthenticated access is currently blocked in some builds, so set at least one user/password in `users.json`.
+
+## Web UI routes
+
+- `/` or `/crosspoint` — crosspoint matrix view
+- `/details` — device details and flow management
+- `/topology` — network topology view
+- `/setup` — configuration and status
+- `/mediadevices` — media device overview
+- `/mediadevices/matroxcip` — Matrox Convert IP controls
+- `/mediadevices/riedelembrionix` — Riedel Embrionix controls
+- `/debug` — live NMOS/crosspoint data
+- `/logging` — server logs while making connections
+
+## Integrations
+
+### Matrox Convert IP
+
+Configuration: `server/config/mediadev_matroxcip/matroxcip.json`.
+
+Credential overrides via environment variables:
+
+- `MATROX_CIP_USER`
+- `MATROX_CIP_PASSWORD`
+
+Supported controls include multiviewer enable/disable and PTP enable/disable. See `docs/WEBSOCKET_API.md` for API routes.
+
+### Network switch topology
+
+Define devices in `server/config/topology.json` to pull interface and LLDP data into the topology view (e.g., Arista DCS, Netgear M4350).
+
+### Q-SYS
+
+Use the Lua script in `scripts/q-sys-crosspoint-control.lua` for Q-SYS control system integration. Setup details and examples are in `scripts/README.md`.
+
+### Bitfocus Companion
+
+Bitfocus Companion workflows are supported via the WebSocket API. See the Companion integration notes in `docs/NMOS_COMMANDS.md`.
+
+## Monitoring
+
+The default compose stack includes Prometheus and Grafana for latency metrics and performance monitoring. With `network_mode: host`, they use standard ports (Grafana 3000, Prometheus 9090) unless changed.
+
+### InfluxDB (Proxmox metrics)
+
+The stack can also run InfluxDB 2.x for Proxmox host metrics. InfluxDB data is persisted via the `influxdb2-data` and `influxdb2-config` volumes (Balena keeps these across redeploys).
+
+**InfluxDB init env vars** (set in Balena Cloud for the `influxdb` service):
+
+- `DOCKER_INFLUXDB_INIT_USERNAME`
+- `DOCKER_INFLUXDB_INIT_PASSWORD`
+- `DOCKER_INFLUXDB_INIT_ORG`
+- `DOCKER_INFLUXDB_INIT_BUCKET` (default: `proxmox`)
+- `DOCKER_INFLUXDB_INIT_ADMIN_TOKEN`
+
+> Note: these init values apply **only on first boot** (when `/var/lib/influxdb2` is empty). After that, change tokens/users in the InfluxDB UI.
+
+**Grafana datasource provisioning** is defined in:
+
+`monitoring/grafana/provisioning/datasources/influxdb.yml`
+
+Set these **Grafana service** env vars in Balena Cloud:
+
+- `INFLUXDB_URL` (e.g. `http://localhost:8086`)
+- `INFLUXDB_ORG`
+- `INFLUXDB_BUCKET`
+- `INFLUXDB_TOKEN`
+
+Restart the Grafana service to apply provisioning.
 
 ## Development
 
-```
-docker-compose up nmos-crosspoint-dev
-```
-Will start one Docker Container with a live updating Node Server.
-For both folders, `/ui` and `/server` you could also run `npm install` and `npm run dev` for a local development session. 
-
-In development mode it is extremely usefull for debugging as you can nearly live modify patch commands and the interpretation of NMOS data. under `http://<ip:port>/debug` you can see the full live updating crosspoint and NMOS data. Under `http://<ip:port>/log` there is lots of usefull data while making connections.
-
-## Standalone
-
-It is possible to run this tool without docker. Still there is need for a NMOS Registry, nmos-cpp can be built and operated without Docker.
+### Docker development
 
 ```shell
-# build the angular app
-cd ./ui
-npm install --force         # force is required for ace (json rendering, to be fixed or replaced)
-npm run build                
-cd ..
-
-# build the server (typescript has to be globally available)
-
-cd ./server
-npm install
-# optional:    npm install -g typescript@latest
-tsc
-node ./dist/server.js
+docker-compose up nmos-crosspoint-dev
 ```
 
-Check the `Dockerfile.dev` for information on how to start live development servers.
+### Local development
 
+```shell
+cd ui
+npm install
+npm run dev
 
+cd ../server
+npm install
+npm run dev
+```
 
+See [Web UI routes](#web-ui-routes) for `/debug` and `/logging` while developing.
 
+## Troubleshooting
 
+- **Missing state folders**: If startup logs mention missing state folders, create `server/state` and the subfolders named in the warnings.
+- **mDNS discovery**: Docker deployments require host networking for reliable discovery.
+- **Unauthenticated access**: Add a user/password in `server/config/users.json` if login fails without credentials.
 
+## Documentation
+
+- WebSocket API: `docs/WEBSOCKET_API.md`
+- NMOS command reference: `docs/NMOS_COMMANDS.md`
+- Q-SYS integration guide: `scripts/README.md`
+
+## License
+
+MIT

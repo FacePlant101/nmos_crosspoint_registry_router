@@ -1,0 +1,9 @@
+{
+  "logging_level": 0,
+  "label": "rig-node",
+  "how_many": 2,
+  "activate_senders": true,
+  "registry_address": "nmos-registry",
+  "registry_version": "v1.3",
+  "registration_port": 8080
+}

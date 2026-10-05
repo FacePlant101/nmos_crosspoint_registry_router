@@ -1,4 +1,7 @@
 import { SyncObject } from "./SyncServer/syncObject";
+import { Bcp008Monitor, MonitorStatus } from "./bcp008Monitor";
+import { nmosIdFromCrosspointId } from "./functions";
+import { MulticastLeaseManager } from "./multicastLeaseManager";
 import { LoggedError, SyncLog } from "./syncLog";
 import { error } from "console";
 import { NmosRegistryConnector } from "./nmosConnector";
@@ -124,6 +127,17 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         this.healthMonitor = NmosHealthMonitor.getInstance();
         this.predictiveStaging = EnhancedPredictiveStaging.getInstance();
 
+        // BCP-008 status monitoring. It lives here rather than in server.ts
+        // because its output is folded into the crosspoint state, and it needs
+        // the NMOS state this class already receives.
+        new Bcp008Monitor();
+        Bcp008Monitor.instance.onChange = () => {
+            try { this.republishEnriched(); } catch (e) {}
+        };
+        try {
+            Bcp008Monitor.instance.setEnabled(this.settings?.bcp008?.enabled !== false);
+        } catch (e) {}
+
         this.startWorker();
         // Don't call this.update() here - wait for first NMOS state to prevent 
         // initialization timing issues where existing connections are missed
@@ -195,30 +209,41 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         // Request current alias state from worker thread
         return new Promise((resolve) => {
             const requestId = Math.random().toString(36).substring(7);
+            let timeout: any = null;
 
-            // Set up listener for response
-            const messageHandler = (event: MessageEvent) => {
+            // NOTE this listener was written against the browser Worker API:
+            // addEventListener/removeEventListener with an event object
+            // carrying .data. `this.worker` is a Node worker_threads Worker,
+            // which uses on/off and hands the posted value straight to the
+            // handler. Calling addEventListener threw immediately, so this
+            // migration never ran once — it only ever logged
+            // "this.worker.addEventListener is not a function".
+            const messageHandler = (message: any) => {
                 try {
-                    const data = JSON.parse(event.data);
+                    const data = JSON.parse(message);
                     if (data.aliasStateResponse && data.requestId === requestId) {
-                        this.worker.removeEventListener('message', messageHandler);
+                        this.worker.off('message', messageHandler);
+                        if (timeout) { clearTimeout(timeout); timeout = null; }
                         this.processAliasMigration(data.aliasState).then(resolve);
                     }
                 } catch (e) {
-                    // Ignore parsing errors
+                    // Every worker message passes through here, so anything
+                    // that is not our response is simply not ours to handle.
                 }
             };
 
-            this.worker.addEventListener('message', messageHandler);
+            this.worker.on('message', messageHandler);
 
             // Request alias state
             this.worker.postMessage(JSON.stringify({
                 requestAliasState: { requestId }
             }));
 
-            // Timeout after 5 seconds
-            setTimeout(() => {
-                this.worker.removeEventListener('message', messageHandler);
+            // Give up after 5 seconds rather than leaving the caller hanging
+            // if the worker is restarting and never answers.
+            timeout = setTimeout(() => {
+                this.worker.off('message', messageHandler);
+                SyncLog.log("warning", "alias", "Timed out waiting for the worker's alias state; migration skipped this run.");
                 resolve();
             }, 5000);
         });
@@ -352,6 +377,39 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         return new Promise((resolve, reject) => {
             if(id.startsWith("nmos_")){
                 let nmosId = id.slice(5);
+                // Record the edit against the lease FIRST. Otherwise the next
+                // reconcile sees the sender sitting on an address that is not
+                // its reserved one and immediately patches it back — the manual
+                // edit would survive only until the following sweep.
+                // An empty string is an explicit clear, which drops the
+                // override and returns the leg to its reserved address.
+                try{
+                    if(MulticastLeaseManager.instance && Array.isArray(data?.legs)){
+                        for(const leg of data.legs){
+                            const index = Number(leg?.index);
+                            if(!Number.isFinite(index)){ continue; }
+                            MulticastLeaseManager.instance.recordManualEdit(nmosId, index, leg?.multicast);
+                        }
+                    }
+                }catch(e){
+                    SyncLog.log("warning", "Multicast Lease", "Could not record a manual multicast edit", e);
+                }
+
+                // A cleared leg has no address of its own to send, so resolve
+                // the effective one from the lease before patching.
+                try{
+                    const mgr = MulticastLeaseManager.instance;
+                    if(mgr && mgr.isEnabled() && Array.isArray(data?.legs)){
+                        data = { ...data, legs: data.legs.map((leg:any)=>{
+                            const index = Number(leg?.index);
+                            const wanted = (leg?.multicast === "" || leg?.multicast == null)
+                                ? mgr.getEffectiveIp(nmosId, index)
+                                : leg.multicast;
+                            return { index, multicast: wanted };
+                        }).filter((leg:any)=> !!leg.multicast) };
+                    }
+                }catch(e){}
+
                 NmosRegistryConnector.instance.setFlowMulticast(nmosId,data);
             } 
             resolve({});
@@ -1074,6 +1132,134 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         }
     }
     
+    /** Re-publish the current state with enrichment recomputed.
+     *
+     *  Needed when something the enrichment depends on changes without the
+     *  worker producing new state — editing the Web-UI link profiles in Setup
+     *  is exactly that case, and without this the links stayed stale until
+     *  some unrelated device event came along. */
+    public republishForSettingsChange() {
+        try { this.republishEnriched(); } catch (e) {}
+    }
+
+    /** Resolve the "open device web UI" link for one crosspoint device.
+     *
+     *  Two sources, in order of authority:
+     *    1. A webui control the device itself advertises. That is the device
+     *       telling us where its UI lives, so it always wins — this tree
+     *       already sees urn:x-matrox:cip:webui on Matrox ConvertIP.
+     *    2. Otherwise the first configured vendor profile whose comma-separated
+     *       labels substring-match the NMOS node label, combined with the host
+     *       the node advertises. Matching on the NODE label (not the device
+     *       label) is what makes one profile cover a whole product family.
+     *
+     *  Returns "" when nothing matches, which the UI reads as "no link".
+     */
+    private resolveDeviceUrl(crosspointDeviceId: string): string {
+        try {
+            const nmosDeviceId = nmosIdFromCrosspointId(crosspointDeviceId);
+            const device = this.nmosState?.devices?.[nmosDeviceId];
+            if (!device) return "";
+
+            // 1. An explicit webui control from the device itself.
+            const controls = Array.isArray(device.controls) ? device.controls : [];
+            for (const c of controls) {
+                if (typeof c?.type === "string" && c.type.includes("webui")
+                    && typeof c?.href === "string" && c.href.startsWith("http")) {
+                    return c.href;
+                }
+            }
+
+            // 2. Vendor profile matched against the node label.
+            const node = this.nmosState?.nodes?.[device.node_id];
+            const label = ("" + (node?.label || device?.label || "")).toLowerCase();
+            if (!label) return "";
+
+            // Prefer the API endpoint host — node.href can carry a port that
+            // belongs to the NMOS API rather than the device's own web UI.
+            let host = "";
+            try {
+                const ep = node?.api?.endpoints?.[0];
+                if (ep?.host) { host = "" + ep.host; }
+            } catch (e) {}
+            if (!host) {
+                try {
+                    const m = ("" + (node?.href || "")).match(/^https?:\/\/([^\/:]+)/);
+                    if (m) { host = m[1]; }
+                } catch (e) {}
+            }
+            if (!host) return "";
+
+            const profiles = Array.isArray(this.settings?.vendorProfiles) ? this.settings.vendorProfiles : [];
+            for (const prof of profiles) {
+                const needles = ("" + (prof?.labels || "")).split(",")
+                    .map((x: string) => x.trim().toLowerCase())
+                    .filter((x: string) => x.length > 0);
+                if (needles.length === 0) continue;
+                // First match wins, so profile order is the operator's priority.
+                if (!needles.some((n: string) => label.includes(n))) continue;
+
+                const protocol = (prof.protocol === "https") ? "https" : "http";
+                const port = Number(prof.port) || (protocol === "https" ? 443 : 80);
+                let path = ("" + (prof.path || "/"));
+                if (!path.startsWith("/")) { path = "/" + path; }
+                // Leave the default port off, so the link reads like one a
+                // person would type.
+                const portPart = ((protocol === "https" && port === 443) || (protocol === "http" && port === 80))
+                    ? "" : ":" + port;
+                return protocol + "://" + host + portPart + path;
+            }
+        } catch (e) {}
+        return "";
+    }
+
+    /** Fold BCP-008 status into the crosspoint state and publish it.
+     *
+     *  The worker thread builds the state and knows nothing about BCP-008, so
+     *  the monitor's output is stitched in here, on the main thread, right
+     *  before publishing. Called both when the worker sends new state and when
+     *  the monitor reports a status change on its own. */
+    private republishEnriched() {
+        if (!this.crosspointState) return;
+        const mon = Bcp008Monitor.instance;
+        const enabled = !!mon?.isEnabled();
+
+        try {
+            (this.crosspointState as any).bcp008Enabled = enabled;
+            for (const dev of this.crosspointState.devices || []) {
+                // Per-device rollup, so the matrix can colour a collapsed node
+                // band without walking its flows in the UI.
+                let worstTx = 0, worstRx = 0;
+                for (const dir of ["senders", "receivers"] as const) {
+                    const groups = (dev as any)[dir] || {};
+                    for (const type of Object.keys(groups)) {
+                        const list = groups[type];
+                        if (!Array.isArray(list)) continue;
+                        for (const flow of list) {
+                            // Crosspoint ids are namespaced ("nmos_<uuid>"),
+                            // but the monitor keys its statuses by the bare
+                            // IS-04 UUID it resolved from the device's
+                            // touchpoints — map before looking up.
+                            const st = enabled ? mon?.getStatus(nmosIdFromCrosspointId(flow.id)) : null;
+                            (flow as any).monitor = st || null;
+                            if (st) {
+                                if (dir === "senders") { worstTx = Math.max(worstTx, st.status); }
+                                else { worstRx = Math.max(worstRx, st.status); }
+                            }
+                        }
+                    }
+                }
+                (dev as any).monitorSummaryTx = worstTx;
+                (dev as any).monitorSummaryRx = worstRx;
+                (dev as any).deviceUrl = this.resolveDeviceUrl(dev.id);
+            }
+        } catch (e) {
+            SyncLog.log("error", "crosspoint", "Failed to fold BCP-008 status into crosspoint state", e);
+        }
+
+        this.syncCrosspoint.setState(this.crosspointState);
+    }
+
     updateReturn(data: any) {
         if(data.hasOwnProperty("crosspointState")){
             const prev = this.crosspointState;
@@ -1082,7 +1268,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             // Update optimized lookup maps for O(1) performance
             this.optimizedLookup.updateFromCrosspointState(this.crosspointState);
             
-            this.syncCrosspoint.setState(this.crosspointState);
+            this.republishEnriched();
             // Notify subscribers
             try{
                 this.updateCallbacks.forEach(cb => {
@@ -1105,6 +1291,9 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
     updateFromNmos(nmosState: any) {
         const isFirstUpdate = !this.nmosState;
         this.nmosState = nmosState;
+        // Let the monitor reconcile its IS-12 control connections against the
+        // devices currently in the registry.
+        try { Bcp008Monitor.instance?.updateFromNmos(nmosState); } catch (e) {}
         this.worker.postMessage(JSON.stringify({
             nmosState: this.nmosState
         }));
@@ -1176,7 +1365,11 @@ export interface CrosspointFlow {
     capLimits:string,
     channelNumber: number,
     sourceNumber: number,
-    bitrate:CrosspointFlowBitrate
+    bitrate:CrosspointFlowBitrate,
+    /** Live BCP-008 status for this flow, or null when monitoring is off or
+     *  the owning device has no IS-12 control endpoint. Filled in on the main
+     *  thread by republishEnriched, not by the worker. */
+    monitor?: MonitorStatus | null
 };
 
 
@@ -1213,10 +1406,21 @@ export interface CrosspointDevice {
         mqtt: CrosspointFlow[],
         unknown: CrosspointFlow[],
     },
+
+    /** Worst BCP-008 status across this device's senders / receivers (0 = ok),
+     *  so a collapsed node band can be coloured without walking its flows. */
+    monitorSummaryTx?: number,
+    monitorSummaryRx?: number,
+
+    /** Resolved "open device web UI" link, or "" when nothing matched. */
+    deviceUrl?: string,
     
   }
 export interface CrosspointState {
-    devices: CrosspointDevice[]
+    devices: CrosspointDevice[],
+    /** Whether BCP-008 monitoring is on, so the UI can hide the status glyphs
+     *  entirely rather than showing every flow as "unknown". */
+    bcp008Enabled?: boolean
 }
 
 
@@ -1235,7 +1439,10 @@ export interface CrosspointConnectionSenderInfo {
     interfaces:any[],
     active:boolean,
     error:string,
-    transport:string
+    transport:string,
+    // Sender TCP endpoint per leg, required to stage a Matrox USB receiver. Only set for
+    // transport "usb"; other transports derive their parameters on the receiver side.
+    senderLegs?:{source_ip:string, source_port:number}[]
 }
 
 export interface CrosspointShadowDevice {

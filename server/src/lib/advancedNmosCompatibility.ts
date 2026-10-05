@@ -10,6 +10,7 @@
 
 import { SyncLog } from "./syncLog";
 import { NmosRegistryConnector } from "./nmosConnector";
+import { isUsbTransport } from "./functions";
 
 export interface StreamCompatibilityResult {
     compatible: boolean;
@@ -31,8 +32,9 @@ export interface StreamCapabilities {
 }
 
 export interface OptimizedTransportParams {
-    rtp_enabled: boolean;
-    rtcp_enabled: boolean;
+    // RTP specific, absent for non-RTP transports such as urn:x-matrox:transport:usb
+    rtp_enabled?: boolean;
+    rtcp_enabled?: boolean;
     destination_ip?: string;
     destination_port?: number;
     source_ip?: string;
@@ -127,6 +129,12 @@ export class AdvancedNmosCompatibility {
 
             if (!sender || !receiver || !flow) {
                 throw new Error("Required NMOS resources not found");
+            }
+
+            // Everything below is RTP specific. Non-RTP transports (urn:x-matrox:transport:usb)
+            // have no optimizable parameters here, so return an empty set rather than RTP defaults.
+            if (isUsbTransport(sender.transport)) {
+                return {};
             }
 
             const optimizedParams: OptimizedTransportParams = {
@@ -250,7 +258,8 @@ export class AdvancedNmosCompatibility {
             // Include manifest file if provided (non-empty) and transport supports it
             const trimmedManifest = typeof manifestFile === 'string' ? manifestFile.trim() : '';
             if (trimmedManifest && (receiver.transport === "urn:x-nmos:transport:rtp" || 
-                                   receiver.transport === "urn:x-nmos:transport:rtp.mcast")) {
+                                   receiver.transport === "urn:x-nmos:transport:rtp.mcast" ||
+                                   receiver.transport === "urn:x-matrox:transport:usb")) {
                 reconfigPatch.transport_file = {
                     type: "application/sdp",
                     data: trimmedManifest,
@@ -607,7 +616,9 @@ export class AdvancedNmosCompatibility {
             // Standard NMOS formats to Matrox formats
             'urn:x-nmos:format:video': ['video', 'video/colibri', 'video/hdmi', 'video/sdi'],
             'urn:x-nmos:format:audio': ['audio', 'audio/colibri', 'audio/hdmi', 'audio/sdi'],
-            'urn:x-nmos:format:data': ['data'],
+            // Matrox USB streams are data flows carrying the 'application/usb' media type
+            'urn:x-nmos:format:data': ['data', 'application/usb'],
+            'application/usb': ['urn:x-nmos:format:data', 'data'],
             
             // Matrox to standard NMOS and cross-format mappings
             'video': ['urn:x-nmos:format:video', 'video/colibri', 'video/hdmi', 'video/sdi'],

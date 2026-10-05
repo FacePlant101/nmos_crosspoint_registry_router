@@ -3,3 +3,61 @@
 
     
 }
+// ----- SDP viewer -----
+.sdp-flow-name {
+    font-weight: 500;
+    margin: 0.25rem 0 0.5rem;
+}
+
+.sdp-body {
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    white-space: pre;
+    // A manifest can be long and lines can be wide; scroll inside the modal
+    // rather than letting it push the dialog past the viewport.
+    max-height: 26rem;
+    overflow: auto;
+    padding: 0.5rem 0.75rem;
+    background-color: hsl(var(--b2));
+    border-radius: 0.25rem;
+}
+
+// ----- Duplicate multicast -----
+.mc-dup {
+    color: hsl(var(--er));
+    font-weight: 500;
+}
+
+.mc-dup-badge {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0 0.3rem;
+    border-radius: 0.25rem;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    background-color: hsl(var(--er) / 0.2);
+    color: hsl(var(--er));
+}
+
+// The Forget button sits next to the online/offline badge and only appears for
+// unavailable rows, so it must not push the badge around when it shows up.
+.forget-btn {
+    margin-left: 0.25rem;
+    vertical-align: middle;
+}
+
+// The audio monitor floats over the table rather than living in a row: it
+// outlives scrolling and filtering, and only one plays at a time.
+.audio-monitor-dock {
+    position: fixed;
+    right: 5rem;
+    bottom: 1rem;
+    z-index: 40;
+}
+
+.mc-flow-name {
+    font-weight: 500;
+    margin: 0.25rem 0 0.5rem;
+}

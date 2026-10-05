@@ -1,0 +1,45 @@
+# Reference NMOS test rig: a registry and a virtual node from the nmos-cpp
+# project, for exercising the crosspoint against a third-party implementation
+# rather than a hand-written stub.
+#
+#   docker compose -f test/nmos-rig/docker-compose.yml up -d
+#   # point server/config/settings.json at 127.0.0.1:8080, then start the server
+#   docker compose -f test/nmos-rig/docker-compose.yml down
+#
+# The image tag is PINNED on purpose. `latest` moved mid-development and the
+# node's sender transports changed with it (see README), which silently changes
+# what this rig covers. Bump the tag deliberately, and re-read the README's
+# transport table when you do.
+services:
+  nmos-registry:
+    image: rhastie/nmos-cpp:master-0fb6b51
+    container_name: nmos-registry
+    hostname: nmos-registry
+    # All registry APIs are collapsed onto 8080 by http_port in registry.json.
+    # The spare ports cover the node's manifest/connection APIs when it is
+    # reached from the host.
+    ports:
+      - "8080-8088:8080-8088"
+    volumes:
+      - ./registry.json:/home/registry.json
+    networks: [nmosrig]
+
+  nmos-virtnode:
+    image: rhastie/nmos-cpp:master-0fb6b51
+    container_name: nmos-virtnode
+    hostname: nmos-virtnode
+    environment:
+      - RUN_NODE=TRUE
+    volumes:
+      - ./node.json:/home/node.json
+    # The node advertises its own hrefs by container IP, so a crosspoint running
+    # on the host can read the registry but cannot always reach the node's IS-05
+    # API. Run the crosspoint in this network too when that matters.
+    ports:
+      - "3210-3220:3210-3220"
+    networks: [nmosrig]
+    depends_on: [nmos-registry]
+
+networks:
+  nmosrig:
+    name: nmosrig

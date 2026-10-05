@@ -106,15 +106,16 @@ class CrosspointUpdateThread{
             }
         }
 
-        if(this.settings.autoMulticast){
-            parentPort.postMessage(JSON.stringify({
-                log:{severity:"info", topic:"Multicast Config", text:"Starting automatic Multicast configuration.", raw:null}
-            }));
-            setInterval(()=>{
-                // Todo, when disabled, the service should run but not do any changes
-                this.updateMulticast();
-            },30000);
-        }
+        // NOTE the multicast allocator that used to run here on a 30 s timer is
+        // gone. Allocation is now owned by MulticastLeaseManager on the main
+        // thread, which keeps a persistent lease per sender, pairs the two
+        // 2022-7 legs on adjacent addresses and can be released from the UI.
+        //
+        // Running both would be actively harmful: two allocators drawing from
+        // the same ranges with separate state would hand out the same address
+        // and then fight over it, repointing senders on every sweep.
+        // updateMulticast() and its helpers are kept below for reference until
+        // the lease path has run in production for a while.
     }
 
 
@@ -1117,6 +1118,12 @@ class CrosspointUpdateThread{
                 let workingOnLeg = false;
 
                 activeData.transport_params.forEach((p, index)=>{
+                    // Non-RTP transports (Matrox USB) have no destination_ip. Without this guard
+                    // undefined is treated as a real address: 'undefined != ""' holds, so the first
+                    // such sender claims activeMulticast[undefined] and every later one is flagged a
+                    // duplicate and handed a bogus multicast address.
+                    if(typeof p.destination_ip != "string"){ return; }
+
                     multicast.push(p.destination_ip);
 
                     

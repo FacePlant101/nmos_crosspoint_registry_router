@@ -153,15 +153,38 @@ export class WebsocketSyncServer {
         }
     }
 
+    // Subscribers fired when a WS client disconnects. Used by modules that
+    // hold per-client resources (e.g. the audio monitor's RTC peer
+    // connections) so they can tear them down the moment the tab closes
+    // instead of waiting for a protocol-level timeout.
+    public onClientDisconnect: ((client: WebsocketClient) => void)[] = [];
+
     disconnectClient(client: WebsocketClient) {
         const index = this.clientList.indexOf(client);
         if (index > -1) {
             this.clientList.splice(index, 1);
         }
+        // Also drop the client from every sync channel — subscriptions used to
+        // outlive the socket, so each browser reload leaked one entry per
+        // channel that every future setState still serialised for.
+        for (const name of Object.keys(this.syncObjectList)) {
+            try { this.syncObjectList[name].unsubscribeAll(client); } catch (e) {}
+        }
+        for (const cb of this.onClientDisconnect) {
+            try { cb(client); } catch (e) {}
+        }
     }
 
     public addExpressMiddleware(path: string, middleware: any) {
         this.server.use(path, middleware);
+    }
+
+    // WS upgrade handlers per URL path, registered by modules that speak their
+    // own websocket protocol (e.g. the multicast ProbeGateway on /probe).
+    // These bypass the sync client handling entirely.
+    private upgradePathHandlers: { [path: string]: (request: any, socket: any, head: any) => void } = {};
+    public addUpgradePath(path: string, handler: (request: any, socket: any, head: any) => void) {
+        this.upgradePathHandlers[path] = handler;
     }
 
     public getExpressApp() {
@@ -232,6 +255,13 @@ export class WebsocketSyncServer {
         });
 
         ls.on("upgrade", (request, socket, head) => {
+            // Path-registered upgrade handlers speak their own protocol and
+            // must not be turned into sync clients.
+            try {
+                const p = ("" + (request.url || "")).split("?")[0];
+                const handler = this.upgradePathHandlers[p];
+                if (handler) { handler(request, socket, head); return; }
+            } catch (e) {}
             this.wss.handleUpgrade(request, socket, head, (socket) => {
                 this.wss.emit("connection", socket, request);
             });

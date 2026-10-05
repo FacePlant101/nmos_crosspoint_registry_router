@@ -7,12 +7,14 @@
        VideoCamera, Microphone, SpeakerWave, Tv,
        ArrowRightStartOnRectangle, ArrowLeftEndOnRectangle,
        CodeBracketSquare,
-       BarsArrowDown, BarsArrowUp, ArrowUturnLeft, CodeBracket
+       BarsArrowDown, BarsArrowUp, ArrowUturnLeft, CodeBracket,
+      DocumentText, ArrowTopRightOnSquare, Trash
      } from "svelte-hero-icons";
     import SetupFlow from "../lib/SetupFlow.svelte";
     import SetupDevice from "../lib/SetupDevice.svelte";
 
     import ScrollArea from "../lib/ScrollArea.svelte";
+    import AudioMonitorPlayer from "../lib/AudioMonitor/AudioMonitorPlayer.svelte";
     import { getSearchTokens, tokenSearch } from "../lib/functions";
     import OverlayMenuService from "../lib/OverlayMenu/OverlayMenuService";
 
@@ -91,6 +93,17 @@
             nmosState = obj;
             reRender();
       });
+      setupSync = ServerConnector.sync("setupConfig")
+      setupSync.subscribe((obj:any)=>{
+            audioMonitorEnabled = !!obj?.audioMonitor?.enabled;
+            multicastDhcpEnabled = !!obj?.autoMulticast?.enabled;
+            reRender();
+      });
+      leaseSync = ServerConnector.sync("multicastLeases")
+      leaseSync.subscribe((obj:any)=>{
+            leaseState = obj ?? { leases:{} };
+            reRender();
+      });
       try{
         let f = localStorage.getItem("nmos_details_filter");
         if(f){
@@ -109,6 +122,10 @@
           ServerConnector.unsync("crosspoint")
       syncNmos.unsubscribe();
           ServerConnector.unsync("nmos")
+      if(setupSync){ setupSync.unsubscribe(); }
+          ServerConnector.unsync("setupConfig")
+      if(leaseSync){ leaseSync.unsubscribe(); }
+          ServerConnector.unsync("multicastLeases")
     });
 
       function saveFilter(){
@@ -488,7 +505,187 @@
       }
 
 
-  </script>
+  
+  // ----- SDP viewer -----
+  // The raw manifest is fetched on demand via the senderSdp route rather than
+  // read out of the broadcast nmos channel, so opening one sender's SDP costs
+  // one request instead of every client carrying every manifest.
+  let sdpModal: any;
+  let sdpModalFlow: any = null;
+  let sdpModalText = "";
+  let sdpModalBusy = false;
+
+  async function openSdp(flow: any) {
+    sdpModalFlow = flow;
+    sdpModalText = "";
+    sdpModalBusy = true;
+    sdpModal.showModal();
+    try {
+      const res: any = await ServerConnector.get("senderSdp/" + flow.id);
+      sdpModalText = res?.data?.raw ?? "";
+    } catch (e: any) {
+      sdpModalText = "";
+      ServerConnector.addFeedback({ level: "error", message: "Could not load SDP: " + (e?.message ?? e) });
+    } finally {
+      sdpModalBusy = false;
+    }
+  }
+
+  async function copySdp() {
+    try {
+      await navigator.clipboard.writeText(sdpModalText);
+      ServerConnector.addFeedback({ level: "success", message: "SDP copied to the clipboard." });
+    } catch (e) {
+      ServerConnector.addFeedback({ level: "error", message: "The browser refused clipboard access." });
+    }
+  }
+
+  function downloadSdp() {
+    // Object URL rather than a data: URI so a large manifest is not capped by
+    // URL length limits.
+    const blob = new Blob([sdpModalText], { type: "application/sdp" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (sdpModalFlow?.alias || "sender").replace(/[^A-Za-z0-9._-]/g, "_") + ".sdp";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // ----- Duplicate multicast detection -----
+  // The server computes clashes from the IS-05 ACTIVE transport params (what
+  // devices are really transmitting on), keyed by address. Two senders on one
+  // group address is otherwise invisible until a receiver shows the wrong
+  // picture, so the offending leg is flagged right where its address is shown.
+  function dupSenders(address: string, selfFlowId: string): string[] {
+    try {
+      const claimers: string[] = nmosState.multicastConflicts?.[address] ?? [];
+      if (claimers.length < 2) return [];
+      const selfNmosId = selfFlowId.startsWith("nmos_") ? selfFlowId.substring(5) : selfFlowId;
+      // Name the OTHER senders — the operator already knows which row they are on.
+      return claimers.filter((id) => id !== selfNmosId);
+    } catch (e) { return []; }
+  }
+
+  function dupLabel(ids: string[]): string {
+    const names = ids.map((id) => {
+      try { return nmosState.senders?.[id]?.label || id.substring(0, 8); } catch (e) { return id.substring(0, 8); }
+    });
+    return "Also used by: " + names.join(", ");
+  }
+
+  // ----- Forget offline devices and flows -----
+  // The server already supports a "delete" crosspoint change, which drops the
+  // shadow entry and its aliases. It was never reachable from the UI, so an
+  // offline device stayed in the matrix forever. Only offered while something
+  // is unavailable — forgetting a live device would just be re-discovered.
+  let forgetModal: any;
+  let forgetTarget: any = null;      // { kind, devId, flowId, label }
+
+  function askForget(kind: "device" | "flow", devId: string, flowId: string, label: string) {
+    forgetTarget = { kind, devId, flowId, label };
+    forgetModal.showModal();
+  }
+
+  async function confirmForget() {
+    if (!forgetTarget) return;
+    const t = forgetTarget;
+    try {
+      await ServerConnector.post("crosspoint", {
+        action: "delete",
+        devId: t.devId,
+        // "" means the whole device; the worker branches on it.
+        flowId: t.kind === "device" ? "" : t.flowId,
+      });
+      ServerConnector.addFeedback({ level: "success", message: "Forgot " + t.label + "." });
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not forget " + t.label + ": " + (e?.message ?? e) });
+    } finally {
+      forgetTarget = null;
+    }
+  }
+
+  // ----- Audio monitor -----
+  // A headphone button next to each audio sender. The server joins the
+  // multicast (directly, or through a connected probe), transcodes to Opus and
+  // streams it over WebRTC. Only offered when the feature is enabled in Setup
+  // and the sender actually has a manifest to decode.
+  let audioMonitorEnabled = false;
+  let multicastDhcpEnabled = false;
+  let setupSync: Subject<any>;
+  let monitorSenderId = "";
+  let monitorSdp = "";
+
+  function canMonitor(flow: any): boolean {
+    return audioMonitorEnabled && flow.type === "audio" && flow.available && flow.manifestOk;
+  }
+
+  async function startMonitor(flow: any) {
+    // The player wants the SDP for channel-pair detection; the server uses its
+    // own cached copy for the actual join, so this is display-only.
+    try {
+      const res: any = await ServerConnector.get("senderSdp/" + flow.id);
+      monitorSdp = res?.data?.raw ?? "";
+      monitorSenderId = flow.id;
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not start the monitor: " + (e?.message ?? e) });
+    }
+  }
+
+  function stopMonitor() {
+    monitorSenderId = "";
+    monitorSdp = "";
+  }
+
+  // ----- Multicast lease overrides -----
+  // The lease inventory tells us the reserved address per leg, so the editor
+  // can show what "clear" will fall back to instead of leaving the operator
+  // guessing what an empty field means.
+  let leaseState: any = { leases: {} };
+  let leaseSync: Subject<any>;
+  let mcModal: any;
+  let mcFlow: any = null;
+  let mcLegs: Array<{ index: number, value: string, reserved: string }> = [];
+
+  function leaseFor(flowId: string): any {
+    const id = flowId.startsWith("nmos_") ? flowId.substring(5) : flowId;
+    return leaseState.leases?.[id] ?? null;
+  }
+
+  function openMulticastEditor(flow: any) {
+    mcFlow = flow;
+    const lease = leaseFor(flow.id);
+    const legs = getSenderSettings(flow);
+    mcLegs = legs.map((leg: any, index: number) => ({
+      index,
+      // Show the override if there is one, otherwise blank so the placeholder
+      // can advertise the reserved address.
+      value: lease?.overrideIp?.["" + index] ?? "",
+      reserved: index === 0 ? (lease?.primaryIp ?? "") : (lease?.secondaryIp ?? ""),
+    }));
+    if (mcLegs.length === 0) {
+      mcLegs = [{ index: 0, value: "", reserved: lease?.primaryIp ?? "" }];
+    }
+    mcModal.showModal();
+  }
+
+  async function saveMulticast() {
+    if (!mcFlow) return;
+    try {
+      // An empty string is an explicit clear: the server drops the override and
+      // returns the leg to its reserved address.
+      await ServerConnector.post("setMulticast", {
+        id: mcFlow.id,
+        data: { legs: mcLegs.map((l) => ({ index: l.index, multicast: l.value.trim() })) },
+      });
+      ServerConnector.addFeedback({ level: "success", message: "Multicast addresses updated." });
+    } catch (e: any) {
+      ServerConnector.addFeedback({ level: "error", message: "Could not set multicast: " + (e?.message ?? e) });
+    }
+  }
+</script>
   
 
   <div class="content-container">
@@ -593,7 +790,16 @@
                             {/if}
 
                             {#if col.id == "available"}
-                            <div class="badge badge-{ dev.available ? "success" : "error"} badge-sm"></div>
+                            <div class="badge badge-{ dev.available ? "success" : "error"} badge-sm"
+                              use:OverlayMenuService.tooltip
+                              data-tooltip={dev.available ? "online" : "offline"}></div>
+                            {#if !dev.available}
+                              <button class="btn btn-round btn-hover forget-btn"
+                                on:click={(e)=>{e.stopPropagation(); askForget("device", dev.id, "", dev.alias || dev.name || dev.id);}}
+                                use:OverlayMenuService.tooltip data-tooltip="forget this offline device">
+                                <Icon src={Trash}></Icon>
+                              </button>
+                            {/if}
                             {/if}
 
                             {#if col.id == "name"}
@@ -609,6 +815,14 @@
 
                             {#if col.id == "info"}
                             {renderId(dev.id)}
+                            {#if dev.deviceUrl}
+                              <a href={dev.deviceUrl} target="_blank" rel="noopener noreferrer"
+                                 class="btn btn-round btn-hover" on:click={(e)=>e.stopPropagation()}
+                                 use:OverlayMenuService.tooltip
+                                 data-tooltip="Open device web UI: {dev.deviceUrl}">
+                                <Icon src={ArrowTopRightOnSquare}></Icon>
+                              </a>
+                            {/if}
                             {/if}
 
                         </td>
@@ -634,7 +848,16 @@
                                     {/if}
 
                                     {#if col.id == "available"}
-                                    <div class="badge badge-{ flow.available ? (flow.manifestOk ? "success" : "warning") : "error"} badge-sm"></div>
+                                    <div class="badge badge-{ flow.available ? (flow.manifestOk ? "success" : "warning") : "error"} badge-sm"
+                                      use:OverlayMenuService.tooltip
+                                      data-tooltip={flow.available ? (flow.manifestOk ? "online" : "online, no manifest") : "offline"}></div>
+                                    {#if !flow.available}
+                                      <button class="btn btn-round btn-hover forget-btn"
+                                        on:click={(e)=>{e.stopPropagation(); askForget("flow", dev.id, flow.id, flow.alias || flow.name || flow.id);}}
+                                        use:OverlayMenuService.tooltip data-tooltip="forget this offline flow">
+                                        <Icon src={Trash}></Icon>
+                                      </button>
+                                    {/if}
                                     {/if}
 
                                     {#if col.id == "name"}
@@ -680,6 +903,17 @@
                                       </span>
                                       {#if !flow.manifestOk}
                                         <span class="text-error">No Manifest Loaded</span>
+                                      {:else}
+                                        <button on:click={()=>openSdp(flow)} class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="view SDP">
+                                          <Icon src={DocumentText}></Icon>
+                                        </button>
+                                      {/if}
+                                      {#if canMonitor(flow)}
+                                        <button on:click={()=>startMonitor(flow)} class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="listen to this sender">
+                                          <Icon src={SpeakerWave}></Icon>
+                                        </button>
                                       {/if}
                                     {/if}
 
@@ -694,11 +928,26 @@
 
 
                                     {#if col.id == "flow"}
+                                      {#if multicastDhcpEnabled && getSenderSettings(flow).length > 0}
+                                        <button on:click={()=>openMulticastEditor(flow)}
+                                          class="btn btn-round btn-hover"
+                                          use:OverlayMenuService.tooltip data-tooltip="edit multicast addresses">
+                                          <Icon src={Pencil}></Icon>
+                                        </button>
+                                      {/if}
                                       {#each getSenderSettings(flow) as settings}
-                                        <div>
-                                          <!--<span>{settings.name} : </span>-->
-                                          <span>Dst: {settings.dstIp} Src: {settings.srcIp}</span>
-                                        </div>
+                                        {#each [dupSenders(settings.dstIp, flow.id)] as dups}
+                                          <div>
+                                            <!--<span>{settings.name} : </span>-->
+                                            <span class={dups.length > 0 ? "mc-dup" : ""}
+                                              use:OverlayMenuService.tooltip
+                                              data-tooltip={dups.length > 0 ? dupLabel(dups) : ""}
+                                              >Dst: {settings.dstIp} Src: {settings.srcIp}</span>
+                                            {#if dups.length > 0}
+                                              <span class="mc-dup-badge">duplicate</span>
+                                            {/if}
+                                          </div>
+                                        {/each}
                                       {/each}
                                     {/if}
 
@@ -797,6 +1046,87 @@
     </div>
   </dialog>
 
+
+  {#if monitorSenderId}
+    <div class="audio-monitor-dock">
+      <AudioMonitorPlayer senderId={monitorSenderId} sdp={monitorSdp} onClose={stopMonitor} />
+    </div>
+  {/if}
+
+  <dialog bind:this={mcModal} class="modal">
+    <div class="modal-box">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">Multicast addresses</h3>
+      {#if mcFlow}
+        <p class="mc-flow-name">{mcFlow.alias}</p>
+      {/if}
+      {#each mcLegs as leg}
+        <div class="setup-row">
+          <label class="label" for={"mcleg"+leg.index}>Leg {leg.index + 1}</label>
+          <input id={"mcleg"+leg.index} class="input input-bordered input-sm" type="text"
+            placeholder={leg.reserved ? "reserved: " + leg.reserved : "auto"}
+            bind:value={leg.value} />
+        </div>
+      {/each}
+      <p class="setup-hint">
+        Leave a field empty to use the address reserved by Multicast DHCP. A value
+        here overrides the reservation, which stays held for this sender so
+        clearing the field always returns to it.
+      </p>
+      <div class="modal-action">
+        <form method="dialog">
+          <button class="btn btn-sm btn-primary" on:click={saveMulticast}>Save</button>
+          <button class="btn btn-sm">Cancel</button>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog bind:this={forgetModal} class="modal">
+    <div class="modal-box">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">Forget {forgetTarget?.kind ?? ""}</h3>
+      <p>
+        Remove <strong>{forgetTarget?.label ?? ""}</strong> and its aliases from the
+        crosspoint. If the {forgetTarget?.kind ?? "item"} comes back online it will be
+        rediscovered as new, without its number or alias.
+      </p>
+      <div class="modal-action">
+        <form method="dialog">
+          <button class="btn btn-sm btn-error" on:click={confirmForget}>Forget</button>
+          <button class="btn btn-sm">Cancel</button>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog bind:this={sdpModal} class="modal">
+    <div class="modal-box" style="max-width:52rem;">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+      </form>
+      <h3 class="font-bold text-lg">SDP manifest</h3>
+      {#if sdpModalFlow}
+        <p class="sdp-flow-name">{sdpModalFlow.alias}</p>
+      {/if}
+      {#if sdpModalBusy}
+        <p>Loading…</p>
+      {:else if sdpModalText == ""}
+        <p class="text-error">No SDP available for this sender.</p>
+      {:else}
+        <pre class="sdp-body">{sdpModalText}</pre>
+      {/if}
+      <div class="modal-action">
+        <button class="btn btn-sm" disabled={sdpModalText == ""} on:click={copySdp}>Copy</button>
+        <button class="btn btn-sm" disabled={sdpModalText == ""} on:click={downloadSdp}>Download</button>
+        <form method="dialog"><button class="btn btn-sm">Close</button></form>
+      </div>
+    </div>
+  </dialog>
 
   <dialog bind:this={labelModal} class="modal">
     <div class="modal-box">

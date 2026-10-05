@@ -1,5 +1,204 @@
+.setup-page {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.setup-header {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid hsl(var(--b3));
+
+    h2 {
+        font-size: 1.25rem;
+        font-weight: 500;
+        line-height: 1.2;
+    }
+}
+
+.setup-version {
+    font-family: monospace;
+    font-size: 0.75rem;
+    opacity: 0.6;
+}
+
+.setup-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
 .setup-container {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 1rem;
+    // Two columns where there is room; the sections are short and unrelated,
+    // so a single long scroll wastes the width.
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
+    gap: 1rem;
+    align-content: start;
+
     .label {
         display: inline;
     }
+}
+
+.setup-section {
+    background-color: hsl(var(--b2));
+    border-radius: var(--rounded-box, 0.5rem);
+    padding: 0.75rem 1rem 1rem;
+
+    h3 {
+        font-size: 1rem;
+        font-weight: 500;
+        margin-bottom: 0.5rem;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid hsl(var(--b3));
+    }
+}
+
+.setup-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.25rem 0;
+
+    input[type="text"],
+    input[type="number"],
+    input[type="password"] {
+        width: 14rem;
+        max-width: 55%;
+    }
+}
+
+.setup-hint {
+    font-size: 0.8rem;
+    opacity: 0.65;
+    margin: 0.25rem 0 0.5rem;
+
+    code {
+        font-family: monospace;
+        font-size: 0.75rem;
+        background-color: hsl(var(--b3));
+        border-radius: 0.25rem;
+        padding: 0 0.25rem;
+    }
+}
+
+// A section that needs the full grid width rather than one column — the vendor
+// profile table has six columns and is unreadable squeezed into a third.
+.setup-section-wide {
+    grid-column: 1 / -1;
+}
+
+.vp-table {
+    width: 100%;
+    font-size: 0.85rem;
+    border-collapse: collapse;
+
+    th, td {
+        text-align: left;
+        padding: 0.15rem 0.35rem;
+        border-bottom: 1px solid hsl(var(--b3));
+        vertical-align: middle;
+    }
+
+    th { font-weight: 500; opacity: 0.7; }
+
+    input, select { width: 100%; }
+    .vp-port { width: 5.5rem; }
+    .vp-path { width: 8rem; }
+    .vp-labels { min-width: 12rem; }
+
+    .vp-actions {
+        white-space: nowrap;
+        width: 1%;
+
+        .btn { margin-left: 0.15rem; }
+    }
+}
+
+.setup-subhead {
+    font-weight: 500;
+    margin: 0.75rem 0 0.25rem;
+}
+
+.probe-cmd {
+    font-family: monospace;
+    font-size: 0.7rem;
+    line-height: 1.45;
+    // The command is long and must not wrap mid-flag, so let it scroll.
+    white-space: pre;
+    overflow-x: auto;
+    padding: 0.5rem;
+    background-color: hsl(var(--b3));
+    border-radius: 0.25rem;
+    margin: 0.25rem 0;
+}
+
+// ----- Multicast lease inventory -----
+.lease-ip {
+    font-family: monospace;
+    white-space: nowrap;
+}
+
+.lease-count {
+    font-size: 0.8rem;
+    opacity: 0.6;
+    white-space: nowrap;
+}
+
+.lease-override {
+    display: inline-block;
+    margin-left: 0.3rem;
+    padding: 0 0.25rem;
+    border-radius: 0.2rem;
+    font-family: inherit;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    background-color: hsl(var(--in) / 0.2);
+    color: hsl(var(--in));
+}
+
+// Live status of a lease against the wire.
+.lease-dot {
+    display: inline-block;
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    background-color: hsl(var(--bc) / 0.3);
+
+    &.lease-active   { background-color: hsl(var(--su)); }
+    &.lease-inactive { background-color: hsl(var(--wa)); }
+    // Held for a sender the registry no longer knows.
+    &.lease-missing  { background-color: hsl(var(--er)); }
+}
+
+.lease-table {
+    // The inventory can be long; keep the section from growing without bound.
+    display: block;
+    max-height: 22rem;
+    overflow-y: auto;
+}
+
+.lease-actions {
+    justify-content: flex-start;
+    gap: 0.5rem;
+}
+
+.adopt-list {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    font-size: 0.85rem;
+    list-style: disc;
+
+    li { margin-bottom: 0.5rem; }
 }
