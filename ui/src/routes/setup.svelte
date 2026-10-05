@@ -37,8 +37,11 @@
 
     // Multicast probe status, so the operator can see whether a probe is
     // actually attached before wondering why the monitor is silent.
-    let probeState: any = { token: "", probes: [] };
+    let probeState: any = { probes: [] };
     let probeSync: Subject<any>;
+    // Fetched separately: the probeState channel is readable by every user,
+    // the token only by users allowed to change setup.
+    let probeToken = "";
 
     // Multicast lease inventory.
     let leaseState: any = { leases: {}, stats: {} };
@@ -110,8 +113,11 @@
         });
         probeSync = ServerConnector.sync("probeState");
         probeSync.subscribe((obj: any) => {
-            probeState = obj ?? { token: "", probes: [] };
+            probeState = obj ?? { probes: [] };
         });
+        ServerConnector.post("probeToken", {})
+            .then((r: any) => { probeToken = r?.data?.token || ""; })
+            .catch(() => {});
         leaseSync = ServerConnector.sync("multicastLeases");
         leaseSync.subscribe((obj: any) => {
             leaseState = obj ?? { leases: {}, stats: {} };
@@ -272,7 +278,7 @@
     }
 
     async function copyProbeCommand() {
-        const cmd = probeRunCommand();
+        const cmd = probeRunCommand(probeToken);
         try {
             await navigator.clipboard.writeText(cmd);
             ServerConnector.addFeedback({ level: "success", message: "Probe command copied." });
@@ -283,12 +289,12 @@
 
     // Ready-to-paste command for the probe sidecar. Host networking is required
     // so it can actually join the media network's multicast groups.
-    function probeRunCommand(): string {
+    function probeRunCommand(token: string): string {
         const origin = window.location.host || "crosspoint";
         return "docker run -d --restart unless-stopped --network host \\\n" +
             "  -e MODE=probe \\\n" +
             "  -e CROSSPOINT_URL=ws://" + origin + " \\\n" +
-            "  -e PROBE_TOKEN=" + (probeState.token || "<token>") + " \\\n" +
+            "  -e PROBE_TOKEN=" + (token || "<token>") + " \\\n" +
             '  -e PROBE_NAME="Studio A" \\\n' +
             "  ghcr.io/avassdal/nmos_crosspoint_registry_router:latest";
     }
@@ -479,7 +485,7 @@
                     forwards multicast to the crosspoint as unicast over an authenticated
                     websocket, so the crosspoint container needs no multicast access at all.
                 </p>
-                <pre class="probe-cmd">{probeRunCommand()}</pre>
+                <pre class="probe-cmd">{probeRunCommand(probeToken)}</pre>
                 <div class="setup-row">
                     <button class="btn btn-sm" on:click={copyProbeCommand}>Copy command</button>
                 </div>

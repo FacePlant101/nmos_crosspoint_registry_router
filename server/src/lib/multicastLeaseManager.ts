@@ -462,7 +462,8 @@ export class MulticastLeaseManager {
         for (const id in data.leases) {
             const raw = data.leases[id];
             if (!raw || !MULTICAST_CATEGORIES.includes(raw.category)) { dropped++; continue; }
-            if (typeof raw.primaryIp !== "string" || typeof raw.secondaryIp !== "string") { dropped++; continue; }
+            // Same check as load(): an invalid IP drives the reconcile loop forever.
+            if (!this.ipIsValid(raw.primaryIp) || !this.ipIsValid(raw.secondaryIp)) { dropped++; continue; }
             if (newIndex.has(raw.primaryIp) || newIndex.has(raw.secondaryIp)) {
                 SyncLog.log("warn", "Multicast Lease", "Import dropping duplicate lease for " + id + " — IP already claimed.");
                 dropped++;
@@ -534,6 +535,11 @@ export class MulticastLeaseManager {
         if (l) {
             this.releaseIp(l.primaryIp,   owner);
             this.releaseIp(l.secondaryIp, owner);
+            if (l.overrideIp){
+                for (const k of Object.keys(l.overrideIp)){
+                    this.releaseIp(l.overrideIp[k], owner);
+                }
+            }
             delete this.leases[owner];
         }else{
             this.ipToSender.delete(ip);

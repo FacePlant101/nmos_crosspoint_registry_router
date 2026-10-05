@@ -15,7 +15,6 @@ export default class PredictiveStager {
   // History: receiverFlowId -> (senderFlowId -> count)
   private history: Map<string, Map<string, number>> = new Map();
   private lastStageAt: Map<string, number> = new Map();
-  private lastStagedSender: Map<string, { senderId: string; at: number }> = new Map();
   private lastMultiviewerState: Map<string, boolean> = new Map();
 
   constructor(crosspoint: CrosspointAbstraction, options: PredictiveStagerOptions){
@@ -83,7 +82,6 @@ export default class PredictiveStager {
     const multiviewerStatus = this.getMultiviewerStatus(receiverId);
     if (multiviewerStatus.changed) {
       this.lastStageAt.delete(receiverId);
-      this.lastStagedSender.delete(receiverId);
     }
     if (multiviewerStatus.skip) {
       return;
@@ -91,12 +89,6 @@ export default class PredictiveStager {
 
     const last = this.lastStageAt.get(receiverId) ?? 0;
     const now = Date.now();
-
-    // The staged connection was taken up by this switch, so it is no longer pending.
-    const lastStaged = this.lastStagedSender.get(receiverId);
-    if (lastStaged && lastStaged.senderId === currentSenderId) {
-      this.lastStagedSender.delete(receiverId);
-    }
 
     // Hard rate limit. This must not depend on which sender is predicted: predict() excludes the
     // current sender, so on A->B->A switching the prediction flips every time and any
@@ -106,18 +98,14 @@ export default class PredictiveStager {
     const predicted = this.predict(receiverId, currentSenderId);
     if(!predicted || predicted === currentSenderId){ return; }
 
-    // Already staged and still pending - re-issuing the same prepare would be a no-op.
-    const staged = this.lastStagedSender.get(receiverId);
-    if (staged && staged.senderId === predicted) {
-      return;
-    }
+    // No "already staged" shortcut: this only runs after a switch, and activating any sender
+    // replaces the receiver's staged parameters, so an earlier staging is never still pending.
 
     const dst = this.findFlowById(state, receiverId, false);
     const src = this.findFlowById(state, predicted, true);
     if(!dst || !src){ return; }
 
     this.lastStageAt.set(receiverId, now);
-    this.lastStagedSender.set(receiverId, { senderId: predicted, at: now });
     SyncLog.log("info", "predictive", `Staging prediction for ${receiverId}: ${predicted}`);
     this.crosspoint.executeConnectionPrepare(src, dst)
       .then(()=>{ SyncLog.log("success", "predictive", `Staged ${predicted} -> ${receiverId}`); })

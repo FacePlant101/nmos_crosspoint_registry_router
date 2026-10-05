@@ -201,9 +201,11 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
         }
     }
 
-    public async migrateExistingAliasesToNmos(): Promise<void> {
+    /** Resolves true once the migration ran, false when it was skipped (state not ready, or
+     *  the worker did not answer) so the caller does not record it as done. */
+    public async migrateExistingAliasesToNmos(): Promise<boolean> {
         if (!this.crosspointState || !this.nmosState) {
-            return;
+            return false;
         }
 
         // Request current alias state from worker thread
@@ -224,7 +226,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
                     if (data.aliasStateResponse && data.requestId === requestId) {
                         this.worker.off('message', messageHandler);
                         if (timeout) { clearTimeout(timeout); timeout = null; }
-                        this.processAliasMigration(data.aliasState).then(resolve);
+                        this.processAliasMigration(data.aliasState).then(() => resolve(true));
                     }
                 } catch (e) {
                     // Every worker message passes through here, so anything
@@ -244,7 +246,7 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             timeout = setTimeout(() => {
                 this.worker.off('message', messageHandler);
                 SyncLog.log("warning", "alias", "Timed out waiting for the worker's alias state; migration skipped this run.");
-                resolve();
+                resolve(false);
             }, 5000);
         });
     }
@@ -260,8 +262,10 @@ const md5 = data => crypto.createHash('md5').update(data).digest("hex")
             return;
         }
 
-        // Run the migration
-        await this.migrateExistingAliasesToNmos();
+        // Run the migration; a skipped run is retried on the next start
+        if (!(await this.migrateExistingAliasesToNmos())) {
+            return;
+        }
 
         // Create flag file to prevent future migrations
         try {
