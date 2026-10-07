@@ -61,6 +61,48 @@ const ANC   = ["m=video 5008 RTP/AVP 100", "c=IN IP4 239.1.1.3/64", "a=rtpmap:10
         p.format === "urn:x-nmos:format:audio" && p.transportParams.length === 1 && p.droppedMedia.length === 0);
 }
 
+// ---- media_type must match what the device itself publishes ----
+{
+    // Modelled on a real Matrox ConvertIP sender (addresses changed). Those
+    // devices publish media_type "video/colibri"; upper-casing the subtype
+    // produced "video/COLIBRI", which no receiver's caps match by string, so
+    // the virtual sender was unroutable by the controllers it exists to serve.
+    const colibri = sdp(
+        "m=video 5004 RTP/AVP 112", "c=IN IP4 239.0.0.1/128", "b=AS:220045",
+        "a=rtpmap:112 colibri/90000",
+        "a=fmtp:112 sampling=RGB; width=1920; height=1080; exactframerate=60; depth=8; " +
+        "PM=2110GPM; IPMX; colorimetry=BT709; TCS=SDR; RANGE=FULL; SSN=ST2110-22:2019");
+    check("a vendor codec keeps the spelling the SDP used",
+        parseVirtualSdp(colibri).mediaType === "video/colibri", parseVirtualSdp(colibri).mediaType);
+    check("...and is still a video flow",
+        parseVirtualSdp(colibri).format === "urn:x-nmos:format:video");
+
+    const upper = colibri.replace("colibri/90000", "COLIBRI/90000");
+    check("an upper-case vendor codec is also left alone",
+        parseVirtualSdp(upper).mediaType === "video/COLIBRI", parseVirtualSdp(upper).mediaType);
+
+    // The known subtypes have canonical case of their own, in both directions.
+    const withCodec = (c, type) => sdp(`m=${type} 5004 RTP/AVP 96`, "c=IN IP4 239.0.0.1/64",
+        `a=rtpmap:96 ${c}/90000`);
+    const cases = [
+        ["raw",      "video", "video/raw"],
+        ["RAW",      "video", "video/raw"],
+        ["jxsv",     "video", "video/jxsv"],
+        ["smpte291", "video", "video/smpte291"],
+    ];
+    for (const [c, type, want] of cases) {
+        check(`"${c}" maps to ${want}`, parseVirtualSdp(withCodec(c, type)).mediaType === want,
+            parseVirtualSdp(withCodec(c, type)).mediaType);
+    }
+    // Audio needs the channel count on the rtpmap line, so build those by hand.
+    const audio = (c) => sdp(`m=audio 5006 RTP/AVP 97`, "c=IN IP4 239.0.0.2/64", `a=rtpmap:97 ${c}/48000/8`);
+    for (const [c, want] of [["L24", "audio/L24"], ["L16", "audio/L16"], ["L32", "audio/L24"],
+                             ["l24", "audio/L24"]]) {
+        check(`audio "${c}" maps to ${want}`, parseVirtualSdp(audio(c)).mediaType === want,
+            parseVirtualSdp(audio(c)).mediaType);
+    }
+}
+
 // ---- the Device must not reference senders that do not exist ----
 {
     const st = parseSettings({ virtualNode: { enabled: true }, virtualSenders: [

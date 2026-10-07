@@ -131,7 +131,11 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
     // Codec / format come from the first media block's rtp[0] entry.
     let firstMedia = sdp.media[0];
     let mediaTypeRaw = ("" + (firstMedia.type || "")).toLowerCase();      // "audio" | "video"
-    let codec        = ("" + (firstMedia.rtp?.[0]?.codec || "")).toUpperCase();
+    // The codec as the SDP spells it, and an upper-cased copy for comparison.
+    // Only the comparisons are case-folded: the published media_type must keep
+    // the device's own spelling (see below).
+    let codecRaw     = ("" + (firstMedia.rtp?.[0]?.codec || "")).trim();
+    let codec        = codecRaw.toUpperCase();
     let rate         = Number(firstMedia.rtp?.[0]?.rate || 0);
     let encoding     = ("" + (firstMedia.rtp?.[0]?.encoding || "")).trim(); // for audio: channel count
 
@@ -139,11 +143,23 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
     // SDP "raw" → "video/raw", "jxsv" → "video/jxsv", "smpte291" → "video/smpte291".
     // L32 in SDP carries 24-bit LPCM samples padded into a 32-bit container;
     // NMOS' canonical form is audio/L24, so normalise.
-    let mediaType = mediaTypeRaw + "/" + codec;
+    //
+    // Anything without an explicit mapping keeps the spelling the SDP used.
+    // Case-folding the subtype here is not harmless: a vendor codec comes
+    // straight through, and upper-casing it published "video/COLIBRI" where
+    // Matrox ConvertIP devices publish "video/colibri". A receiver whose caps
+    // list the lower-case form does not match the upper-case one by string
+    // comparison, so the virtual sender became unroutable by exactly the
+    // controllers it exists to serve. The known subtypes below are spelled out
+    // rather than derived, because their canonical case differs: "raw" and
+    // "jxsv" are lower, "L16" and "L24" are upper.
+    let mediaType = mediaTypeRaw + "/" + codecRaw;
     if(codec === "RAW")           mediaType = "video/raw";
     else if(codec === "JXSV")     mediaType = "video/jxsv";
     else if(codec === "SMPTE291") mediaType = "video/smpte291";
     else if(codec === "L32")      mediaType = "audio/L24";
+    else if(codec === "L24")      mediaType = "audio/L24";
+    else if(codec === "L16")      mediaType = "audio/L16";
 
     // ----- Audio -----
     if(mediaTypeRaw === "audio"){
