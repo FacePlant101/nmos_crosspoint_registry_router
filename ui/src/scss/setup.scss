@@ -222,3 +222,20 @@
     white-space: pre;
     overflow-x: auto;
 }
+
+// What became of this SDP when it was last published. The warning case is the
+// common one — a multi-essence SDP publishes its first essence only — and the
+// operator has no other way to find out short of reading the log.
+.vs-note {
+    margin: 0.25rem 0 0.1rem;
+    font-size: 0.8rem;
+    line-height: 1.35;
+    padding-left: 0.5rem;
+    border-left: 3px solid transparent;
+}
+// daisyUI 4 stores these as oklch components, so they must be read with
+// oklch(). hsl(var(--wa)) parses as an invalid colour and is dropped silently,
+// leaving the note in the ordinary text colour — legible, but with the warning
+// and error cases indistinguishable, which is the whole point of them.
+.vs-note-warn  { color: oklch(var(--wa)); border-left-color: oklch(var(--wa)); }
+.vs-note-error { color: oklch(var(--er)); border-left-color: oklch(var(--er)); }

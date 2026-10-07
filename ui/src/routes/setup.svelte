@@ -763,6 +763,19 @@
                             <textarea class="textarea textarea-bordered vs-sdp" rows="6"
                                 placeholder="paste the sender's SDP here"
                                 bind:value={vs.sdp} on:input={touch}></textarea>
+                            <!-- What the server made of this SDP when it last
+                                 published it. Hidden once the form is dirty,
+                                 because it describes the saved SDP, not the
+                                 one being typed. -->
+                            {#if !dirty && vs.publishError}
+                                <p class="vs-note vs-note-error">
+                                    Not published: {vs.publishError}
+                                </p>
+                            {:else if !dirty && vs.publishWarning}
+                                <p class="vs-note vs-note-warn">
+                                    {vs.publishWarning}
+                                </p>
+                            {/if}
                         </div>
                     {/each}
                 {/if}

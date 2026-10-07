@@ -109,7 +109,7 @@ a=mid:VID
 
     // Enable it with one sender.
     const ws = new WebSocket(`ws://127.0.0.1:${SRV_PORT}/`);
-    let id = 1; const pend = {}; let started = false;
+    let id = 1; const pend = {}; let started = false; let setupState = null;
     const req = (route, data) => new Promise((res, rej) => {
         const i = id++; pend[i] = { res, rej };
         ws.send(JSON.stringify({ type: "request", method: "POST", route, id: i, data }));
@@ -124,6 +124,10 @@ a=mid:VID
                 const p = pend[m.id];
                 if (p) { delete pend[m.id]; (m.status === 200 || m.message === 200) ? p.res(m) : p.rej(m); }
             }
+            // The setupConfig channel republishes after every successful save;
+            // keep the latest full state so the Setup page's view can be
+            // asserted on.
+            if (m.type === "sync" && m.channel === "setupConfig" && m.action === "init") setupState = m.data;
         });
     });
 
@@ -181,6 +185,66 @@ a=mid:VID
             b.transport_params[0].destination_ip === "239.200.0.11",
             JSON.stringify(b.transport_params));
     }
+
+    // What the Setup page is told about each SDP it holds. An SDP that cannot
+    // be published at all, and one that can only be published in part, both
+    // used to look completely healthy there.
+    // The channel sends a full state on subscribe and JSON-Patch frames after
+    // that, so each read re-subscribes rather than tracking patches.
+    const readSetupState = async () => {
+        setupState = null;
+        ws.send(JSON.stringify({ type: "unsync", channel: "setupConfig", objectId: 0 }));
+        await new Promise((r) => setTimeout(r, 150));
+        ws.send(JSON.stringify({ type: "sync", channel: "setupConfig", objectId: 0 }));
+        for (let i = 0; i < 40 && setupState === null; i++) await new Promise((r) => setTimeout(r, 100));
+        return setupState;
+    };
+    check("the setup state is readable", (await readSetupState()) !== null);
+    const MULTI = `v=0
+o=- 1 1 IN IP4 10.20.0.60
+s=Multi Essence
+t=0 0
+m=video 5004 RTP/AVP 96
+c=IN IP4 239.200.0.21/64
+a=rtpmap:96 raw/90000
+m=audio 5006 RTP/AVP 97
+c=IN IP4 239.200.0.22/64
+a=rtpmap:97 L24/48000/8
+`;
+    const BROKEN = `v=0
+o=- 1 1 IN IP4 10.20.0.61
+s=No Destination
+t=0 0
+m=video 5004 RTP/AVP 96
+a=rtpmap:96 raw/90000
+`;
+    const keep = (setupState.virtualSenders || []).map((v) => ({
+        id: v.id, name: v.name, sdp: v.sdp,
+        senderId: v.senderId, sourceId: v.sourceId, flowId: v.flowId,
+    }));
+    await req("setupConfig", { virtualSenders: [
+        ...keep,
+        { id: "multi",  name: "Multi Essence",  sdp: MULTI },
+        { id: "broken", name: "No Destination", sdp: BROKEN },
+    ]});
+    await new Promise((r) => setTimeout(r, 1500));
+    await readSetupState();
+
+    const byId = {};
+    for (const v of (setupState.virtualSenders || [])) byId[v.id] = v;
+    check("a multi-essence SDP is reported as partly published",
+        !!byId.multi && /not published/i.test(byId.multi.publishWarning || "") &&
+        /audio/.test(byId.multi.publishWarning || ""), (byId.multi || {}).publishWarning);
+    check("...and it is not reported as an error, because it did publish",
+        !!byId.multi && !byId.multi.publishError);
+    check("an SDP that cannot be published at all is reported as an error",
+        !!byId.broken && /destination/i.test(byId.broken.publishError || ""), (byId.broken || {}).publishError);
+    check("a good SDP carries no notice at all",
+        keep.length > 0 && !!byId[keep[0].id] &&
+        !byId[keep[0].id].publishError && !byId[keep[0].id].publishWarning);
+    check("the broken sender is not advertised by the Device",
+        !(JSON.parse((await get(`http://127.0.0.1:${SRV_PORT}/x-nmos/node/v1.3/devices`)).body || "[]")[0] || { senders: [] })
+            .senders.includes(byId.broken && byId.broken.senderId));
 
     // Identifiers must survive a restart, or every boot orphans a node.
     const before = JSON.parse(fs.readFileSync(CFG, "utf8"));

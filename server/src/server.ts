@@ -451,7 +451,16 @@ function getSetupConfigState() {
                 // in IS-04. Read-only to the client, but sent so a save can
                 // carry them back instead of looking like a request to mint
                 // new ones.
-                senderId:v.senderId, sourceId:v.sourceId, flowId:v.flowId }))
+                senderId:v.senderId, sourceId:v.sourceId, flowId:v.flowId,
+                // What actually happened to this SDP when it was last
+                // published. Without it the only record is a line in the log:
+                // an SDP that could not be parsed publishes nothing at all,
+                // and a multi-essence one publishes its first essence and
+                // drops the rest — in both cases the Setup page would
+                // otherwise look entirely healthy.
+                publishError:   (NmosNodeApi.instance?.lastError   || {})[v.senderId] || "",
+                publishWarning: (NmosNodeApi.instance?.lastWarning || {})[v.senderId] || "",
+            }))
             : [],
         acceptableGmid: (typeof settings.acceptableGmid === "string") ? settings.acceptableGmid : "",
         // The TSIG secret is a credential and never leaves the server.
