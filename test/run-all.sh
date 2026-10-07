@@ -1,10 +1,11 @@
 #!/bin/sh
-# Run every unit test. Requires a built server: npm --prefix server run build
+# Run every test. Requires a built server: npm --prefix server run build
 # (and `lua` for the Q-SYS script tests).
+# Integration tests start a real server on a free port and tear it down.
 set -e
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/.."
 fail=0
-for t in test/unit/*.test.js; do
+for t in test/unit/*.test.js test/integration/*.test.js; do
     echo "--- $t"
     node "$t" || fail=1
     echo

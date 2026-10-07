@@ -57,7 +57,12 @@ export interface MulticastLease {
     // different address, these stay locked in the pool — clearing the field
     // restores the leg back to its reserved value.
     primaryIp: string;       // odd, reserved for Leg 1
-    secondaryIp: string;     // odd+1, reserved for Leg 2 (also held for single-leg senders)
+    // Reserved for leg 2, normally primaryIp + 1. Empty when no reservation
+    // could be made — an adopted address whose partner was already taken, or a
+    // migrated sender that never recorded a second leg. Empty means the
+    // reconcile leaves leg 2 alone. It must never be a copy of primaryIp,
+    // which would put both ST 2022-7 legs on one group.
+    secondaryIp: string;
     // Optional per-leg manual overrides. Keys: "0" for Leg 1, "1" for Leg 2.
     // When unset (or empty string), the effective IP for that leg is the
     // reserved address. When set, the override "wins" over the reservation.
@@ -225,17 +230,41 @@ export class MulticastLeaseManager {
             return null;
         }
 
-        // Derive a secondary if the caller didn't pass one. Standard ST 2022-7
-        // convention: secondary = primary + 1 when primary is odd.
+        // Derive a secondary if the caller didn't pass one.
+        //
+        // This used to fall back to the primary address itself when one could
+        // not be derived. That is actively harmful: getDesiredAddresses then
+        // reports the same address for both legs, and the reconcile puts leg 2
+        // of a 2022-7 sender onto leg 1's group — collapsing the path
+        // redundancy the pairing exists to provide. An empty secondary is the
+        // honest answer instead: leg 2 has no reservation, so the reconcile
+        // leaves it alone, which is also what "keep current addresses"
+        // promises.
         let secondary = "";
         if (args.secondaryIp && this.ipIsValid(args.secondaryIp)) {
             secondary = args.secondaryIp;
-        } else if (this.ipToUint32(args.primaryIp) % 2 === 1) {
-            secondary = this.uint32ToIp(this.ipToUint32(args.primaryIp) + 1);
         } else {
-            // No usable secondary — single-leg sender; we use primary as both
-            // so the index still reserves it from future fresh allocations.
-            secondary = args.primaryIp;
+            // Try the ST 2022-7 partner, primary + 1. The convention pairs an
+            // odd primary with the next address, but an adopted primary is
+            // whatever the device already had, so attempt it either way and
+            // only take it if nothing else — lease or live sender — holds it.
+            const candidate = this.uint32ToIp(this.ipToUint32(args.primaryIp) + 1);
+            let externalIps: Set<string> = new Set<string>();
+            try {
+                if (this.externalIpsProvider) {
+                    externalIps = this.externalIpsProvider(args.senderId) || new Set<string>();
+                }
+            } catch (e) {}
+            const free = this.ipIsValid(candidate)
+                && candidate !== args.primaryIp
+                && !this.ipToSender.has(candidate)
+                && !externalIps.has(candidate);
+            secondary = free ? candidate : "";
+            if (!free) {
+                SyncLog.log("verbose", "Multicast Lease",
+                    "No secondary reserved for " + args.senderId + " (adopted " + args.primaryIp +
+                    "); leg 2 is left unmanaged rather than duplicated onto leg 1.");
+            }
         }
 
         // Collision check: never overwrite another sender's claim.
@@ -244,7 +273,7 @@ export class MulticastLeaseManager {
             SyncLog.log("warn", "Multicast Lease", "Cannot adopt " + args.primaryIp + " for " + args.senderId + " — already claimed by " + primOwner);
             return null;
         }
-        if (secondary !== args.primaryIp) {
+        if (secondary) {
             const secOwner = this.ipToSender.get(secondary);
             if (secOwner && secOwner !== args.senderId) {
                 SyncLog.log("warn", "Multicast Lease", "Cannot adopt secondary " + secondary + " for " + args.senderId + " — already claimed by " + secOwner);
@@ -264,10 +293,10 @@ export class MulticastLeaseManager {
         };
         this.leases[args.senderId] = lease;
         this.claimIp(args.primaryIp, args.senderId);
-        if (secondary !== args.primaryIp) this.claimIp(secondary, args.senderId);
+        this.claimIp(secondary, args.senderId);
         this.persist();
         this.notifyChange();
-        SyncLog.log("info", "Multicast Lease", "Adopted existing addresses " + args.primaryIp + " / " + secondary + " for sender " + args.senderId + " (" + category + ")");
+        SyncLog.log("info", "Multicast Lease", "Adopted existing addresses " + args.primaryIp + " / " + (secondary || "(leg 2 unmanaged)") + " for sender " + args.senderId + " (" + category + ")");
         return lease;
     }
 
@@ -458,14 +487,28 @@ export class MulticastLeaseManager {
         const newLeases: { [id: string]: MulticastLease } = {};
         const newIndex: Map<string, string> = new Map();
         let dropped = 0;
+        const offered = Object.keys(data.leases).length;
 
         for (const id in data.leases) {
             const raw = data.leases[id];
             if (!raw || !MULTICAST_CATEGORIES.includes(raw.category)) { dropped++; continue; }
-            // Same check as load(): an invalid IP drives the reconcile loop forever.
-            if (!this.ipIsValid(raw.primaryIp) || !this.ipIsValid(raw.secondaryIp)) { dropped++; continue; }
+            // Same bar as load(). A type check alone let "" and "239.120.0"
+            // through, and the reconcile would then keep trying to put that
+            // value on a device that can never report it back — exactly the
+            // loop load() warns about and refuses to create. The secondary may
+            // legitimately be absent, meaning leg 2 has no reservation.
+            if (typeof raw.primaryIp !== "string") { dropped++; continue; }
+            if (raw.secondaryIp == null) { raw.secondaryIp = ""; }
+            if (typeof raw.secondaryIp !== "string") { dropped++; continue; }
+            if (!this.ipIsValid(raw.primaryIp) || (raw.secondaryIp && !this.ipIsValid(raw.secondaryIp))) {
+                SyncLog.log("warning", "Multicast Lease",
+                    "Import dropping lease with invalid IPs for " + id +
+                    " (primary='" + raw.primaryIp + "', secondary='" + raw.secondaryIp + "')");
+                dropped++;
+                continue;
+            }
             if (newIndex.has(raw.primaryIp) || newIndex.has(raw.secondaryIp)) {
-                SyncLog.log("warn", "Multicast Lease", "Import dropping duplicate lease for " + id + " — IP already claimed.");
+                SyncLog.log("warning", "Multicast Lease", "Import dropping duplicate lease for " + id + " — IP already claimed.");
                 dropped++;
                 continue;
             }
@@ -501,6 +544,16 @@ export class MulticastLeaseManager {
                 }
             }
         }
+        // An import REPLACES the inventory, so committing an empty result is
+        // destructive: every sender loses its reservation and the next sweep
+        // re-addresses the whole plant. A file that offered leases and had
+        // every one rejected is malformed, not an intentional clear, so refuse
+        // it and leave the current inventory alone. Importing a genuinely
+        // empty file still clears, because that asks for nothing to be kept.
+        if (offered > 0 && Object.keys(newLeases).length === 0) {
+            throw new Error("All " + offered + " lease(s) in the file were rejected as invalid; the existing inventory was left unchanged.");
+        }
+
         this.leases = newLeases;
         this.ipToSender = newIndex;
         this.persist();
@@ -597,14 +650,15 @@ export class MulticastLeaseManager {
                     category: "other",
                     channels: 0,
                     primaryIp: primary,
-                    secondaryIp: secondary || primary,
+                    // Empty rather than a copy of the primary: see adoptLease.
+                    // The old allocator stored legs independently, so a sender
+                    // with no recorded leg 2 simply has no reservation for it.
+                    secondaryIp: secondary || "",
                     port: 5004
                 };
                 this.leases[senderId] = lease;
-                this.ipToSender.set(lease.primaryIp, senderId);
-                if (lease.secondaryIp !== lease.primaryIp) {
-                    this.ipToSender.set(lease.secondaryIp, senderId);
-                }
+                this.claimIp(lease.primaryIp, senderId);
+                this.claimIp(lease.secondaryIp, senderId);
                 adopted++;
             }
 
@@ -638,9 +692,12 @@ export class MulticastLeaseManager {
                     const l = data.leases[id];
                     if (!l || !MULTICAST_CATEGORIES.includes(l.category)) { dropped++; continue; }
 
-                    // Drop leases with empty / invalid IPs — older bugs could
-                    // produce these and they cause an infinite reconcile loop.
-                    if (!this.ipIsValid(l.primaryIp) || !this.ipIsValid(l.secondaryIp)) {
+                    // The primary must parse. The secondary may be absent —
+                    // leg 2 then carries no reservation and the reconcile leaves
+                    // it alone — but if present it has to be valid, since an
+                    // invalid one would drive an endless reconcile.
+                    if (typeof l.secondaryIp !== "string") { l.secondaryIp = ""; }
+                    if (!this.ipIsValid(l.primaryIp) || (l.secondaryIp && !this.ipIsValid(l.secondaryIp))) {
                         SyncLog.log("warn", "Multicast Lease", "Dropping lease with invalid IPs on load: " + id + " (primary='" + l.primaryIp + "', secondary='" + l.secondaryIp + "')");
                         dropped++;
                         continue;
@@ -821,10 +878,23 @@ export class MulticastLeaseManager {
 
     // ----- Internal: IP helpers -----
 
-    private parseCidr(cidr: string): { start: number; end: number } {
-        const [ipStr, bitsStr] = cidr.split("/");
-        const bits = parseInt(bitsStr, 10);
-        const base = this.ipToUint32(ipStr);
+    /**
+     * Parse a CIDR, or return null if it is not one.
+     *
+     * Previously this trusted its input and ipToUint32 answered 0 for anything
+     * it could not read, so a malformed range silently became a pool at
+     * 0.0.0.0 and the allocator handed those addresses to real devices.
+     * Refusing to parse means the category simply has no capacity, which the
+     * Setup page shows and the allocator treats as "cannot allocate" — wrong
+     * addresses on the wire are far worse than none.
+     */
+    private parseCidr(cidr: string): { start: number; end: number } | null {
+        const parts = ("" + cidr).split("/");
+        if (parts.length !== 2) return null;
+        const bits = parseInt(parts[1], 10);
+        if (!Number.isFinite(bits) || bits < 0 || bits > 32) return null;
+        if (!this.ipIsValid(parts[0])) return null;
+        const base = this.ipToUint32(parts[0]);
         const mask = bits === 0 ? 0 : ((0xFFFFFFFF << (32 - bits)) >>> 0);
         const start = (base & mask) >>> 0;
         const end = (start | ((~mask) >>> 0)) >>> 0;

@@ -322,7 +322,9 @@ server.addRoute("POST", "importLeases","global", (client: WebsocketClient, query
             SyncLog.log("info", "Multicast Lease", "Imported leases by " + client.user + ".", r);
             resolve({message:200, data:r});
         }catch(e:any){
-            reject({message:"import failed: " + (e?.message || e)});
+            // The UI already prefixes "Import failed:", so pass the reason
+            // through rather than stuttering it back at the operator.
+            reject({message: (e?.message || "" + e)});
         }
     });
 });
@@ -433,6 +435,20 @@ function persistSettings(){
     fs.renameSync(tmp, "./config/settings.json");
 }
 
+/**
+ * Restore the settings object IN PLACE from a snapshot.
+ *
+ * Several long-lived objects — the connector, the crosspoint abstraction, the
+ * lease manager — captured this exact object at construction, so the identity
+ * has to survive: reassigning the variable would leave them reading the old
+ * one. Keys are therefore cleared and refilled rather than swapped.
+ */
+function restoreSettings(snapshotJson: string){
+    const prev = JSON.parse(snapshotJson);
+    for(const k of Object.keys(settings)){ delete settings[k]; }
+    Object.assign(settings, prev);
+}
+
 server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:string[], postData: any) => {
     return new Promise((resolve, reject) => {
         try{
@@ -440,31 +456,47 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                 reject({message:"No settings supplied."});
                 return;
             }
-            // Local to this request, then folded into the sticky flag below.
+
+            // Validate EVERYTHING before changing anything.
+            //
+            // This used to validate and apply field by field, so a request that
+            // failed on a later field had already mutated settings for the
+            // earlier ones. Nothing was written to disk, so the UI reported a
+            // failed save while the running server had quietly moved on — and
+            // the next unrelated save then persisted the change the operator
+            // was told had been rejected.
+            //
+            // Each accepted field contributes a closure that performs the
+            // mutation, plus optionally one that performs its side effect. The
+            // mutations run only once the whole request is known to be valid,
+            // and the side effects only once it is safely on disk.
+            const mutations: Array<() => void> = [];
+            const sideEffects: Array<() => void> = [];
             let restartRequired = false;
 
             // --- NMOS registry (first static entry). Needs a restart: the
             // connector builds its registry list once at startup.
             if(postData.hasOwnProperty("registry") && typeof postData.registry === "object" && postData.registry){
-                let ip = (typeof postData.registry.ip === "string") ? postData.registry.ip.trim() : "";
+                const ip = (typeof postData.registry.ip === "string") ? postData.registry.ip.trim() : "";
                 if(ip !== "" && !/^[0-9a-zA-Z.:_-]+$/.test(ip)){
                     reject({message:"Registry address contains invalid characters."});
                     return;
                 }
-                let port = parseInt("" + postData.registry.port);
+                const port = parseInt("" + postData.registry.port);
                 if(isNaN(port) || port < 1 || port > 65535){
                     reject({message:"Registry port must be between 1 and 65535."});
                     return;
                 }
-                if(!Array.isArray(settings.staticNmosRegistries) || settings.staticNmosRegistries.length === 0){
-                    settings.staticNmosRegistries = [{ip:"", port:80, priority:10, domain:""}];
-                }
-                let cur = settings.staticNmosRegistries[0];
-                if(cur.ip !== ip || parseInt("" + cur.port) !== port){
-                    restartRequired = true;
-                }
-                cur.ip = ip;
-                cur.port = port;
+                const cur = (Array.isArray(settings.staticNmosRegistries) && settings.staticNmosRegistries.length > 0)
+                    ? settings.staticNmosRegistries[0] : null;
+                if(!cur || cur.ip !== ip || parseInt("" + cur.port) !== port){ restartRequired = true; }
+                mutations.push(()=>{
+                    if(!Array.isArray(settings.staticNmosRegistries) || settings.staticNmosRegistries.length === 0){
+                        settings.staticNmosRegistries = [{ip:"", port:80, priority:10, domain:""}];
+                    }
+                    settings.staticNmosRegistries[0].ip = ip;
+                    settings.staticNmosRegistries[0].port = port;
+                });
             }
 
             // --- Plain booleans read live by the connector / update thread.
@@ -474,44 +506,50 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         reject({message: key + " must be a boolean."});
                         return;
                     }
-                    settings[key] = postData[key];
+                    const value = postData[key];
+                    mutations.push(()=>{ settings[key] = value; });
                 }
             }
 
             // --- Crosspoint numbering. The worker thread reads this at start.
             if(postData.hasOwnProperty("firstDynamicNumber")){
-                let n = parseInt("" + postData.firstDynamicNumber);
+                const n = parseInt("" + postData.firstDynamicNumber);
                 if(isNaN(n) || n < 1){
                     reject({message:"First dynamic number must be 1 or greater."});
                     return;
                 }
                 if(settings.firstDynamicNumber !== n){ restartRequired = true; }
-                settings.firstDynamicNumber = n;
+                mutations.push(()=>{ settings.firstDynamicNumber = n; });
             }
 
             // --- Predictive staging. The stager is constructed at startup, so
             // enabling it from here needs a restart to take effect.
             if(postData.hasOwnProperty("predictiveStaging") && typeof postData.predictiveStaging === "object" && postData.predictiveStaging){
-                if(!settings.predictiveStaging || typeof settings.predictiveStaging !== "object"){
-                    settings.predictiveStaging = { enabled:false, cooldownMs:10000, perReceiver:{} };
-                }
-                let target = settings.predictiveStaging;
+                let enabled: boolean | null = null;
+                let cooldown: number | null = null;
                 if(postData.predictiveStaging.hasOwnProperty("enabled")){
                     if(typeof postData.predictiveStaging.enabled !== "boolean"){
                         reject({message:"predictiveStaging.enabled must be a boolean."});
                         return;
                     }
-                    if(target.enabled !== postData.predictiveStaging.enabled){ restartRequired = true; }
-                    target.enabled = postData.predictiveStaging.enabled;
+                    enabled = postData.predictiveStaging.enabled;
+                    if(!!settings.predictiveStaging?.enabled !== enabled){ restartRequired = true; }
                 }
                 if(postData.predictiveStaging.hasOwnProperty("cooldownMs")){
-                    let c = parseInt("" + postData.predictiveStaging.cooldownMs);
+                    const c = parseInt("" + postData.predictiveStaging.cooldownMs);
                     if(isNaN(c) || c < 0){
                         reject({message:"predictiveStaging.cooldownMs must be 0 or greater."});
                         return;
                     }
-                    target.cooldownMs = c;
+                    cooldown = c;
                 }
+                mutations.push(()=>{
+                    if(!settings.predictiveStaging || typeof settings.predictiveStaging !== "object"){
+                        settings.predictiveStaging = { enabled:false, cooldownMs:10000, perReceiver:{} };
+                    }
+                    if(enabled !== null){ settings.predictiveStaging.enabled = enabled; }
+                    if(cooldown !== null){ settings.predictiveStaging.cooldownMs = cooldown; }
+                });
             }
 
             // --- BCP-008 master switch. Applies live: the monitor opens or
@@ -522,58 +560,70 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         reject({message:"bcp008.enabled must be a boolean."});
                         return;
                     }
-                    if(!settings.bcp008 || typeof settings.bcp008 !== "object"){ settings.bcp008 = { enabled:true }; }
-                    settings.bcp008.enabled = postData.bcp008.enabled;
-                    try{ Bcp008Monitor.instance?.setEnabled(settings.bcp008.enabled); }catch(e){}
+                    const value = postData.bcp008.enabled;
+                    mutations.push(()=>{
+                        if(!settings.bcp008 || typeof settings.bcp008 !== "object"){ settings.bcp008 = { enabled:true }; }
+                        settings.bcp008.enabled = value;
+                    });
+                    sideEffects.push(()=>{ try{ Bcp008Monitor.instance?.setEnabled(value); }catch(e){} });
                 }
             }
 
             // --- Registry discovery. The domain list is re-read on the next
             // DNS-SD pass, so both fields apply without a restart.
             if(postData.hasOwnProperty("registryDiscovery") && typeof postData.registryDiscovery === "object" && postData.registryDiscovery){
-                if(!settings.registryDiscovery || typeof settings.registryDiscovery !== "object"){
-                    settings.registryDiscovery = { unicastDnssd:true, domain:"" };
-                }
+                let unicast: boolean | null = null;
+                let domain: string | null = null;
                 if(postData.registryDiscovery.hasOwnProperty("unicastDnssd")){
                     if(typeof postData.registryDiscovery.unicastDnssd !== "boolean"){
                         reject({message:"registryDiscovery.unicastDnssd must be a boolean."});
                         return;
                     }
-                    settings.registryDiscovery.unicastDnssd = postData.registryDiscovery.unicastDnssd;
+                    unicast = postData.registryDiscovery.unicastDnssd;
                 }
                 if(postData.registryDiscovery.hasOwnProperty("domain")){
-                    let d = ("" + postData.registryDiscovery.domain).trim();
+                    const d = ("" + postData.registryDiscovery.domain).trim();
                     if(d !== "" && !/^[A-Za-z0-9.-]+$/.test(d)){
                         reject({message:"Discovery domain contains invalid characters."});
                         return;
                     }
-                    settings.registryDiscovery.domain = d;
+                    domain = d;
                 }
+                mutations.push(()=>{
+                    if(!settings.registryDiscovery || typeof settings.registryDiscovery !== "object"){
+                        settings.registryDiscovery = { unicastDnssd:true, domain:"" };
+                    }
+                    if(unicast !== null){ settings.registryDiscovery.unicastDnssd = unicast; }
+                    if(domain !== null){ settings.registryDiscovery.domain = domain; }
+                });
             }
 
-            // --- Multicast DHCP master switch. Turning it ON does not
-            // immediately repoint anything: the reconcile sweep decides whether
-            // to adopt the addresses already on the wire or allocate fresh,
-            // based on the adoptExisting flag below.
+            // --- Multicast DHCP master switch. The seed sweep is a side effect
+            // on purpose: it patches real devices, so it must not run until the
+            // decision that triggered it is safely on disk.
             if(postData.hasOwnProperty("autoMulticast") && typeof postData.autoMulticast === "object" && postData.autoMulticast){
                 if(postData.autoMulticast.hasOwnProperty("enabled")){
                     if(typeof postData.autoMulticast.enabled !== "boolean"){
                         reject({message:"autoMulticast.enabled must be a boolean."});
                         return;
                     }
-                    if(!settings.autoMulticast || typeof settings.autoMulticast !== "object"){
-                        settings.autoMulticast = { enabled:false };
-                    }
-                    let wasOn = !!settings.autoMulticast.enabled;
-                    settings.autoMulticast.enabled = postData.autoMulticast.enabled;
-                    try{ MulticastLeaseManager.instance?.setSettings(settings); }catch(e){}
-
-                    if(!wasOn && settings.autoMulticast.enabled){
-                        // First enable: adopt what is already on the wire unless
-                        // the operator explicitly asked for fresh addresses.
-                        let adopt = postData.autoMulticast.adoptExisting !== false;
-                        try{ nmosConnector.seedLeasesFromActive(adopt); }catch(e){}
-                    }
+                    const value = postData.autoMulticast.enabled;
+                    const wasOn = !!(settings.autoMulticast && settings.autoMulticast.enabled);
+                    const adopt = postData.autoMulticast.adoptExisting !== false;
+                    mutations.push(()=>{
+                        if(!settings.autoMulticast || typeof settings.autoMulticast !== "object"){
+                            settings.autoMulticast = { enabled:false };
+                        }
+                        settings.autoMulticast.enabled = value;
+                    });
+                    sideEffects.push(()=>{
+                        try{ MulticastLeaseManager.instance?.setSettings(settings); }catch(e){}
+                        if(!wasOn && value){
+                            // First enable: adopt what is already on the wire
+                            // unless the operator asked for fresh addresses.
+                            try{ nmosConnector.seedLeasesFromActive(adopt); }catch(e){}
+                        }
+                    });
                 }
             }
 
@@ -584,13 +634,16 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         reject({message:"audioMonitor.enabled must be a boolean."});
                         return;
                     }
-                    if(!settings.audioMonitor || typeof settings.audioMonitor !== "object"){ settings.audioMonitor = { enabled:false }; }
-                    let wasEnabled = !!settings.audioMonitor.enabled;
-                    settings.audioMonitor.enabled = postData.audioMonitor.enabled;
-                    if(wasEnabled && !settings.audioMonitor.enabled){
+                    const value = postData.audioMonitor.enabled;
+                    const wasEnabled = !!(settings.audioMonitor && settings.audioMonitor.enabled);
+                    mutations.push(()=>{
+                        if(!settings.audioMonitor || typeof settings.audioMonitor !== "object"){ settings.audioMonitor = { enabled:false }; }
+                        settings.audioMonitor.enabled = value;
+                    });
+                    if(wasEnabled && !value){
                         // Stop every producer rather than leaving multicast
                         // memberships open after the feature is switched off.
-                        try{ audioMonitor.shutdownAll().catch(()=>{}); }catch(e){}
+                        sideEffects.push(()=>{ try{ audioMonitor.shutdownAll().catch(()=>{}); }catch(e){} });
                     }
                 }
             }
@@ -612,7 +665,7 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         reject({message:"Each vendor profile must be an object."});
                         return;
                     }
-                    let port = parseInt("" + v.port);
+                    const port = parseInt("" + v.port);
                     if(isNaN(port) || port < 1 || port > 65535){
                         reject({message:"Vendor profile port must be between 1 and 65535."});
                         return;
@@ -626,12 +679,17 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         return;
                     }
                 }
-                settings.vendorProfiles = postData.vendorProfiles;
-                // Re-run the normaliser over just this key.
-                settings = parseSettings(settings);
+                const profiles = postData.vendorProfiles;
+                mutations.push(()=>{
+                    settings.vendorProfiles = profiles;
+                    // parseSettings mutates and returns the same object, so this
+                    // re-normalises in place without breaking the references
+                    // other components hold.
+                    settings = parseSettings(settings);
+                });
                 // Device links are computed during enrichment, so without a
                 // republish they stay stale until an unrelated device event.
-                try{ crosspoint.republishForSettingsChange(); }catch(e){}
+                sideEffects.push(()=>{ try{ crosspoint.republishForSettingsChange(); }catch(e){} });
             }
 
             // --- Debug logging applies immediately.
@@ -640,17 +698,32 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                     reject({message:"debugLogs must be a boolean."});
                     return;
                 }
-                settings.debugLogs = postData.debugLogs;
-                try{ SyncLog.setDebugEnabled(settings.debugLogs); }catch(e){}
+                const value = postData.debugLogs;
+                mutations.push(()=>{ settings.debugLogs = value; });
+                sideEffects.push(()=>{ try{ SyncLog.setDebugEnabled(value); }catch(e){} });
             }
+
+            // Everything validated. Apply, then persist — and if the write
+            // fails, put the in-memory settings back exactly as they were so
+            // the running server still matches what is on disk.
+            const snapshot = JSON.stringify(settings);
+            for(const apply of mutations){ apply(); }
 
             try{
                 persistSettings();
             }catch(e:any){
+                try{ restoreSettings(snapshot); }catch(restoreErr){
+                    SyncLog.log("error", "Settings",
+                        "Failed to write settings.json AND could not roll back in memory; " +
+                        "the running configuration may not match ./config/settings.json.", restoreErr);
+                }
                 SyncLog.log("error", "Settings", "Failed to write ./config/settings.json", e);
                 reject({message:"Could not write settings.json: " + (e?.message || e)});
                 return;
             }
+
+            // Only now that the change is durable: tell the subsystems.
+            for(const run of sideEffects){ run(); }
 
             if(restartRequired){ setupRestartRequired = true; }
             setupConfigSync.setState(getSetupConfigState());
@@ -661,6 +734,7 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
         }
     });
 });
+
 
 // ----- Change admin credentials -----
 // The auth model stores sha256(plaintextPassword) in users.json, and the

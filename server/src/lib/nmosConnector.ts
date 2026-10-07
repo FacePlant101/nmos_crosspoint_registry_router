@@ -252,6 +252,9 @@ export class NmosRegistryConnector {
                                 priority: (typeof srv.priority === "number") ? srv.priority : 100,
                                 source: "dnssd",
                                 domain,
+                                // The SRV target, not the resolved address:
+                                // see NmosRegistry.discoveryKey.
+                                discoveryKey: target + ":" + srv.port,
                             });
                         }
                     } catch (e) { /* instance without SRV - skip */ }
@@ -274,16 +277,37 @@ export class NmosRegistryConnector {
     private addRegistry(registry: NmosRegistry) {
         const rank = NmosRegistryConnector.sourceRank(registry.source);
 
-        // Already known endpoint: keep the existing connection and only
-        // relabel it when a higher-ranked source confirms the same address.
-        // The old code relabelled whenever the entry was not "static", so a
-        // periodic mDNS answer could downgrade a manual entry's source.
+        // Already known: keep the existing connection and only relabel it when
+        // a higher-ranked source confirms it. The old code relabelled whenever
+        // the entry was not "static", so a periodic mDNS answer could downgrade
+        // a manual entry's source.
+        //
+        // "Already known" means the same endpoint OR the same discovered
+        // service instance. The second test is what stops one registry being
+        // added twice when its A lookup succeeds on one pass and fails on
+        // another, since the address we store differs between the two.
         for (let i = 0; i < this.nmosRegistryList.length; i++) {
             const el = this.nmosRegistryList[i];
-            if (el.ip + ":" + el.port == registry.ip + ":" + registry.port) {
+            const sameEndpoint = (el.ip + ":" + el.port) === (registry.ip + ":" + registry.port);
+            const sameInstance = !!registry.discoveryKey && el.discoveryKey === registry.discoveryKey;
+            if (sameEndpoint || sameInstance) {
                 if (rank > NmosRegistryConnector.sourceRank(el.source)) {
-                    this.nmosRegistryList[i] = registry;
+                    // Upgrade the metadata only. The address stays as it is,
+                    // because that is the one we actually hold subscriptions
+                    // to — replacing the whole entry would make the Setup page
+                    // show an endpoint the connector is not talking to.
+                    // Re-pointing a live registry needs the generation counter
+                    // noted below, which is not here yet.
+                    el.source = registry.source;
+                    el.priority = registry.priority;
+                    el.domain = registry.domain;
+                    if (registry.discoveryKey) { el.discoveryKey = registry.discoveryKey; }
                     this.updateSyncConnectionState();
+                } else if (registry.discoveryKey && !el.discoveryKey) {
+                    // Same endpoint, now also seen via DNS-SD. Remember the
+                    // instance identity so a later pass that resolves the name
+                    // differently still recognises this entry.
+                    el.discoveryKey = registry.discoveryKey;
                 }
                 return;
             }
@@ -2217,27 +2241,51 @@ export class NmosRegistryConnector {
                 }
             }
 
+            const requested: any[] = Array.isArray(data?.legs) ? data.legs : [];
+            if(requested.length === 0){
+                // Nothing to set. Falling through would send an all-"auto"
+                // patch, which tells the device to reassign every leg — the
+                // opposite of a no-op.
+                SyncLog.log("verbose", "nmos", "setFlowMulticast called with no legs for " + senderId + " - nothing to do.");
+                return;
+            }
+
+            // Size the array to the sender's REAL leg count. IS-05 expects
+            // transport_params to match the sender, and this always sent two
+            // entries, so a single-leg (non-2022-7) sender got a two-element
+            // patch that a conforming device rejects outright.
+            const activeParams: any[] = Array.isArray(this.nmosState.senderActiveData?.[senderId]?.transport_params)
+                ? this.nmosState.senderActiveData[senderId].transport_params : [];
+            // Never fewer slots than the highest leg we were asked to write.
+            const highestRequested = requested.reduce((m: number, l: any) => Math.max(m, Number(l?.index) + 1), 1);
+            const legCount = Math.max(activeParams.length, highestRequested);
+
             let patch:any = {
                 "receiver_id": null,
                 "activation": {
                     "mode": "activate_immediate",
                     "requested_time": null,
                 },
-                // Initialize legs with minimal valid sender-side params to avoid empty objects
-                "transport_params": [
-                    {
-                        destination_ip: "auto",
+                // A leg we are NOT changing is seeded from what the device is
+                // currently transmitting, not from "auto". In IS-05 "auto"
+                // means "device picks its own address", so the old code told
+                // the device to reassign every leg it was not explicitly
+                // given — on a 2022-7 sender, changing leg 0 silently moved
+                // leg 1 as well, and the next reconcile then saw that drift.
+                "transport_params": Array.from({ length: legCount }, (_unused, i) => {
+                    const cur = activeParams[i];
+                    const dst = this.stripSdpAddress(cur?.destination_ip);
+                    return {
+                        destination_ip: (dst && dst !== "auto") ? dst : "auto",
                         source_ip: "auto",
-                    },
-                    {
-                        destination_ip: "auto",
-                        source_ip: "auto",
-                    }
-                ]
+                    };
+                })
             };
 
-            data.legs.forEach((l)=>{
-                patch.transport_params[l.index] = {destination_ip:l.multicast, source_ip:"auto"}
+            requested.forEach((l:any)=>{
+                const index = Number(l?.index);
+                if(!Number.isFinite(index) || index < 0 || index >= legCount){ return; }
+                patch.transport_params[index] = {destination_ip:l.multicast, source_ip:"auto"}
             });
 
             
@@ -2326,6 +2374,17 @@ interface NmosRegistry {
     domain: string;
     priority: number;
     source: "mdns" | "dnssd" | "static" | "manual";
+    /**
+     * Stable identity of a DISCOVERED service instance: the SRV target and
+     * port, independent of whatever address that name currently resolves to.
+     *
+     * Deduplication cannot rely on ip:port for these. The A lookup is allowed
+     * to fail — we then fall back to using the hostname as the address, since
+     * it still works in a URL — so the same registry appears under its name on
+     * one pass and under its numeric address on the next, and would otherwise
+     * be added twice with two full sets of subscriptions.
+     */
+    discoveryKey?: string;
 }
 
 interface ConnectionList {

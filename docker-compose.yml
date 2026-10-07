@@ -15,6 +15,8 @@ services:
     # includes server/config (it holds password hashes and device
     # credentials), and the entrypoint seeds settings.json + users.json from
     # the image's config.default on first boot if this directory is empty.
+    # If it is empty but server/state is not, the entrypoint stops rather than
+    # reseeding over an existing deployment — see docker-compose.deploy.yml.
     - ./server/config:/nmos-crosspoint/server/config
     - nmos-state:/nmos-crosspoint/server/state
     # Added depends_on for startup order (optional but good practice)
