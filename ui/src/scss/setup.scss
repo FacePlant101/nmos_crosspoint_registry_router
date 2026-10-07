@@ -206,7 +206,7 @@
 // ----- Virtual senders -----
 .vs-row {
     padding: 0.4rem 0;
-    border-bottom: 1px solid hsl(var(--b3));
+    border-bottom: 1px solid oklch(var(--b3));
 
     &:last-child { border-bottom: none; }
 
