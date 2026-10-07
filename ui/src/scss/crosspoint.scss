@@ -731,19 +731,19 @@ html[data-theme="light"] {
 // shows up without widening an already very wide matrix. Colour is carried by
 // a ring rather than the fill, so the type icon underneath stays readable.
 .cp-type {
-    &.mon-ok      { box-shadow: inset 0 0 0 2px hsl(var(--su)); }
-    &.mon-warn    { box-shadow: inset 0 0 0 2px hsl(var(--wa)); }
-    &.mon-bad     { box-shadow: inset 0 0 0 2px hsl(var(--er)); }
+    &.mon-ok      { box-shadow: inset 0 0 0 2px oklch(var(--su)); }
+    &.mon-warn    { box-shadow: inset 0 0 0 2px oklch(var(--wa)); }
+    &.mon-bad     { box-shadow: inset 0 0 0 2px oklch(var(--er)); }
     // Monitored but not streaming — deliberately quiet: it is not a fault.
-    &.mon-inactive { box-shadow: inset 0 0 0 2px hsl(var(--bc) / 0.25); }
+    &.mon-inactive { box-shadow: inset 0 0 0 2px oklch(var(--bc) / 0.25); }
 
     &.mon-warn, &.mon-bad { cursor: pointer; }
 }
 
 // Device-level rollup on the collapsed node bands, so a problem is findable
 // without expanding every device.
-.cp-device.mon-warn, .cp-line-stick.mon-warn { border-left: 3px solid hsl(var(--wa)); }
-.cp-device.mon-bad,  .cp-line-stick.mon-bad  { border-left: 3px solid hsl(var(--er)); }
+.cp-device.mon-warn, .cp-line-stick.mon-warn { border-left: 3px solid oklch(var(--wa)); }
+.cp-device.mon-bad,  .cp-line-stick.mon-bad  { border-left: 3px solid oklch(var(--er)); }
 
 // ----- BCP-008 status panel -----
 .mon-flow-name {
@@ -763,10 +763,10 @@ html[data-theme="light"] {
     display: inline-block;
     box-shadow: none;
 
-    &.mon-ok       { background-color: hsl(var(--su) / 0.2); }
-    &.mon-warn     { background-color: hsl(var(--wa) / 0.2); }
-    &.mon-bad      { background-color: hsl(var(--er) / 0.2); }
-    &.mon-inactive { background-color: hsl(var(--bc) / 0.1); }
+    &.mon-ok       { background-color: oklch(var(--su) / 0.2); }
+    &.mon-warn     { background-color: oklch(var(--wa) / 0.2); }
+    &.mon-bad      { background-color: oklch(var(--er) / 0.2); }
+    &.mon-inactive { background-color: oklch(var(--bc) / 0.1); }
 }
 
 .mon-subhead {
@@ -788,7 +788,7 @@ html[data-theme="light"] {
     th, td {
         text-align: left;
         padding: 0.15rem 0.5rem;
-        border-bottom: 1px solid hsl(var(--b3));
+        border-bottom: 1px solid oklch(var(--b3));
     }
 
     th { font-weight: 500; opacity: 0.7; }
@@ -797,7 +797,7 @@ html[data-theme="light"] {
 
     // Per-domain state cell: same 0..3 scale as the overall status.
     .mon-cell { font-family: monospace; text-align: center; width: 4rem; }
-    .mon-s1 { color: hsl(var(--su)); }
-    .mon-s2 { color: hsl(var(--wa)); }
-    .mon-s3 { color: hsl(var(--er)); }
+    .mon-s1 { color: oklch(var(--su)); }
+    .mon-s2 { color: oklch(var(--wa)); }
+    .mon-s3 { color: oklch(var(--er)); }
 }

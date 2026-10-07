@@ -13,7 +13,7 @@
     justify-content: space-between;
     gap: 1rem;
     padding: 0.5rem 1rem;
-    border-bottom: 1px solid hsl(var(--b3));
+    border-bottom: 1px solid oklch(var(--b3));
 
     h2 {
         font-size: 1.25rem;
@@ -51,7 +51,7 @@
 }
 
 .setup-section {
-    background-color: hsl(var(--b2));
+    background-color: oklch(var(--b2));
     border-radius: var(--rounded-box, 0.5rem);
     padding: 0.75rem 1rem 1rem;
 
@@ -60,7 +60,7 @@
         font-weight: 500;
         margin-bottom: 0.5rem;
         padding-bottom: 0.25rem;
-        border-bottom: 1px solid hsl(var(--b3));
+        border-bottom: 1px solid oklch(var(--b3));
     }
 }
 
@@ -87,7 +87,7 @@
     code {
         font-family: monospace;
         font-size: 0.75rem;
-        background-color: hsl(var(--b3));
+        background-color: oklch(var(--b3));
         border-radius: 0.25rem;
         padding: 0 0.25rem;
     }
@@ -107,7 +107,7 @@
     th, td {
         text-align: left;
         padding: 0.15rem 0.35rem;
-        border-bottom: 1px solid hsl(var(--b3));
+        border-bottom: 1px solid oklch(var(--b3));
         vertical-align: middle;
     }
 
@@ -139,7 +139,7 @@
     white-space: pre;
     overflow-x: auto;
     padding: 0.5rem;
-    background-color: hsl(var(--b3));
+    background-color: oklch(var(--b3));
     border-radius: 0.25rem;
     margin: 0.25rem 0;
 }
@@ -164,8 +164,8 @@
     font-family: inherit;
     font-size: 0.65rem;
     text-transform: uppercase;
-    background-color: hsl(var(--in) / 0.2);
-    color: hsl(var(--in));
+    background-color: oklch(var(--in) / 0.2);
+    color: oklch(var(--in));
 }
 
 // Live status of a lease against the wire.
@@ -174,12 +174,12 @@
     width: 0.6rem;
     height: 0.6rem;
     border-radius: 50%;
-    background-color: hsl(var(--bc) / 0.3);
+    background-color: oklch(var(--bc) / 0.3);
 
-    &.lease-active   { background-color: hsl(var(--su)); }
-    &.lease-inactive { background-color: hsl(var(--wa)); }
+    &.lease-active   { background-color: oklch(var(--su)); }
+    &.lease-inactive { background-color: oklch(var(--wa)); }
     // Held for a sender the registry no longer knows.
-    &.lease-missing  { background-color: hsl(var(--er)); }
+    &.lease-missing  { background-color: oklch(var(--er)); }
 }
 
 .lease-table {
