@@ -19,13 +19,13 @@
     max-height: 26rem;
     overflow: auto;
     padding: 0.5rem 0.75rem;
-    background-color: hsl(var(--b2));
+    background-color: oklch(var(--b2));
     border-radius: 0.25rem;
 }
 
 // ----- Duplicate multicast -----
 .mc-dup {
-    color: hsl(var(--er));
+    color: oklch(var(--er));
     font-weight: 500;
 }
 
@@ -37,8 +37,8 @@
     font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    background-color: hsl(var(--er) / 0.2);
-    color: hsl(var(--er));
+    background-color: oklch(var(--er) / 0.2);
+    color: oklch(var(--er));
 }
 
 // The Forget button sits next to the online/offline badge and only appears for

@@ -12,6 +12,18 @@
 @tailwind components;
 @tailwind utilities;
 
+// Theme colours: read daisyUI's variables with oklch(), never hsl().
+//
+// daisyUI 4 stores --p, --su, --wa, --er, --bc, --b2, --b3 and the rest as
+// oklch components ("84.71% .199 83.87"). hsl(var(--wa)) is therefore not a
+// valid colour, and CSS drops the whole declaration without a word: the
+// element keeps whatever it inherited. That reads as plain body text, so a
+// status colour looks deliberate rather than broken, which is why every
+// warning and error colour in this UI was silently grey until 2026-10.
+//
+//   oklch(var(--wa))            amber
+//   oklch(var(--er) / 0.2)      red at 20% — the alpha form needs oklch too
+
 
 @import './scss/components.scss';
 @import './scss/components/scrollbars.scss';
