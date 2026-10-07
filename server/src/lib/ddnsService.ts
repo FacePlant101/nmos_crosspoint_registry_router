@@ -91,6 +91,10 @@ export class DdnsService {
     // server-side way to list "our" records).
     private lastPushed: Map<string, PushedEntry> = new Map();
 
+    // Nodes we have already warned about losing a name collision, so the
+    // warning is logged once rather than on every discovery event.
+    private collisionWarned: Set<string> = new Set();
+
     private onChange: (() => void) | null = null;
     setOnChange(cb: (() => void) | null) { this.onChange = cb; }
     private notifyChange() {
@@ -98,6 +102,22 @@ export class DdnsService {
             try { this.onChange(); } catch { /* swallow */ }
         }
     }
+    /**
+     * The node that already holds `fqdn`, or "" when it is free for `nodeId`.
+     * Two different devices can easily sanitise to one label ("Cam 1" and
+     * "Cam-1"), and the inventory is keyed by nodeId, so without this check
+     * each would overwrite the other's A record and either removal would take
+     * both down.
+     */
+    private ownerOfName(fqdn: string, nodeId: string): string {
+        const want = fqdn.toLowerCase();
+        for (const e of Array.from(this.lastPushed.values())) {
+            if (e.nodeId === nodeId) continue;
+            if ((e.host + "." + (e.domain || "")).toLowerCase() === want) return e.nodeId;
+        }
+        return "";
+    }
+
     getPushedEntries(): PushedEntry[] {
         return Array.from(this.lastPushed.values()).sort((a, b) => a.host.localeCompare(b.host));
     }
@@ -187,12 +207,46 @@ export class DdnsService {
             const fqdn = host + "." + zone;
             const prev = this.lastPushed.get(node.nodeId);
 
-            // Nothing to do when name + IP are unchanged.
-            if (prev && prev.host === host && prev.ip === node.ip) continue;
+            // Two nodes whose labels sanitise to the same host would otherwise
+            // take turns owning one A record — the name would resolve to
+            // whichever pushed last, and removing either would delete the
+            // record both believe they own. First claim wins; the loser is
+            // named in the log so the operator can rename it.
+            const claimant = this.ownerOfName(fqdn, node.nodeId);
+            if (claimant) {
+                if (!this.collisionWarned.has(node.nodeId)) {
+                    this.collisionWarned.add(node.nodeId);
+                    SyncLog.log("warn", "DDNS", `Not publishing ${fqdn} for node ${node.nodeId}: that name is already held by node ${claimant}. Rename one of them — their labels differ only in characters a DNS label cannot carry.`);
+                }
+                continue;
+            }
+            this.collisionWarned.delete(node.nodeId);
+
+            // Nothing to do when name, IP and zone are all unchanged. The zone
+            // has to be part of this: without it, moving the feature to a new
+            // zone looks like a no-op for every node and nothing is ever
+            // published there.
+            if (prev && prev.host === host && prev.ip === node.ip && prev.domain === zone) continue;
+
+            // A zone change cannot be expressed in one message — an RFC 2136
+            // UPDATE carries a single zone in its Zone section, and a name
+            // outside it is refused with NOTZONE. So the old zone is cleaned
+            // up in its own update first, best-effort: if that server is no
+            // longer reachable we still want the new zone populated.
+            if (prev && prev.domain && prev.domain !== zone) {
+                const oldFqdn = prev.host + "." + prev.domain;
+                try {
+                    await this.sendUpdate([{ kind: "deleteRRset", name: oldFqdn }], prev.domain);
+                    SyncLog.log("info", "DDNS", `Removed ${oldFqdn} from the previous zone ${prev.domain}`);
+                } catch (e: any) {
+                    SyncLog.log("warn", "DDNS", `Could not remove ${oldFqdn} from the previous zone: ` + (e?.message || e));
+                }
+            }
 
             const ops: UpdateOp[] = [];
-            // Rename: remove the old FQDN's A RRset in the same atomic update.
-            if (prev && prev.host !== host) {
+            // Rename within the same zone: remove the old FQDN's A RRset in the
+            // same atomic update.
+            if (prev && prev.host !== host && prev.domain === zone) {
                 ops.push({ kind: "deleteRRset", name: prev.host + "." + zone });
             }
             // Replace semantics for the current FQDN.
@@ -200,8 +254,8 @@ export class DdnsService {
             ops.push({ kind: "addA", name: fqdn, ttl: this.settings.ttl, ip: node.ip });
 
             try {
-                await this.sendUpdate(ops);
-                SyncLog.log("info", "DDNS", `Updated ${fqdn} → ${node.ip}` + (prev && prev.host !== host ? ` (renamed from ${prev.host}.${zone})` : ""));
+                await this.sendUpdate(ops, zone);
+                SyncLog.log("info", "DDNS", `Updated ${fqdn} → ${node.ip}` + (prev && prev.host !== host ? ` (renamed from ${prev.host}.${prev.domain || zone})` : ""));
                 this.lastPushed.set(node.nodeId, { nodeId: node.nodeId, host, domain: zone, ip: node.ip, ts: new Date().toISOString() });
                 changed = true;
             } catch (e: any) {
@@ -225,9 +279,13 @@ export class DdnsService {
         }
         if (!this.settings.server) return;                                   // can't reach the server
         if (!this.unsigned && !this.settings.keySecret) return;             // can't sign the update
-        const fqdn = prev.host + "." + (prev.domain || this.settings.zone);
+        const recordZone = prev.domain || this.settings.zone;
+        const fqdn = prev.host + "." + recordZone;
         try {
-            await this.sendUpdate([{ kind: "deleteRRset", name: fqdn }]);
+            // Addressed to the zone the record was published in, not whatever
+            // the settings say now — an UPDATE naming a record outside its
+            // Zone section is refused with NOTZONE.
+            await this.sendUpdate([{ kind: "deleteRRset", name: fqdn }], recordZone);
             SyncLog.log("info", "DDNS", `Removed DNS record ${fqdn}`);
             this.lastPushed.delete(nodeId);
             this.savePushedState();
@@ -262,7 +320,12 @@ export class DdnsService {
     // The TSIG MAC is an HMAC over the message as it looks WITHOUT the TSIG
     // record (ARCOUNT excludes it), followed by the TSIG "variables".
 
-    private async sendUpdate(ops: UpdateOp[]) {
+    private async sendUpdate(ops: UpdateOp[], zone?: string) {
+        // The Zone section names the zone this update is addressed to. It is
+        // passed in rather than read from settings so a record can still be
+        // withdrawn from the zone it was actually published in after the
+        // operator has pointed the feature somewhere else.
+        const updateZone = (typeof zone === "string" && zone) ? zone : this.settings.zone;
         // Unsigned mode ("none"): send the bare UPDATE without a TSIG RR —
         // the server is expected to authorise by source address.
         const signing = !this.unsigned;
@@ -287,7 +350,7 @@ export class DdnsService {
         parts.push(header);
 
         // Zone section: <zone> SOA IN
-        parts.push(encodeName(this.settings.zone));
+        parts.push(encodeName(updateZone));
         parts.push(u16(6), u16(1));                // TYPE SOA, CLASS IN
 
         for (const op of ops) {
@@ -377,6 +440,14 @@ export class DdnsService {
             };
             sock.setTimeout(5000, () => finish(new Error("timeout talking to " + this.settings.server + ":" + this.settings.port)));
             sock.on("error", (e) => finish(e));
+            // A peer that accepts the connection and then closes it without
+            // answering would otherwise leave this promise pending forever:
+            // the inactivity timer above stops once the socket is destroyed,
+            // and only the data handler resolves. The await in flush() would
+            // never return, stranding the rest of the batch.
+            sock.on("close", () => finish(new Error(
+                "connection to " + this.settings.server + ":" + this.settings.port +
+                " closed before a DNS response arrived")));
             sock.on("data", (d) => {
                 chunks.push(d);
                 const buf = Buffer.concat(chunks);

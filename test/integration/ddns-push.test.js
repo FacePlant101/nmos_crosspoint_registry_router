@@ -28,12 +28,17 @@ const IMAGE = "ubuntu/bind9:latest";
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "ddns-bind-"));
 const SECRET = require("crypto").randomBytes(32).toString("base64");
 const ZONE = "media.example.net";
+// A second zone on the same server, so moving the feature between zones can be
+// tested end to end rather than asserted about in the abstract.
+const ZONE2 = "av.example.net";
 
 fs.writeFileSync(path.join(work, "named.conf"), `
 options { directory "/var/cache/bind"; listen-on { any; }; allow-query { any; };
           recursion no; dnssec-validation no; };
 key "crosspoint-key" { algorithm hmac-sha256; secret "${SECRET}"; };
 zone "${ZONE}" { type master; file "/var/lib/bind/db.zone";
+                 allow-update { key "crosspoint-key"; }; };
+zone "${ZONE2}" { type master; file "/var/lib/bind/db.zone2";
                  allow-update { key "crosspoint-key"; }; };
 `);
 fs.writeFileSync(path.join(work, "db.zone"),
@@ -42,8 +47,15 @@ fs.writeFileSync(path.join(work, "db.zone"),
 @   IN NS  ns.${ZONE}.
 ns  IN A   127.0.0.1
 `);
+fs.writeFileSync(path.join(work, "db.zone2"),
+`$TTL 300
+@   IN SOA ns.${ZONE2}. admin.${ZONE2}. ( 1 3600 600 86400 300 )
+@   IN NS  ns.${ZONE2}.
+ns  IN A   127.0.0.1
+`);
 fs.chmodSync(work, 0o777);
 fs.chmodSync(path.join(work, "db.zone"), 0o666);
+fs.chmodSync(path.join(work, "db.zone2"), 0o666);
 
 function findPort() {
     // A fixed high port keeps the dig invocations simple; bail if it is taken.
@@ -80,9 +92,9 @@ process.on("exit", cleanup);
     if (!up) { console.log("SKIP  BIND did not come up"); process.exit(0); }
     await new Promise((r) => setTimeout(r, 2000));
 
-    const dig = (name) => {
+    const dig = (name, zone) => {
         try {
-            return execFileSync("dig", ["@127.0.0.1", "-p", String(PORT), name + "." + ZONE, "A", "+short"],
+            return execFileSync("dig", ["@127.0.0.1", "-p", String(PORT), name + "." + (zone || ZONE), "A", "+short"],
                 { stdio: "pipe" }).toString().trim();
         } catch (e) { return "<dig failed>"; }
     };
@@ -141,6 +153,62 @@ process.on("exit", cleanup);
     await bad.syncAll([{ nodeId: "n9", displayName: "Impostor", ip: "10.20.0.66" }]);
     await new Promise((r) => setTimeout(r, 1500));
     check("a bad TSIG secret does not get a record in", dig("impostor") === "", dig("impostor"));
+
+    // Two devices whose labels sanitise to the same label must not take turns
+    // owning one record: the first claim wins and the second is refused.
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "ddns-collide-"));
+    process.chdir(dir2); fs.mkdirSync("state");
+    const collide = new DdnsService();
+    collide.setSettings({ enabled: true, server: "127.0.0.1", port: PORT, zone: ZONE, ttl: 300,
+                          keyName: "crosspoint-key", keySecret: SECRET, keyAlgorithm: "hmac-sha256" });
+    await collide.syncAll([{ nodeId: "c1", displayName: "Shared Name", ip: "10.20.0.31" }]);
+    await new Promise((r) => setTimeout(r, 1200));
+    await collide.syncAll([{ nodeId: "c2", displayName: "Shared-Name", ip: "10.20.0.32" }]);
+    await new Promise((r) => setTimeout(r, 1200));
+    check("a colliding name does not hijack the first node's record",
+        dig("shared-name") === "10.20.0.31", dig("shared-name"));
+    check("the loser of a name collision is not in the inventory",
+        collide.getPushedEntries().filter((e) => e.nodeId === "c2").length === 0);
+    // ...and removing the loser must not delete the winner's record.
+    await collide.removeNode("c2");
+    await new Promise((r) => setTimeout(r, 1200));
+    check("removing the loser leaves the winner's record alone",
+        dig("shared-name") === "10.20.0.31", dig("shared-name"));
+    process.chdir(dir);
+
+    // A peer that accepts the connection and closes without answering must
+    // fail the push, not hang it forever.
+    const deaf = net.createServer((sock) => sock.end());
+    await new Promise((r) => deaf.listen(0, "127.0.0.1", r));
+    const deafPort = deaf.address().port;
+    const hang = new DdnsService();
+    hang.setSettings({ enabled: true, server: "127.0.0.1", port: deafPort, zone: ZONE, ttl: 300,
+                       keyName: "crosspoint-key", keySecret: SECRET, keyAlgorithm: "hmac-sha256" });
+    const t0 = Date.now();
+    const settled = await Promise.race([
+        hang.syncAll([{ nodeId: "h1", displayName: "Deaf Server", ip: "10.20.0.41" }]).then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 8000)),
+    ]);
+    deaf.close();
+    check("a connection closed without a reply settles instead of hanging",
+        settled === true, settled ? "" : "still pending after 8s");
+    check("...and it does so without waiting out the inactivity timeout",
+        settled === true && (Date.now() - t0) < 4000, String(Date.now() - t0) + "ms");
+    check("nothing is recorded as published for it",
+        hang.getPushedEntries().filter((e) => e.nodeId === "h1").length === 0);
+
+    // Moving to another zone must publish there and clean up the old zone,
+    // even though the host and address have not changed.
+    svc.setSettings({ enabled: true, server: "127.0.0.1", port: PORT, zone: ZONE2, ttl: 300,
+                      keyName: "crosspoint-key", keySecret: SECRET, keyAlgorithm: "hmac-sha256" });
+    await svc.syncAll([{ nodeId: "n1", displayName: "Camera One", ip: "10.20.0.99" }]);
+    await new Promise((r) => setTimeout(r, 1500));
+    check("a zone change publishes into the new zone",
+        dig("camera-one", ZONE2) === "10.20.0.99", dig("camera-one", ZONE2));
+    check("a zone change withdraws the record from the old zone",
+        dig("camera-one", ZONE) === "", dig("camera-one", ZONE));
+    check("the inventory follows the node to the new zone",
+        (svc.getPushedEntries().find((e) => e.nodeId === "n1") || {}).domain === ZONE2);
 
     console.log(`\n${pass} passed, ${fail} failed`);
     cleanup();
