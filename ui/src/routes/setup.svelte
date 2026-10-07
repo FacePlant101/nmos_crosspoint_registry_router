@@ -25,6 +25,9 @@
         audioMonitorEnabled: false,
         dnssdEnabled: true,
         dnssdDomain: "",
+        virtualNodeEnabled: false,
+        virtualNodeLabel: "",
+        virtualNodeAdvertiseHost: "",
         ddnsEnabled: false,
         ddnsServer: "",
         ddnsPort: 53,
@@ -38,6 +41,11 @@
         debugLogs: false,
     };
     let ddnsKeySecretSet = false;
+
+    // Virtual senders are edited as a list: rows are added and removed, not
+    // just changed. ids are read-only and come from the server.
+    let virtualSenders: any[] = [];
+    let virtualNodeIds = { nodeId: "", deviceId: "" };
     let dirty = false;
     let saving = false;
     let restartRequired = false;
@@ -100,6 +108,9 @@
             audioMonitorEnabled: !!s.audioMonitor?.enabled,
             dnssdEnabled: s.registryDiscovery?.unicastDnssd !== false,
             dnssdDomain: s.registryDiscovery?.domain ?? "",
+            virtualNodeEnabled: !!s.virtualNode?.enabled,
+            virtualNodeLabel: s.virtualNode?.label ?? "",
+            virtualNodeAdvertiseHost: s.virtualNode?.advertiseHost ?? "",
             ddnsEnabled: !!s.ddns?.enabled,
             ddnsServer: s.ddns?.server ?? "",
             ddnsPort: s.ddns?.port ?? 53,
@@ -111,6 +122,8 @@
             debugLogs: !!s.debugLogs,
         };
         ddnsKeySecretSet = !!s.ddns?.keySecretSet;
+        virtualSenders = (s.virtualSenders ?? []).map((v: any) => ({ ...v }));
+        virtualNodeIds = { nodeId: s.virtualNode?.nodeId ?? "", deviceId: s.virtualNode?.deviceId ?? "" };
         if (!cred.currentUsername && Array.isArray(s.auth?.users) && s.auth.users.length > 0) {
             cred.currentUsername = s.auth.users[0];
         }
@@ -188,6 +201,18 @@
                 },
                 bcp008: { enabled: !!form.bcp008Enabled },
                 audioMonitor: { enabled: !!form.audioMonitorEnabled },
+                virtualNode: {
+                    enabled: !!form.virtualNodeEnabled,
+                    label: form.virtualNodeLabel.trim(),
+                    advertiseHost: form.virtualNodeAdvertiseHost.trim(),
+                },
+                virtualSenders: virtualSenders.map((v) => ({
+                    id: v.id, name: v.name ?? "", sdp: v.sdp ?? "",
+                    // Sent back untouched so a save never looks like a request
+                    // for fresh identifiers. The server keeps its own copy
+                    // regardless of what arrives here.
+                    senderId: v.senderId, sourceId: v.sourceId, flowId: v.flowId,
+                })),
                 ddns: {
                     enabled: !!form.ddnsEnabled,
                     server: form.ddnsServer.trim(),
@@ -318,6 +343,15 @@
             }
         };
         reader.readAsText(file);
+    }
+
+    function addVirtualSender() {
+        virtualSenders = [...virtualSenders, { id: "vs_" + Math.random().toString(36).slice(2, 10), name: "", sdp: "" }];
+        touch();
+    }
+    function removeVirtualSender(id: string) {
+        virtualSenders = virtualSenders.filter((v) => v.id !== id);
+        touch();
     }
 
     async function copyProbeCommand() {
@@ -678,6 +712,76 @@
                     Applies immediately. The <code>DEBUG_LOGS</code> environment variable
                     overrides this at startup.
                 </p>
+            </section>
+
+            <section class="setup-section setup-section-wide">
+                <h3>Virtual senders</h3>
+                <p class="setup-hint">
+                    Makes devices without NMOS support visible to the rest of the plant: paste a
+                    sender's SDP and this server publishes it through its own IS-04 Node API and
+                    registers it with your registry, so other controllers can route it. Those
+                    senders do not appear in this crosspoint's own matrix.
+                </p>
+                <div class="setup-row">
+                    <label class="label" for="virtualNodeEnabled">Publish a virtual node</label>
+                    <input id="virtualNodeEnabled" class="toggle" type="checkbox"
+                        bind:checked={form.virtualNodeEnabled} on:change={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="virtualNodeLabel">Node label</label>
+                    <input id="virtualNodeLabel" class="input input-bordered input-sm" type="text"
+                        placeholder="NMOS Crosspoint Virtual Node"
+                        bind:value={form.virtualNodeLabel} on:input={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="virtualNodeAdvertiseHost">Advertise address</label>
+                    <input id="virtualNodeAdvertiseHost" class="input input-bordered input-sm" type="text"
+                        placeholder="detected automatically"
+                        bind:value={form.virtualNodeAdvertiseHost} on:input={touch} />
+                </div>
+                <p class="setup-hint">
+                    The address other controllers use to reach this node's API. Leave it empty
+                    unless this host has several interfaces and the wrong one is picked.
+                    {#if virtualNodeIds.nodeId}
+                        <br />Node ID <code>{virtualNodeIds.nodeId}</code>
+                    {/if}
+                </p>
+
+                <h4 class="setup-subhead">Senders</h4>
+                {#if virtualSenders.length === 0}
+                    <p class="setup-hint">None yet.</p>
+                {:else}
+                    {#each virtualSenders as vs (vs.id)}
+                        <div class="vs-row">
+                            <div class="setup-row">
+                                <input class="input input-bordered input-sm vs-name" type="text"
+                                    placeholder="name, e.g. Legacy Camera 3"
+                                    bind:value={vs.name} on:input={touch} />
+                                <button class="btn btn-xs btn-error"
+                                    on:click={()=>removeVirtualSender(vs.id)} title="remove">✕</button>
+                            </div>
+                            <textarea class="textarea textarea-bordered vs-sdp" rows="6"
+                                placeholder="paste the sender's SDP here"
+                                bind:value={vs.sdp} on:input={touch}></textarea>
+                            <!-- What the server made of this SDP when it last
+                                 published it. Hidden once the form is dirty,
+                                 because it describes the saved SDP, not the
+                                 one being typed. -->
+                            {#if !dirty && vs.publishError}
+                                <p class="vs-note vs-note-error">
+                                    Not published: {vs.publishError}
+                                </p>
+                            {:else if !dirty && vs.publishWarning}
+                                <p class="vs-note vs-note-warn">
+                                    {vs.publishWarning}
+                                </p>
+                            {/if}
+                        </div>
+                    {/each}
+                {/if}
+                <div class="setup-row">
+                    <button class="btn btn-sm" on:click={addVirtualSender}>Add sender</button>
+                </div>
             </section>
 
             <section class="setup-section setup-section-wide">
