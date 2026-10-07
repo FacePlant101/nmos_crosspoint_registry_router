@@ -28,6 +28,10 @@ export interface ParsedVirtualSdp {
         destination_port: number,
         rtp_enabled:      boolean
     }>;
+    // Media blocks that were NOT published, because they carry a different
+    // essence from the first one. A sender has exactly one flow, so a
+    // multi-essence SDP cannot be published whole; the caller reports this.
+    droppedMedia: string[];
 
     // Audio-only fields (undefined for video / data)
     audio?: {
@@ -64,9 +68,34 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
         throw new Error("SDP has no media (m=) section");
     }
 
-    // Per-media transport_params. ST 2022-7 redundant streams come through as
-    // two separate `m=` blocks in one SDP. We treat each block as one leg.
-    let transportParams = sdp.media.map((m:any, idx:number) => {
+    // Which `m=` blocks are legs of ONE sender?
+    //
+    // ST 2022-7 redundant streams arrive as two `m=` blocks carrying the same
+    // essence, and those are legs. A multi-essence SDP (video + audio + ANC in
+    // one session, which is what most devices emit) also has several blocks,
+    // but those are different streams, not redundant copies of one. Treating
+    // every block as a leg published the audio group as "leg 2" of a video
+    // sender, so a receiver patched to that leg subscribed to audio while the
+    // flow said video/raw.
+    //
+    // An IS-04 sender has exactly one flow, so only the blocks matching the
+    // first block's essence can be published. The rest are named in
+    // droppedMedia for the caller to report.
+    const essenceOf = (m:any) =>
+        ("" + (m?.type || "")).toLowerCase() + "/" +
+        ("" + (m?.rtp?.[0]?.codec || "")).toUpperCase();
+    const primaryEssence = essenceOf(sdp.media[0]);
+    // The original index travels with the block so a rejection names the
+    // position in the operator's SDP, not the position among the legs.
+    const legMedia: Array<{ m:any, idx:number }> = [];
+    const droppedMedia:string[] = [];
+    sdp.media.forEach((m:any, idx:number) => {
+        if(essenceOf(m) === primaryEssence){ legMedia.push({ m, idx }); }
+        else { droppedMedia.push("m= block " + (idx+1) + " (" + essenceOf(m) + ")"); }
+    });
+
+    // Per-leg transport_params, one per redundant leg.
+    let transportParams = legMedia.map(({ m, idx }:{ m:any, idx:number }) => {
         let destIp = "";
         try{
             if(m.sourceFilter && m.sourceFilter.destAddress){
@@ -128,6 +157,7 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
             format: "urn:x-nmos:format:audio",
             mediaType,
             transportParams,
+            droppedMedia,
             audio: {
                 sampleRate: rate || 48000,
                 channels,
@@ -141,7 +171,8 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
         return {
             format: "urn:x-nmos:format:data",
             mediaType: "video/smpte291",
-            transportParams
+            transportParams,
+            droppedMedia
         };
     }
 
@@ -176,6 +207,7 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
             format: "urn:x-nmos:format:video",
             mediaType,
             transportParams,
+            droppedMedia,
             video: {
                 width,
                 height,
@@ -193,7 +225,8 @@ export function parseVirtualSdp(rawSdp:string): ParsedVirtualSdp {
     return {
         format: "urn:x-nmos:format:mux",
         mediaType,
-        transportParams
+        transportParams,
+        droppedMedia
     };
 }
 

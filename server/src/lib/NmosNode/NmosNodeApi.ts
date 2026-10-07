@@ -43,6 +43,9 @@ export class NmosNodeApi {
     // Cached "<senderId> → parsed SDP" so the registration path doesn't
     // re-parse and the API doesn't either.
     public lastError: { [id:string]: string } = {};
+    // Senders that WERE published but with something left out (currently: a
+    // multi-essence SDP whose extra essences cannot be carried by one sender).
+    public lastWarning: { [id:string]: string } = {};
 
     constructor(settings:any){
         this.settings = settings;
@@ -129,9 +132,11 @@ export class NmosNodeApi {
         };
 
         // ----- Device -----
-        let senderIds: string[] = (this.settings?.virtualSenders || [])
-            .filter((v:any) => v && v.senderId)
-            .map((v:any) => v.senderId);
+        // senders[] is filled in after the sender loop below, from the senders
+        // that were actually built. Listing a configured-but-unparseable
+        // sender here advertised an id whose /senders/<id> returns 404, which
+        // leaves a controller showing a sender it cannot resolve and gives a
+        // schema-strict registry a dangling reference.
         this.deviceResource = {
             id:          virtualNode.deviceId,
             version,
@@ -140,7 +145,7 @@ export class NmosNodeApi {
             tags:        {},
             type:        "urn:x-nmos:device:generic",
             node_id:     virtualNode.nodeId,
-            senders:     senderIds,
+            senders:     [],
             receivers:   [],
             controls: [
                 {
@@ -158,6 +163,7 @@ export class NmosNodeApi {
         this.transportFiles  = {};
         this.transportParams = {};
         this.lastError       = {};
+        this.lastWarning     = {};
 
         for(let vs of (this.settings?.virtualSenders || [])){
             if(!vs || !vs.senderId || !vs.flowId || !vs.sourceId) continue;
@@ -249,12 +255,28 @@ export class NmosNodeApi {
                 // IS-05 transport state + the raw SDP for /transportfile.
                 this.transportFiles[vs.senderId]  = vs.sdp;
                 this.transportParams[vs.senderId] = parsed.transportParams;
+
+                // A multi-essence SDP cannot be published whole: a sender has
+                // one flow. The primary essence is published and the rest are
+                // named here, because silently dropping an operator's audio is
+                // only acceptable if they can find out that it happened.
+                if(parsed.droppedMedia && parsed.droppedMedia.length){
+                    let note = "only the first essence (" + parsed.mediaType + ") is published; " +
+                        "not published: " + parsed.droppedMedia.join(", ") +
+                        ". An IS-04 sender carries one flow, so publish each essence as its own virtual sender.";
+                    this.lastWarning[vs.senderId] = note;
+                    SyncLog.log("warn", "NMOS Node", "Virtual sender " + vs.senderId +
+                        " (" + (vs.name||"") + "): " + note);
+                }
             }catch(e:any){
                 let msg = (e && e.message) ? e.message : String(e);
                 this.lastError[vs.senderId] = msg;
                 SyncLog.log("warn", "NMOS Node", "Virtual sender " + vs.senderId + " (" + (vs.name||"") + ") skipped: " + msg);
             }
         }
+
+        // Only senders that were really built — see the Device note above.
+        this.deviceResource.senders = Object.keys(this.senderResources);
     }
 
     /** Snapshot used by NmosNodeRegistration when POSTing to the registry. */
@@ -356,12 +378,17 @@ export class NmosNodeApi {
             let tp = this.transportParams[req.params.id];
             let sdp = this.transportFiles[req.params.id];
             if(!tp || sdp === undefined) return res.status(404).send("Not Found");
+            // IS-05 sender-response shape: receiver_id (a sender records which
+            // receiver it is subscribed to, if any), master_enable, activation
+            // and transport_params. sender_id and transport_file belong to the
+            // RECEIVER response; a controller validating this against the
+            // sender schema rejects them. The SDP is served from
+            // /transportfile, which is where a sender's transport file lives.
             json(res, {
-                sender_id: null,
+                receiver_id: null,
                 master_enable: true,
                 activation: { mode: null, requested_time: null, activation_time: null },
-                transport_params: tp,
-                transport_file: { data: sdp, type: "application/sdp" }
+                transport_params: tp
             });
         };
         app.get("/x-nmos/connection/v1.0/single/senders/:id/staged", stagedActive);

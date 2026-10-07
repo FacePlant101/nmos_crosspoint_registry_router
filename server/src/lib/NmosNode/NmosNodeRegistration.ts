@@ -182,6 +182,11 @@ export class NmosNodeRegistration {
 
         this.syncInFlight = true;
         let myGen = this.gen;
+        // Checked before every request, not once at the end. stop() bumps the
+        // generation and DELETEs everything; a sync that only looked afterwards
+        // would POST the whole set back and leave the old registry holding a
+        // Node that nothing heartbeats.
+        const stale = () => myGen !== this.gen;
         try{
             // 1) DELETE resources that vanished between this sync and the
             //    last successful publication. Order matters: senders before
@@ -190,26 +195,31 @@ export class NmosNodeRegistration {
             let nowFlows   = new Set(resources.flows.map((f:any) => f.id));
             let nowSources = new Set(resources.sources.map((s:any) => s.id));
             for(let id of Array.from(this.lastSenderIds)){
+                if(stale()) return;
                 if(!nowSenders.has(id)) await this.deleteResource(url, "senders", id);
             }
             for(let id of Array.from(this.lastFlowIds)){
+                if(stale()) return;
                 if(!nowFlows.has(id)) await this.deleteResource(url, "flows", id);
             }
             for(let id of Array.from(this.lastSourceIds)){
+                if(stale()) return;
                 if(!nowSources.has(id)) await this.deleteResource(url, "sources", id);
             }
 
             // 2) POST every currently-known resource (idempotent → update).
             //    Node FIRST — if it's missing in the registry, every
             //    dependent POST below would return 404 otherwise.
+            if(stale()) return;
             await this.postResource(url, "node", resources.node);
+            if(stale()) return;
             await this.postResource(url, "device", resources.device);
-            for(let s of resources.sources) await this.postResource(url, "source", s);
-            for(let f of resources.flows)   await this.postResource(url, "flow",   f);
-            for(let s of resources.senders) await this.postResource(url, "sender", s);
+            for(let s of resources.sources){ if(stale()) return; await this.postResource(url, "source", s); }
+            for(let f of resources.flows)  { if(stale()) return; await this.postResource(url, "flow",   f); }
+            for(let s of resources.senders){ if(stale()) return; await this.postResource(url, "sender", s); }
 
+            if(stale()) return;
             this.snapshotIds(resources);
-            if(myGen !== this.gen) return;
             SyncLog.log("info", "NMOS Node Registration", "Re-synchronised virtual sender resources to registry.");
         }catch(e:any){
             SyncLog.log("warn", "NMOS Node Registration", "Sync failed: " + (e?.message || e));
@@ -258,8 +268,15 @@ export class NmosNodeRegistration {
     }
 
 
+    // Every request carries a timeout. Without one, a registry host that is
+    // firewalled with DROP rather than REJECT never answers and never fails:
+    // the 5 s heartbeat would queue a new request on every tick, none of them
+    // ever settling, and the 404 re-registration path would never run.
+    private static readonly REQUEST_TIMEOUT_MS = 5000;
+
     private async postResource(url:string, type:string, data:any){
-        let resp = await axios.post(url + "/resource", { type, data });
+        let resp = await axios.post(url + "/resource", { type, data },
+            { timeout: NmosNodeRegistration.REQUEST_TIMEOUT_MS });
         if(resp.status !== 200 && resp.status !== 201){
             throw new Error("Unexpected status " + resp.status + " on POST /resource type=" + type);
         }
@@ -267,7 +284,8 @@ export class NmosNodeRegistration {
 
     private async deleteResource(url:string, plural:string, id:string){
         try{
-            await axios.delete(url + "/resource/" + plural + "/" + id);
+            await axios.delete(url + "/resource/" + plural + "/" + id,
+                { timeout: NmosNodeRegistration.REQUEST_TIMEOUT_MS });
         }catch(e:any){
             // 404 == not there, that's fine.
             if(e?.response?.status !== 404){
@@ -292,15 +310,16 @@ export class NmosNodeRegistration {
             let triggeredResync = false;
 
             try{
-                await axios.post(url + "/health/nodes/" + node.id);
+                await axios.post(url + "/health/nodes/" + node.id, undefined,
+                    { timeout: NmosNodeRegistration.REQUEST_TIMEOUT_MS });
             }catch(e:any){
                 if(myGen !== this.gen) return;  // stop() raced us — drop it
                 if(e?.response?.status === 404){
                     // Registry forgot the node entirely (restart,
                     // garbage-collect …). Re-publish everything from
-                    // scratch — syncResources() itself rechecks this.gen so
-                    // a stop() landing between the 404 and the POSTs still
-                    // wins.
+                    // scratch — syncResources() rechecks this.gen before every
+                    // request, so a stop() landing part-way through still
+                    // wins and nothing is POSTed back behind it.
                     SyncLog.log("warn", "NMOS Node Registration", "Heartbeat returned 404 — re-registering.");
                     this.syncResources().catch(()=>{});
                     triggeredResync = true;

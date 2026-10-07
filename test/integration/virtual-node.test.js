@@ -163,6 +163,25 @@ a=mid:VID
         check("IS-05 " + ep + " responds", r.status === 200, String(r.status));
     }
 
+    // Shape, not just status. A sender's staged/active response carries
+    // receiver_id; sender_id and transport_file belong to the RECEIVER
+    // response, and a controller validating against the sender schema rejects
+    // them. The SDP lives at /transportfile, checked above.
+    for (const ep of ["staged", "active"]) {
+        const r = await get(`http://127.0.0.1:${SRV_PORT}/x-nmos/connection/v1.0/single/senders/${sid}/${ep}`);
+        let b = {};
+        try { b = JSON.parse(r.body || "{}"); } catch (e) {}
+        check("IS-05 " + ep + " uses the sender response shape",
+            Object.prototype.hasOwnProperty.call(b, "receiver_id") &&
+            !Object.prototype.hasOwnProperty.call(b, "sender_id") &&
+            !Object.prototype.hasOwnProperty.call(b, "transport_file"),
+            Object.keys(b).join(","));
+        check("IS-05 " + ep + " still carries the transport params",
+            Array.isArray(b.transport_params) && b.transport_params.length >= 1 &&
+            b.transport_params[0].destination_ip === "239.200.0.11",
+            JSON.stringify(b.transport_params));
+    }
+
     // Identifiers must survive a restart, or every boot orphans a node.
     const before = JSON.parse(fs.readFileSync(CFG, "utf8"));
     child.kill("SIGKILL");

@@ -207,7 +207,11 @@
                     advertiseHost: form.virtualNodeAdvertiseHost.trim(),
                 },
                 virtualSenders: virtualSenders.map((v) => ({
-                    id: v.id, name: v.name ?? "", sdp: v.sdp ?? "", senderId: v.senderId,
+                    id: v.id, name: v.name ?? "", sdp: v.sdp ?? "",
+                    // Sent back untouched so a save never looks like a request
+                    // for fresh identifiers. The server keeps its own copy
+                    // regardless of what arrives here.
+                    senderId: v.senderId, sourceId: v.sourceId, flowId: v.flowId,
                 })),
                 ddns: {
                     enabled: !!form.ddnsEnabled,

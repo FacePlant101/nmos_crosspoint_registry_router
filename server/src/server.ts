@@ -445,7 +445,13 @@ function getSetupConfigState() {
             };
         })(),
         virtualSenders: Array.isArray(settings.virtualSenders)
-            ? settings.virtualSenders.map((v:any)=>({ id:v.id, name:v.name || "", sdp:v.sdp || "", senderId:v.senderId }))
+            ? settings.virtualSenders.map((v:any)=>({
+                id:v.id, name:v.name || "", sdp:v.sdp || "",
+                // Minted once and published as sender_id / source_id / flow_id
+                // in IS-04. Read-only to the client, but sent so a save can
+                // carry them back instead of looking like a request to mint
+                // new ones.
+                senderId:v.senderId, sourceId:v.sourceId, flowId:v.flowId }))
             : [],
         acceptableGmid: (typeof settings.acceptableGmid === "string") ? settings.acceptableGmid : "",
         // The TSIG secret is a credential and never leaves the server.
@@ -720,9 +726,20 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                     reject({message:"Too many virtual senders (limit 200)."});
                     return;
                 }
+                // Identifiers are carried over per id below, so two entries
+                // sharing one id would be given the same senderId and collapse
+                // into a single published sender — the operator would see a
+                // row they added quietly do nothing.
+                const seenIds = new Set<string>();
                 for(const v of postData.virtualSenders){
                     if(!v || typeof v !== "object"){
                         reject({message:"Each virtual sender must be an object."}); return;
+                    }
+                    if(typeof v.id === "string" && v.id){
+                        if(seenIds.has(v.id)){
+                            reject({message:"Two virtual senders share the id " + v.id + "."}); return;
+                        }
+                        seenIds.add(v.id);
                     }
                     if(typeof v.sdp !== "string" || v.sdp.trim() === ""){
                         reject({message:"Each virtual sender needs an SDP."}); return;
@@ -738,8 +755,29 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                 }
                 const senders = postData.virtualSenders;
                 mutations.push(()=>{
-                    settings.virtualSenders = senders;
-                    // Re-normalise so each sender keeps or gains its stable ids.
+                    // Carry the minted identifiers over from the stored entry
+                    // rather than trusting the request to return them. They are
+                    // published as sender_id / source_id / flow_id in IS-04 and
+                    // have to be stable: a client that posts a sender without
+                    // them would otherwise have parseSettings mint new ones,
+                    // and every save would move each sender onto a fresh source
+                    // and flow, deleting the old pair from the registry under
+                    // any controller that had resolved it.
+                    const existing:any = {};
+                    for(const old of (Array.isArray(settings.virtualSenders) ? settings.virtualSenders : [])){
+                        if(old && typeof old.id === "string") existing[old.id] = old;
+                    }
+                    settings.virtualSenders = senders.map((v:any)=>{
+                        const prev = (v && typeof v.id === "string") ? existing[v.id] : null;
+                        if(!prev) return v;
+                        return {
+                            ...v,
+                            senderId: prev.senderId,
+                            sourceId: prev.sourceId,
+                            flowId:   prev.flowId,
+                        };
+                    });
+                    // Re-normalise so a genuinely new sender gains its ids.
                     settings = parseSettings(settings);
                 });
             }
