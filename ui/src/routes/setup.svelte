@@ -25,8 +25,19 @@
         audioMonitorEnabled: false,
         dnssdEnabled: true,
         dnssdDomain: "",
+        ddnsEnabled: false,
+        ddnsServer: "",
+        ddnsPort: 53,
+        ddnsZone: "",
+        ddnsTtl: 300,
+        ddnsKeyName: "",
+        ddnsKeyAlgorithm: "hmac-sha256",
+        // Write-only: the server never sends the stored secret back, so an
+        // empty field means "leave whatever is stored alone".
+        ddnsKeySecret: "",
         debugLogs: false,
     };
+    let ddnsKeySecretSet = false;
     let dirty = false;
     let saving = false;
     let restartRequired = false;
@@ -46,6 +57,11 @@
     // Multicast lease inventory.
     let leaseState: any = { leases: {}, stats: {} };
     let leaseSync: Subject<any>;
+
+    // Records this server has published, kept because RFC 2136 gives no way to
+    // ask the DNS server which records are ours.
+    let dnsPushed: any[] = [];
+    let dnsSync: Subject<any>;
     let leaseFilter = "";
     let adoptModal: any;
 
@@ -84,8 +100,17 @@
             audioMonitorEnabled: !!s.audioMonitor?.enabled,
             dnssdEnabled: s.registryDiscovery?.unicastDnssd !== false,
             dnssdDomain: s.registryDiscovery?.domain ?? "",
+            ddnsEnabled: !!s.ddns?.enabled,
+            ddnsServer: s.ddns?.server ?? "",
+            ddnsPort: s.ddns?.port ?? 53,
+            ddnsZone: s.ddns?.zone ?? "",
+            ddnsTtl: s.ddns?.ttl ?? 300,
+            ddnsKeyName: s.ddns?.keyName ?? "",
+            ddnsKeyAlgorithm: s.ddns?.keyAlgorithm ?? "hmac-sha256",
+            ddnsKeySecret: "",
             debugLogs: !!s.debugLogs,
         };
+        ddnsKeySecretSet = !!s.ddns?.keySecretSet;
         if (!cred.currentUsername && Array.isArray(s.auth?.users) && s.auth.users.length > 0) {
             cred.currentUsername = s.auth.users[0];
         }
@@ -122,6 +147,10 @@
         leaseSync.subscribe((obj: any) => {
             leaseState = obj ?? { leases: {}, stats: {} };
         });
+        dnsSync = ServerConnector.sync("dnsPushed");
+        dnsSync.subscribe((obj: any) => {
+            dnsPushed = obj?.entries ?? [];
+        });
     });
     onDestroy(() => {
         if (sync) sync.unsubscribe();
@@ -132,6 +161,8 @@
         ServerConnector.unsync("probeState");
         if (leaseSync) leaseSync.unsubscribe();
         ServerConnector.unsync("multicastLeases");
+        if (dnsSync) dnsSync.unsubscribe();
+        ServerConnector.unsync("dnsPushed");
     });
 
     function touch() {
@@ -157,6 +188,18 @@
                 },
                 bcp008: { enabled: !!form.bcp008Enabled },
                 audioMonitor: { enabled: !!form.audioMonitorEnabled },
+                ddns: {
+                    enabled: !!form.ddnsEnabled,
+                    server: form.ddnsServer.trim(),
+                    port: Number(form.ddnsPort),
+                    zone: form.ddnsZone.trim(),
+                    ttl: Number(form.ddnsTtl),
+                    keyName: form.ddnsKeyName.trim(),
+                    keyAlgorithm: form.ddnsKeyAlgorithm,
+                    // Only sent when the operator typed one; empty keeps the
+                    // stored secret, which was never shown to this page.
+                    keySecret: form.ddnsKeySecret.trim(),
+                },
                 registryDiscovery: {
                     unicastDnssd: !!form.dnssdEnabled,
                     domain: form.dnssdDomain.trim(),
@@ -635,6 +678,97 @@
                     Applies immediately. The <code>DEBUG_LOGS</code> environment variable
                     overrides this at startup.
                 </p>
+            </section>
+
+            <section class="setup-section setup-section-wide">
+                <h3>Push names to DNS</h3>
+                <p class="setup-hint">
+                    Publishes each device's name as an A record in your DNS zone using
+                    standard RFC 2136 dynamic updates, so <code>Camera1.media.example.net</code>
+                    resolves on its own. Works with BIND9, Knot, PowerDNS and Microsoft DNS.
+                    A name you set on the Details page wins over the NMOS label. Only records
+                    this server created are ever touched, and forgetting a device removes its
+                    record.
+                </p>
+                <div class="setup-row">
+                    <label class="label" for="ddnsEnabled">Enabled</label>
+                    <input id="ddnsEnabled" class="toggle" type="checkbox"
+                        bind:checked={form.ddnsEnabled} on:change={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="ddnsServer">DNS server</label>
+                    <input id="ddnsServer" class="input input-bordered input-sm" type="text"
+                        placeholder="10.0.0.53" bind:value={form.ddnsServer} on:input={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="ddnsPort">Port</label>
+                    <input id="ddnsPort" class="input input-bordered input-sm" type="number"
+                        min="1" max="65535" bind:value={form.ddnsPort} on:input={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="ddnsZone">Zone</label>
+                    <input id="ddnsZone" class="input input-bordered input-sm" type="text"
+                        placeholder="media.example.net" bind:value={form.ddnsZone} on:input={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="ddnsTtl">Record TTL (seconds)</label>
+                    <input id="ddnsTtl" class="input input-bordered input-sm" type="number"
+                        min="1" max="604800" bind:value={form.ddnsTtl} on:input={touch} />
+                </div>
+                <div class="setup-row">
+                    <label class="label" for="ddnsKeyAlgorithm">TSIG algorithm</label>
+                    <select id="ddnsKeyAlgorithm" class="select select-bordered select-sm"
+                        bind:value={form.ddnsKeyAlgorithm} on:change={touch}>
+                        <option value="hmac-sha256">hmac-sha256</option>
+                        <option value="hmac-sha512">hmac-sha512</option>
+                        <option value="hmac-sha1">hmac-sha1</option>
+                        <option value="hmac-md5">hmac-md5</option>
+                        <option value="none">none (unsigned)</option>
+                    </select>
+                </div>
+                {#if form.ddnsKeyAlgorithm !== "none"}
+                    <div class="setup-row">
+                        <label class="label" for="ddnsKeyName">TSIG key name</label>
+                        <input id="ddnsKeyName" class="input input-bordered input-sm" type="text"
+                            placeholder="crosspoint-key" bind:value={form.ddnsKeyName} on:input={touch} />
+                    </div>
+                    <div class="setup-row">
+                        <label class="label" for="ddnsKeySecret">TSIG secret (base64)</label>
+                        <input id="ddnsKeySecret" class="input input-bordered input-sm" type="password"
+                            autocomplete="new-password"
+                            placeholder={ddnsKeySecretSet ? "stored — leave empty to keep" : "paste the key"}
+                            bind:value={form.ddnsKeySecret} on:input={touch} />
+                    </div>
+                    <p class="setup-hint">
+                        The secret is never sent back to this page. Leaving the field empty keeps
+                        whatever is already stored.
+                    </p>
+                {:else}
+                    <p class="setup-hint">
+                        Unsigned updates: your DNS server must authorise this host by source
+                        address, for example BIND's <code>allow-update &#123; 10.0.0.9; &#125;;</code>.
+                    </p>
+                {/if}
+
+                <h4 class="setup-subhead">Published records</h4>
+                {#if dnsPushed.length === 0}
+                    <p class="setup-hint">Nothing published yet.</p>
+                {:else}
+                    <table class="mon-table lease-table">
+                        <thead><tr><th>Host</th><th>Zone</th><th>Address</th><th>Updated</th></tr></thead>
+                        <tbody>
+                            {#each dnsPushed as e (e.nodeId)}
+                                <tr>
+                                    <td>{e.host}</td>
+                                    <td>{e.domain}</td>
+                                    <td class="lease-ip">{e.ip}</td>
+                                    <td>{(e.ts ?? "").replace("T", " ").slice(0, 19)}</td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                    <p class="setup-hint">{dnsPushed.length} record{dnsPushed.length === 1 ? "" : "s"} published by this server.</p>
+                {/if}
             </section>
 
             <section class="setup-section setup-section-wide">

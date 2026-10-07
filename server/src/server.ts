@@ -31,6 +31,7 @@ import { nmosIdFromCrosspointId } from "./lib/functions";
 import { ProbeGateway } from "./lib/probeGateway";
 import { AudioMonitorService } from "./lib/audioMonitor";
 import { MulticastLeaseManager } from "./lib/multicastLeaseManager";
+import { DdnsService } from "./lib/ddnsService";
 
 
 
@@ -329,6 +330,21 @@ server.addRoute("POST", "importLeases","global", (client: WebsocketClient, query
     });
 });
 
+// ----- DDNS -----
+// Publishes each node's name as an A record. Constructed before the connector
+// so the first node events already find it.
+const ddnsService = new DdnsService();
+try{ ddnsService.setSettings(settings.ddns); }catch(e){}
+
+function getDnsPushedSnapshot(){
+    return { entries: ddnsService.getPushedEntries(), updatedAt: new Date().toISOString() };
+}
+const dnsPushedSync: SyncObject = new SyncObject("dnsPushed", getDnsPushedSnapshot());
+server.addSyncObject("dnsPushed","global",dnsPushedSync);
+ddnsService.setOnChange(()=>{
+    try{ dnsPushedSync.setState(getDnsPushedSnapshot()); }catch(e){}
+});
+
 // Multicast probe gateway. Registers its own /probe websocket upgrade path, so
 // it must come after WebsocketSyncServer.init() — which it does, since the
 // sync server is created far above.
@@ -407,6 +423,22 @@ function getSetupConfigState() {
         // Read-only IS-12 status monitoring; absent means on.
         bcp008: { enabled: !(settings.bcp008 && settings.bcp008.enabled === false) },
         audioMonitor: { enabled: !!(settings.audioMonitor && settings.audioMonitor.enabled) },
+        // The TSIG secret is a credential and never leaves the server.
+        // keySecretSet lets the UI show that one is configured without it.
+        ddns: (()=>{
+            const d:any = (settings.ddns && typeof settings.ddns === "object") ? settings.ddns : {};
+            return {
+                enabled:      !!d.enabled,
+                server:       (typeof d.server === "string") ? d.server : "",
+                port:         (typeof d.port === "number") ? d.port : 53,
+                zone:         (typeof d.zone === "string") ? d.zone : "",
+                ttl:          (typeof d.ttl === "number") ? d.ttl : 300,
+                keyName:      (typeof d.keyName === "string") ? d.keyName : "",
+                keyAlgorithm: (typeof d.keyAlgorithm === "string") ? d.keyAlgorithm : "hmac-sha256",
+                keySecret:    "",
+                keySecretSet: !!(typeof d.keySecret === "string" && d.keySecret.length > 0),
+            };
+        })(),
         vendorProfiles: Array.isArray(settings.vendorProfiles)
             ? settings.vendorProfiles.map((v:any) => ({...v}))
             : [],
@@ -625,6 +657,86 @@ server.addRoute("POST", "setupConfig","global", (client: WebsocketClient, query:
                         }
                     });
                 }
+            }
+
+            // --- DDNS. An empty keySecret from the client means "leave the
+            // stored one alone", so a round-trip through the UI cannot wipe a
+            // secret it was never shown.
+            if(postData.hasOwnProperty("ddns") && typeof postData.ddns === "object" && postData.ddns){
+                const d = postData.ddns;
+                const next:any = {};
+                if(d.hasOwnProperty("enabled")){
+                    if(typeof d.enabled !== "boolean"){ reject({message:"ddns.enabled must be a boolean."}); return; }
+                    next.enabled = d.enabled;
+                }
+                if(d.hasOwnProperty("server")){
+                    const v = ("" + d.server).trim();
+                    if(v !== "" && !/^[0-9a-zA-Z.:_-]+$/.test(v)){
+                        reject({message:"DNS server address contains invalid characters."}); return;
+                    }
+                    next.server = v;
+                }
+                if(d.hasOwnProperty("zone")){
+                    const v = ("" + d.zone).trim().replace(/\.+$/, "");
+                    if(v !== "" && !/^[A-Za-z0-9.-]+$/.test(v)){
+                        reject({message:"DNS zone contains invalid characters."}); return;
+                    }
+                    next.zone = v;
+                }
+                if(d.hasOwnProperty("keyName")){
+                    const v = ("" + d.keyName).trim().replace(/\.+$/, "");
+                    if(v !== "" && !/^[A-Za-z0-9.\-_]+$/.test(v)){
+                        reject({message:"TSIG key name contains invalid characters."}); return;
+                    }
+                    next.keyName = v;
+                }
+                if(d.hasOwnProperty("port")){
+                    const n = parseInt("" + d.port);
+                    if(isNaN(n) || n < 1 || n > 65535){ reject({message:"DNS port must be between 1 and 65535."}); return; }
+                    next.port = n;
+                }
+                if(d.hasOwnProperty("ttl")){
+                    const n = parseInt("" + d.ttl);
+                    if(isNaN(n) || n < 1 || n > 604800){ reject({message:"DNS TTL must be between 1 and 604800 seconds."}); return; }
+                    next.ttl = n;
+                }
+                if(d.hasOwnProperty("keyAlgorithm")){
+                    const allowed = ["hmac-sha256","hmac-sha512","hmac-sha1","hmac-md5","none"];
+                    if(allowed.indexOf(d.keyAlgorithm) === -1){
+                        reject({message:"TSIG algorithm must be one of: " + allowed.join(", ")}); return;
+                    }
+                    next.keyAlgorithm = d.keyAlgorithm;
+                }
+                if(d.hasOwnProperty("keySecret") && typeof d.keySecret === "string" && d.keySecret.trim() !== ""){
+                    const v = d.keySecret.trim();
+                    if(!/^[A-Za-z0-9+/=]+$/.test(v)){
+                        reject({message:"TSIG secret must be base64."}); return;
+                    }
+                    next.keySecret = v;
+                }
+                // Enabling it with nowhere to send to would just log failures.
+                const willEnable = next.hasOwnProperty("enabled") ? next.enabled : !!settings.ddns?.enabled;
+                const server = next.hasOwnProperty("server") ? next.server : (settings.ddns?.server || "");
+                const zone   = next.hasOwnProperty("zone")   ? next.zone   : (settings.ddns?.zone   || "");
+                if(willEnable && (!server || !zone)){
+                    reject({message:"A DNS server and zone are required before DDNS can be enabled."});
+                    return;
+                }
+
+                mutations.push(()=>{
+                    if(!settings.ddns || typeof settings.ddns !== "object"){ settings.ddns = {}; }
+                    Object.assign(settings.ddns, next);
+                });
+                sideEffects.push(()=>{
+                    try{ DdnsService.instance?.setSettings(settings.ddns); }catch(e){}
+                    // Publish everything we know when it is switched on, so
+                    // existing nodes do not wait for their next registry event.
+                    try{
+                        if(settings.ddns.enabled && DdnsService.instance){
+                            DdnsService.instance.syncAll(nmosConnector.collectDnsPushNodes()).catch(()=>{});
+                        }
+                    }catch(e){}
+                });
             }
 
             // --- Audio monitor master switch.
